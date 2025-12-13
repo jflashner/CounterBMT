@@ -1,0 +1,121 @@
+======================================================================
+COUNTERBMT DETAILED METRICS SUMMARY
+======================================================================
+Scenario ID: 473727ed71e9d699
+Generated: 2025-12-09 02:28:05
+
+BASELINE TRAJECTORY METRICS:
+----------------------------------------
+  Travel Distance:    99.71 m
+  Trajectory Length:  96 steps
+  Mean Speed:         10.50 m/s
+  Max Speed:          14.25 m/s
+  Mean Acceleration:  1.01 m/s²
+  Max Acceleration:   18.75 m/s²
+  Max Jerk:           187.51 m/s³
+
+*** SANITY CHECK: BMT Baseline vs Ground Truth ***
+----------------------------------------
+  (This shows BMT prediction accuracy WITHOUT any intervention)
+  Baseline ADE vs GT: 1.76 m
+  Baseline FDE vs GT: 4.20 m
+  Baseline Travel:    99.71 m
+  GT Travel:          97.48 m
+
+ADV-BMT PAPER METRICS (Aggregate):
+----------------------------------------
+
+  Realism Metrics (Table a):
+    SFDE_avg:       17.69 m
+    SFDE_min:       5.04 m
+    SADE_avg:       5.93 m
+    SADE_min:       1.69 m
+    VehColl_avg:    0.0000
+    VehColl_min:    0.0000
+    JSD_velocity:   0.1708
+    JSD_TTC:        0.0000
+
+  Diversity Metrics (Table b):
+    Mean SDD:       31.07 m
+    Mean FDD:       31.06 m
+    Mean ADD:       10.10 m
+
+OVERALL INTERVENTION STATISTICS:
+----------------------------------------
+  Total Interventions:    5
+  Effective (>5% change): 4
+  Effectiveness Rate:     80.0%
+  Match Expected Effect:  3
+  Prediction Accuracy:    60.0%
+
+PER-INTERVENTION METRICS:
+----------------------------------------
+
+  Set Ego Initial Speed to 3.2947373390197754 (was 6.589474678039551):
+    Distance Change: -8.3%
+    Mean CF Distance: 91.40 m
+    --- ADV-BMT Realism ---
+    SFDE_avg: 11.26 m  |  SFDE_min: 7.92 m
+    SADE_avg: 3.14 m  |  SADE_min: 2.37 m
+    VehColl_avg: 0.0000  |  VehColl_min: 0.0000
+    JSD_velocity: 0.1749  |  JSD_TTC: 0.0000
+    --- ADV-BMT Diversity ---
+    SDD: 8.93 m  |  FDD: 8.93 m  |  ADD: 2.12 m
+    Effect Direction: unknown
+    Matches Expected: ✓
+
+  Set Ego Initial Speed to 4.942106008529663 (was 6.589474678039551):
+    Distance Change: -21.5%
+    Mean CF Distance: 78.31 m
+    --- ADV-BMT Realism ---
+    SFDE_avg: 23.51 m  |  SFDE_min: 6.82 m
+    SADE_avg: 6.56 m  |  SADE_min: 2.07 m
+    VehColl_avg: 0.0000  |  VehColl_min: 0.0000
+    JSD_velocity: 0.1542  |  JSD_TTC: 0.0000
+    --- ADV-BMT Diversity ---
+    SDD: 56.07 m  |  FDD: 56.07 m  |  ADD: 15.02 m
+    Effect Direction: unknown
+    Matches Expected: ✓
+
+  Set Ego Initial Speed to 8.236843347549438 (was 6.589474678039551):
+    Distance Change: +10.7%
+    Mean CF Distance: 110.41 m
+    --- ADV-BMT Realism ---
+    SFDE_avg: 5.81 m  |  SFDE_min: 0.78 m
+    SADE_avg: 3.34 m  |  SADE_min: 1.25 m
+    VehColl_avg: 0.0000  |  VehColl_min: 0.0000
+    JSD_velocity: 0.1241  |  JSD_TTC: 0.0000
+    --- ADV-BMT Diversity ---
+    SDD: 14.61 m  |  FDD: 14.54 m  |  ADD: 6.21 m
+    Effect Direction: unknown
+    Matches Expected: ✗
+
+  Set Maneuver: straight to stop (was straight):
+    Distance Change: -39.9%
+    Mean CF Distance: 59.92 m
+    --- ADV-BMT Realism ---
+    SFDE_avg: 42.84 m  |  SFDE_min: 6.46 m
+    SADE_avg: 14.91 m  |  SADE_min: 2.95 m
+    VehColl_avg: 0.0000  |  VehColl_min: 0.0000
+    JSD_velocity: 0.2940  |  JSD_TTC: 0.0000
+    --- ADV-BMT Diversity ---
+    SDD: 65.90 m  |  FDD: 65.90 m  |  ADD: 24.56 m
+    Effect Direction: unknown
+    Matches Expected: ✓
+
+  Set Maneuver: lane_change_left to straight (was lane_change_left):
+    Distance Change: +1.0%
+    Mean CF Distance: 100.75 m
+    --- ADV-BMT Realism ---
+    SFDE_avg: 5.04 m  |  SFDE_min: 1.83 m
+    SADE_avg: 1.69 m  |  SADE_min: 0.70 m
+    VehColl_avg: 0.0000  |  VehColl_min: 0.0000
+    JSD_velocity: 0.1070  |  JSD_TTC: 0.0000
+    --- ADV-BMT Diversity ---
+    SDD: 9.84 m  |  FDD: 9.84 m  |  ADD: 2.57 m
+    Effect Direction: unknown
+    Matches Expected: ✗
+
+======================================================================
+END OF METRICS SUMMARY
+======================================================================

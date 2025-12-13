@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CounterBMT Report: bde4872a009ffc47</title>
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #1976D2; border-bottom: 3px solid #1976D2; padding-bottom: 10px; }
+        h2 { color: #424242; margin-top: 30px; }
+        h3 { color: #616161; }
+        .metric { display: inline-block; padding: 10px 20px; margin: 5px; background: #E3F2FD; border-radius: 4px; }
+        .metric-label { font-size: 12px; color: #757575; }
+        .metric-value { font-size: 18px; font-weight: bold; color: #1976D2; }
+        .decrease { background: #E8F5E9; }
+        .decrease .metric-value { color: #4CAF50; }
+        .increase { background: #FFEBEE; }
+        .increase .metric-value { color: #F44336; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #E0E0E0; }
+        th { background: #F5F5F5; font-weight: 600; }
+        .log-entry { background: #FAFAFA; padding: 15px; margin: 10px 0; border-radius: 4px; font-family: monospace; font-size: 12px; white-space: pre-wrap; overflow-x: auto; }
+        img { max-width: 100%; height: auto; margin: 20px 0; border: 1px solid #E0E0E0; border-radius: 4px; }
+        .section { margin: 30px 0; padding: 20px; background: #FAFAFA; border-radius: 8px; }
+        .dag-node { display: inline-block; padding: 8px 12px; margin: 4px; border-radius: 4px; font-size: 12px; }
+        .layer-0 { background: #BBDEFB; }
+        .layer-1 { background: #C8E6C9; }
+        .layer-2 { background: #FFE0B2; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚗 CounterBMT Scenario Report</h1>
+        <p><strong>Scenario ID:</strong> bde4872a009ffc47</p>
+
+        <div class="section">
+            <h2>📊 Summary</h2>
+            <div class="metric">
+                <div class="metric-label">Baseline Distance</div>
+                <div class="metric-value">1.1m</div>
+            </div>
+
+            <div class="metric increase">
+                <div class="metric-label">Set Ego Initial Speed to </div>
+                <div class="metric-value">23.7m (-2021.7%)</div>
+            </div>
+
+            <div class="metric increase">
+                <div class="metric-label">Set Ego Initial Speed to </div>
+                <div class="metric-value">1.2m (-5.2%)</div>
+            </div>
+
+            <div class="metric increase">
+                <div class="metric-label">Set Ego Initial Speed to </div>
+                <div class="metric-value">70.7m (-6230.4%)</div>
+            </div>
+
+            <div class="metric increase">
+                <div class="metric-label">Set Maneuver: straight to</div>
+                <div class="metric-value">8.4m (-654.5%)</div>
+            </div>
+
+            <div class="metric increase">
+                <div class="metric-label">Set Maneuver: lane_change</div>
+                <div class="metric-value">25.7m (-2196.5%)</div>
+            </div>
+</div>
+        <div class="section">
+            <h2>📈 Visualizations</h2>
+            <img src="trajectory_comparison.png" alt="Trajectory Comparison">
+            <img src="intervention_summary.png" alt="Intervention Summary">
+        </div>
+
+        <div class="section">
+            <h2>🔗 Causal DAG</h2>
+<h3>Nodes</h3><p><strong>Layer 0:</strong> <span class="dag-node layer-0">Ego Initial Position</span><span class="dag-node layer-0">Ego Initial Speed</span><span class="dag-node layer-0">Ego Initial Heading</span><span class="dag-node layer-0">Vehicle agent_245</span><span class="dag-node layer-0">Pedestrian agent_1779</span><span class="dag-node layer-0">Vehicle agent_248</span><span class="dag-node layer-0">Pedestrian agent_1776</span><span class="dag-node layer-0">Vehicle agent_169</span></p><p><strong>Layer 1:</strong> <span class="dag-node layer-1">Maneuver: straight</span><span class="dag-node layer-1">Maneuver: lane_change_left</span><span class="dag-node layer-1">Maneuver: left_turn</span><span class="dag-node layer-1">Maneuver: straight</span><span class="dag-node layer-1">Decision: proceed_or_yield</span><span class="dag-node layer-1">Decision: lane_choice</span><span class="dag-node layer-1">Decision: gap_acceptance</span></p><p><strong>Layer 2:</strong> <span class="dag-node layer-2">Collision Outcome</span></p><h3>Edges</h3><table><tr><th>From</th><th>To</th><th>Confidence</th></tr><tr><td>ego_initial_position</td><td>maneuver_0</td><td>0.80</td></tr><tr><td>ego_initial_speed</td><td>maneuver_0</td><td>0.80</td></tr><tr><td>ego_initial_heading</td><td>maneuver_0</td><td>0.80</td></tr><tr><td>agent_245_state</td><td>decision_0</td><td>0.70</td></tr><tr><td>agent_1779_state</td><td>decision_0</td><td>0.70</td></tr><tr><td>agent_248_state</td><td>decision_0</td><td>0.70</td></tr><tr><td>agent_1776_state</td><td>decision_0</td><td>0.70</td></tr><tr><td>agent_169_state</td><td>decision_0</td><td>0.70</td></tr><tr><td>maneuver_0</td><td>maneuver_1</td><td>0.90</td></tr><tr><td>maneuver_1</td><td>maneuver_2</td><td>0.90</td></tr><tr><td>maneuver_2</td><td>maneuver_3</td><td>0.90</td></tr><tr><td>decision_0</td><td>maneuver_1</td><td>0.80</td></tr><tr><td>decision_1</td><td>maneuver_3</td><td>0.90</td></tr><tr><td>decision_2</td><td>maneuver_3</td><td>0.70</td></tr><tr><td>maneuver_0</td><td>collision_outcome</td><td>0.60</td></tr><tr><td>maneuver_1</td><td>collision_outcome</td><td>0.70</td></tr><tr><td>maneuver_2</td><td>collision_outcome</td><td>0.80</td></tr><tr><td>maneuver_3</td><td>collision_outcome</td><td>0.60</td></tr><tr><td>decision_0</td><td>collision_outcome</td><td>0.80</td></tr><tr><td>decision_1</td><td>collision_outcome</td><td>0.90</td></tr></table></div>
+        <div class="section">
+            <h2>📋 Detailed Results</h2>
+            <table>
+                <tr>
+                    <th>Intervention</th>
+                    <th>Mean Distance</th>
+                    <th>Change</th>
+                    <th>Samples</th>
+                </tr>
+<tr><td>Set Ego Initial Speed to 0.01019269973039627 (was 0.02038539946079254)</td><td>23.7m</td><td>-2021.7%</td><td>3</td></tr><tr><td>Set Ego Initial Speed to 0.015289049595594406 (was 0.02038539946079254)</td><td>1.2m</td><td>-5.2%</td><td>3</td></tr><tr><td>Set Ego Initial Speed to 0.025481749325990677 (was 0.02038539946079254)</td><td>70.7m</td><td>-6230.4%</td><td>3</td></tr><tr><td>Set Maneuver: straight to stop (was straight)</td><td>8.4m</td><td>-654.5%</td><td>3</td></tr><tr><td>Set Maneuver: lane_change_left to straight (was lane_change_left)</td><td>25.7m</td><td>-2196.5%</td><td>3</td></tr></table></div>
+    </div>
+</body>
+</html>

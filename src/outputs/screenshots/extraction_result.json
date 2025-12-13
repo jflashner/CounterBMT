@@ -1,0 +1,82 @@
+{
+  "scenario_id": "124d47a028beaff1",
+  "maneuvers": [
+    {
+      "type": "left_turn",
+      "start_timestep": 0,
+      "end_timestep": 5,
+      "start_timestamp": 0.0,
+      "end_timestamp": 0.5,
+      "aggressiveness": "normal",
+      "description": "The ego vehicle begins a left turn at the intersection, gradually moving into the left lane.",
+      "confidence": 1.0
+    },
+    {
+      "type": "straight",
+      "start_timestep": 5,
+      "end_timestep": 10,
+      "start_timestamp": 0.5,
+      "end_timestamp": 1.0,
+      "aggressiveness": "normal",
+      "description": "The ego vehicle continues straight after completing the left turn.",
+      "confidence": 1.0
+    }
+  ],
+  "decisions": [
+    {
+      "timestep": 2,
+      "timestamp": 0.2,
+      "type": "proceed_or_yield",
+      "choice": "proceed",
+      "alternatives": [
+        "proceed",
+        "yield"
+      ],
+      "description": "The red car chose to proceed through the intersection while the blue car was approaching. This decision was critical as it involved crossing paths with another vehicle.",
+      "confidence": 0.9
+    },
+    {
+      "timestep": 5,
+      "timestamp": 0.5,
+      "type": "evasive_action",
+      "choice": "maintain course",
+      "alternatives": [
+        "maintain course",
+        "brake",
+        "swerve"
+      ],
+      "description": "The red car maintained its course without braking or swerving as the blue car approached. This was critical because a collision could occur if the blue car did not stop.",
+      "confidence": 0.8
+    },
+    {
+      "timestep": 6,
+      "timestamp": 0.7,
+      "type": "gap_acceptance",
+      "choice": "accept gap",
+      "alternatives": [
+        "accept gap",
+        "reject gap"
+      ],
+      "description": "The red car accepted the gap to cross in front of the blue car. This was critical as it required precise timing to avoid a collision.",
+      "confidence": 0.85
+    }
+  ],
+  "metadata": {
+    "n_images": 8,
+    "time_range": [
+      0.0,
+      0.9967300295829773
+    ],
+    "timestamps": [
+      0.0,
+      0.09990999847650528,
+      0.19976000487804413,
+      0.39941999316215515,
+      0.4991399943828583,
+      0.6983500123023987,
+      0.7978500127792358,
+      0.9967300295829773
+    ],
+    "has_trajectory": true
+  }
+}

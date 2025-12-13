@@ -1,0 +1,359 @@
+{
+  "scenario_id": "ea217cff15168d5e",
+  "nodes": [
+    {
+      "id": "ego_initial_position",
+      "name": "Ego Initial Position",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_speed",
+      "name": "Ego Initial Speed",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": 2.8091437816619873,
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_heading",
+      "name": "Ego Initial Heading",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": -2.116783857345581,
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1092_state",
+      "name": "Vehicle agent_1092",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          2166.425048828125,
+          11068.857421875
+        ],
+        "speed": 6.357609384235519,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1093_state",
+      "name": "Vehicle agent_1093",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          2192.03662109375,
+          11105.607421875
+        ],
+        "speed": 0.06176323555016366,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1094_state",
+      "name": "Vehicle agent_1094",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          2166.676513671875,
+          11086.30078125
+        ],
+        "speed": 3.9995279331598135,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1095_state",
+      "name": "Vehicle agent_1095",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          2169.910888671875,
+          11075.12109375
+        ],
+        "speed": 0.0,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1096_state",
+      "name": "Vehicle agent_1096",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          2172.726806640625,
+          11086.265625
+        ],
+        "speed": 0.0,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_0",
+      "name": "Maneuver: straight",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "straight",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_1",
+      "name": "Maneuver: right_turn",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "right_turn",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_2",
+      "name": "Maneuver: straight",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "straight",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_0",
+      "name": "Decision: proceed_or_yield",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "proceed through intersection",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_1",
+      "name": "Decision: lane_choice",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "stay in current lane",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_2",
+      "name": "Decision: speed_choice",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "maintain speed",
+      "is_interventionable": false
+    },
+    {
+      "id": "collision_outcome",
+      "name": "Collision Outcome",
+      "node_type": "outcome",
+      "layer": 2,
+      "value": null,
+      "is_interventionable": false
+    }
+  ],
+  "edges": [
+    {
+      "parent_id": "ego_initial_position",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial position influences the initial maneuver choice."
+    },
+    {
+      "parent_id": "ego_initial_speed",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial speed influences the initial maneuver choice."
+    },
+    {
+      "parent_id": "ego_initial_heading",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial heading influences the initial maneuver choice."
+    },
+    {
+      "parent_id": "agent_1092_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_1092 influence the decision to proceed or yield."
+    },
+    {
+      "parent_id": "agent_1093_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_1093 influence the decision to proceed or yield."
+    },
+    {
+      "parent_id": "agent_1094_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_1094 influence the decision to proceed or yield."
+    },
+    {
+      "parent_id": "agent_1095_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_1095 influence the decision to proceed or yield."
+    },
+    {
+      "parent_id": "agent_1096_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_1096 influence the decision to proceed or yield."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "maneuver_1",
+      "confidence": 0.9,
+      "mechanism": "Initial straight maneuver leads to a right turn."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "maneuver_2",
+      "confidence": 0.9,
+      "mechanism": "Right turn maneuver leads to continuing straight."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "maneuver_1",
+      "confidence": 0.8,
+      "mechanism": "Decision to proceed influences the right turn maneuver."
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "maneuver_2",
+      "confidence": 0.8,
+      "mechanism": "Lane choice decision influences continuing straight maneuver."
+    },
+    {
+      "parent_id": "decision_2",
+      "child_id": "maneuver_2",
+      "confidence": 0.8,
+      "mechanism": "Speed choice decision influences continuing straight maneuver."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.6,
+      "mechanism": "Initial maneuver can affect collision outcome."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Right turn maneuver can affect collision outcome."
+    },
+    {
+      "parent_id": "maneuver_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Continuing straight maneuver can affect collision outcome."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.8,
+      "mechanism": "Decision to proceed or yield affects collision outcome."
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Lane choice decision affects collision outcome."
+    },
+    {
+      "parent_id": "decision_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Speed choice decision affects collision outcome."
+    }
+  ],
+  "summary": {
+    "n_nodes": 15,
+    "n_edges": 19,
+    "n_initial_state_nodes": 8,
+    "n_event_nodes": 6,
+    "n_outcome_nodes": 1
+  },
+  "vlm_extraction": {
+    "maneuvers": [
+      {
+        "maneuver_type": "straight",
+        "start_timestep": 0,
+        "end_timestep": 25,
+        "start_timestamp": 0.0,
+        "end_timestamp": 2.5,
+        "aggressiveness": "normal",
+        "description": "The vehicle maintains its lane and direction, moving straight through the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "right_turn",
+        "start_timestep": 25,
+        "end_timestep": 50,
+        "start_timestamp": 2.5,
+        "end_timestamp": 5.1,
+        "aggressiveness": "normal",
+        "description": "The vehicle makes a right turn at the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "straight",
+        "start_timestep": 50,
+        "end_timestep": 90,
+        "start_timestamp": 5.1,
+        "end_timestamp": 9.0,
+        "aggressiveness": "normal",
+        "description": "The vehicle continues straight after completing the right turn.",
+        "confidence": 1.0
+      }
+    ],
+    "decisions": [
+      {
+        "timestep": 25,
+        "timestamp": 2.5,
+        "decision_type": "proceed_or_yield",
+        "ground_truth_choice": "proceed through intersection",
+        "alternatives": [
+          "proceed through intersection",
+          "yield to oncoming traffic"
+        ],
+        "description": "The driver chose to proceed through the intersection without yielding, which could be critical if there was oncoming traffic.",
+        "confidence": 0.8
+      },
+      {
+        "timestep": 50,
+        "timestamp": 5.1,
+        "decision_type": "lane_choice",
+        "ground_truth_choice": "stay in current lane",
+        "alternatives": [
+          "stay in current lane",
+          "change to another lane"
+        ],
+        "description": "Staying in the current lane was critical to avoid potential collisions with vehicles in adjacent lanes.",
+        "confidence": 0.7
+      },
+      {
+        "timestep": 77,
+        "timestamp": 7.7,
+        "decision_type": "speed_choice",
+        "ground_truth_choice": "maintain speed",
+        "alternatives": [
+          "maintain speed",
+          "slow down",
+          "speed up"
+        ],
+        "description": "Maintaining speed was critical to ensure safe passage through the intersection without abrupt stops.",
+        "confidence": 0.6
+      }
+    ]
+  }
+}

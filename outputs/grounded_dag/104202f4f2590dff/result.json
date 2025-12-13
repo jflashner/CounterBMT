@@ -1,0 +1,1090 @@
+{
+  "scenario_id": "104202f4f2590dff",
+  "scenario_index": 0,
+  "timestamp": "2025-12-06T17:32:55.331287",
+  "extraction": {
+    "n_frames": 8,
+    "n_trajectory_steps": 199,
+    "n_maneuvers": 4,
+    "n_decisions": 3,
+    "n_other_agents": 5,
+    "maneuvers": [
+      {
+        "type": "straight",
+        "start_timestamp": 0.0,
+        "end_timestamp": 5.6,
+        "aggressiveness": "normal"
+      },
+      {
+        "type": "lane_change_left",
+        "start_timestamp": 5.6,
+        "end_timestamp": 8.4,
+        "aggressiveness": "normal"
+      },
+      {
+        "type": "left_turn",
+        "start_timestamp": 8.4,
+        "end_timestamp": 14.1,
+        "aggressiveness": "normal"
+      },
+      {
+        "type": "straight",
+        "start_timestamp": 14.1,
+        "end_timestamp": 19.78,
+        "aggressiveness": "normal"
+      }
+    ],
+    "decisions": [
+      {
+        "type": "proceed_or_yield",
+        "choice": "proceed through intersection",
+        "timestamp": 8.4,
+        "alternatives": [
+          "proceed through intersection",
+          "yield to oncoming traffic"
+        ]
+      },
+      {
+        "type": "lane_choice",
+        "choice": "stay in current lane",
+        "timestamp": 11.3,
+        "alternatives": [
+          "stay in current lane",
+          "change to left lane",
+          "change to right lane"
+        ]
+      },
+      {
+        "type": "gap_acceptance",
+        "choice": "accept gap to merge",
+        "timestamp": 14.1,
+        "alternatives": [
+          "accept gap to merge",
+          "wait for a larger gap"
+        ]
+      }
+    ]
+  },
+  "dag": {
+    "scenario_id": "104202f4f2590dff",
+    "nodes": [
+      {
+        "id": "ego_initial_position",
+        "name": "Ego Initial Position",
+        "type": "ego_state",
+        "layer": 0,
+        "timestamp": 0.0,
+        "value": {
+          "x": 1045.841552734375,
+          "y": -2028.77783203125
+        },
+        "description": "Ego position at t=0: (1045.8, -2028.8)",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "ego_initial_speed",
+        "name": "Ego Initial Speed",
+        "type": "ego_state",
+        "layer": 0,
+        "timestamp": 0.0,
+        "value": 0.00032983924029394984,
+        "description": "Ego speed at t=0: 0.0 m/s",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {
+          "alternatives": [
+            0.00016491962014697492,
+            0.0002473794302204624,
+            0.00032983924029394984,
+            0.0004122990503674373
+          ]
+        }
+      },
+      {
+        "id": "ego_initial_heading",
+        "name": "Ego Initial Heading",
+        "type": "ego_state",
+        "layer": 0,
+        "timestamp": 0.0,
+        "value": 2.300276756286621,
+        "description": "Ego heading at t=0: 2.30 rad",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "agent_0_state",
+        "name": "Vehicle agent_0",
+        "type": "agent_state",
+        "layer": 0,
+        "timestamp": 0.0,
+        "value": {
+          "position": [
+            1055.1478271484375,
+            -2029.58251953125
+          ],
+          "speed": 4.334637043078794,
+          "type": "VEHICLE"
+        },
+        "description": "VEHICLE at (1055.1, -2029.6), speed 4.3",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "agent_1_state",
+        "name": "Vehicle agent_1",
+        "type": "agent_state",
+        "layer": 0,
+        "timestamp": 0.0,
+        "value": {
+          "position": [
+            1070.9351806640625,
+            -2041.638671875
+          ],
+          "speed": 7.0797767311927,
+          "type": "VEHICLE"
+        },
+        "description": "VEHICLE at (1070.9, -2041.6), speed 7.1",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "agent_2_state",
+        "name": "Vehicle agent_2",
+        "type": "agent_state",
+        "layer": 0,
+        "timestamp": 0.0,
+        "value": {
+          "position": [
+            1040.4827880859375,
+            -2018.0968017578125
+          ],
+          "speed": 1.6702234542420424,
+          "type": "VEHICLE"
+        },
+        "description": "VEHICLE at (1040.5, -2018.1), speed 1.7",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "agent_3_state",
+        "name": "Vehicle agent_3",
+        "type": "agent_state",
+        "layer": 0,
+        "timestamp": 0.0,
+        "value": {
+          "position": [
+            1040.944580078125,
+            -2012.5264892578125
+          ],
+          "speed": 1.250908640581742,
+          "type": "VEHICLE"
+        },
+        "description": "VEHICLE at (1040.9, -2012.5), speed 1.3",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "agent_4_state",
+        "name": "Vehicle agent_4",
+        "type": "agent_state",
+        "layer": 0,
+        "timestamp": 0.0,
+        "value": {
+          "position": [
+            1057.3707275390625,
+            -2020.8099365234375
+          ],
+          "speed": 0.22365200176950756,
+          "type": "VEHICLE"
+        },
+        "description": "VEHICLE at (1057.4, -2020.8), speed 0.2",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "maneuver_0",
+        "name": "Maneuver: straight",
+        "type": "maneuver",
+        "layer": 1,
+        "timestamp": 0.0,
+        "value": "straight",
+        "description": "The ego vehicle maintains its lane and direction in moderate traffic.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {
+          "aggressiveness": "normal",
+          "alternatives": [
+            "straight",
+            "stop"
+          ]
+        }
+      },
+      {
+        "id": "maneuver_1",
+        "name": "Maneuver: lane_change_left",
+        "type": "maneuver",
+        "layer": 1,
+        "timestamp": 5.6,
+        "value": "lane_change_left",
+        "description": "The ego vehicle changes to the left lane to prepare for a turn.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {
+          "aggressiveness": "normal",
+          "alternatives": [
+            "lane_change_left",
+            "straight"
+          ]
+        }
+      },
+      {
+        "id": "maneuver_2",
+        "name": "Maneuver: left_turn",
+        "type": "maneuver",
+        "layer": 1,
+        "timestamp": 8.4,
+        "value": "left_turn",
+        "description": "The ego vehicle makes a left turn at the intersection.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {
+          "aggressiveness": "normal",
+          "alternatives": [
+            "left_turn",
+            "straight",
+            "stop"
+          ]
+        }
+      },
+      {
+        "id": "maneuver_3",
+        "name": "Maneuver: straight",
+        "type": "maneuver",
+        "layer": 1,
+        "timestamp": 14.1,
+        "value": "straight",
+        "description": "The ego vehicle continues straight after completing the turn.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {
+          "aggressiveness": "normal",
+          "alternatives": [
+            "straight",
+            "stop"
+          ]
+        }
+      },
+      {
+        "id": "decision_0",
+        "name": "Decision: proceed_or_yield",
+        "type": "decision",
+        "layer": 1,
+        "timestamp": 8.4,
+        "value": "proceed through intersection",
+        "description": "The driver chose to proceed through the intersection while there were other vehicles approaching. This decision was critical to avoid potential collisions.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {
+          "alternatives": [
+            "proceed through intersection",
+            "yield to oncoming traffic"
+          ],
+          "confidence": 0.9
+        }
+      },
+      {
+        "id": "decision_1",
+        "name": "Decision: lane_choice",
+        "type": "decision",
+        "layer": 1,
+        "timestamp": 11.3,
+        "value": "stay in current lane",
+        "description": "Staying in the current lane was crucial as changing lanes could have led to a collision with vehicles in adjacent lanes.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {
+          "alternatives": [
+            "stay in current lane",
+            "change to left lane",
+            "change to right lane"
+          ],
+          "confidence": 0.8
+        }
+      },
+      {
+        "id": "decision_2",
+        "name": "Decision: gap_acceptance",
+        "type": "decision",
+        "layer": 1,
+        "timestamp": 14.1,
+        "value": "accept gap to merge",
+        "description": "The driver accepted a gap to merge into another lane. This was critical to ensure safe merging without causing disruption to the traffic flow.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {
+          "alternatives": [
+            "accept gap to merge",
+            "wait for a larger gap"
+          ],
+          "confidence": 0.85
+        }
+      },
+      {
+        "id": "collision_outcome",
+        "name": "Collision Outcome",
+        "type": "outcome",
+        "layer": 2,
+        "timestamp": null,
+        "value": null,
+        "description": "Whether collision occurs or is avoided",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      }
+    ],
+    "edges": [
+      {
+        "parent": "ego_initial_position",
+        "child": "maneuver_0",
+        "edge_type": "direct",
+        "mechanism": "Initial position influences the initial maneuver choice.",
+        "confidence": 0.7,
+        "metadata": {}
+      },
+      {
+        "parent": "ego_initial_speed",
+        "child": "maneuver_0",
+        "edge_type": "direct",
+        "mechanism": "Initial speed influences the initial maneuver choice.",
+        "confidence": 0.7,
+        "metadata": {}
+      },
+      {
+        "parent": "ego_initial_heading",
+        "child": "maneuver_0",
+        "edge_type": "direct",
+        "mechanism": "Initial heading influences the initial maneuver choice.",
+        "confidence": 0.7,
+        "metadata": {}
+      },
+      {
+        "parent": "agent_0_state",
+        "child": "maneuver_1",
+        "edge_type": "direct",
+        "mechanism": "Presence and state of agent_0 influences lane change decision.",
+        "confidence": 0.6,
+        "metadata": {}
+      },
+      {
+        "parent": "agent_1_state",
+        "child": "maneuver_1",
+        "edge_type": "direct",
+        "mechanism": "Presence and state of agent_1 influences lane change decision.",
+        "confidence": 0.6,
+        "metadata": {}
+      },
+      {
+        "parent": "agent_2_state",
+        "child": "maneuver_1",
+        "edge_type": "direct",
+        "mechanism": "Presence and state of agent_2 influences lane change decision.",
+        "confidence": 0.6,
+        "metadata": {}
+      },
+      {
+        "parent": "agent_3_state",
+        "child": "maneuver_1",
+        "edge_type": "direct",
+        "mechanism": "Presence and state of agent_3 influences lane change decision.",
+        "confidence": 0.6,
+        "metadata": {}
+      },
+      {
+        "parent": "agent_4_state",
+        "child": "maneuver_1",
+        "edge_type": "direct",
+        "mechanism": "Presence and state of agent_4 influences lane change decision.",
+        "confidence": 0.6,
+        "metadata": {}
+      },
+      {
+        "parent": "maneuver_0",
+        "child": "maneuver_1",
+        "edge_type": "direct",
+        "mechanism": "Initial maneuver influences subsequent lane change.",
+        "confidence": 0.8,
+        "metadata": {}
+      },
+      {
+        "parent": "maneuver_1",
+        "child": "maneuver_2",
+        "edge_type": "direct",
+        "mechanism": "Lane change prepares for left turn.",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "maneuver_2",
+        "child": "maneuver_3",
+        "edge_type": "direct",
+        "mechanism": "Left turn leads to continuation straight.",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "maneuver_2",
+        "child": "decision_0",
+        "edge_type": "direct",
+        "mechanism": "Left turn decision affects intersection crossing.",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "decision_0",
+        "child": "collision_outcome",
+        "edge_type": "direct",
+        "mechanism": "Decision to proceed affects collision outcome.",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "maneuver_1",
+        "child": "decision_1",
+        "edge_type": "direct",
+        "mechanism": "Lane change affects lane choice decision.",
+        "confidence": 0.8,
+        "metadata": {}
+      },
+      {
+        "parent": "decision_1",
+        "child": "collision_outcome",
+        "edge_type": "direct",
+        "mechanism": "Lane choice affects collision outcome.",
+        "confidence": 0.8,
+        "metadata": {}
+      },
+      {
+        "parent": "maneuver_3",
+        "child": "decision_2",
+        "edge_type": "direct",
+        "mechanism": "Continuing straight affects gap acceptance decision.",
+        "confidence": 0.85,
+        "metadata": {}
+      },
+      {
+        "parent": "decision_2",
+        "child": "collision_outcome",
+        "edge_type": "direct",
+        "mechanism": "Gap acceptance affects collision outcome.",
+        "confidence": 0.85,
+        "metadata": {}
+      },
+      {
+        "parent": "maneuver_0",
+        "child": "collision_outcome",
+        "edge_type": "direct",
+        "mechanism": "Event affects collision outcome",
+        "confidence": 0.7,
+        "metadata": {}
+      },
+      {
+        "parent": "maneuver_1",
+        "child": "collision_outcome",
+        "edge_type": "direct",
+        "mechanism": "Event affects collision outcome",
+        "confidence": 0.7,
+        "metadata": {}
+      },
+      {
+        "parent": "maneuver_2",
+        "child": "collision_outcome",
+        "edge_type": "direct",
+        "mechanism": "Event affects collision outcome",
+        "confidence": 0.7,
+        "metadata": {}
+      },
+      {
+        "parent": "maneuver_3",
+        "child": "collision_outcome",
+        "edge_type": "direct",
+        "mechanism": "Event affects collision outcome",
+        "confidence": 0.7,
+        "metadata": {}
+      }
+    ],
+    "metadata": {
+      "llm_reasoning": "Edges inferred between 16 grounded nodes"
+    }
+  },
+  "interventions": [
+    {
+      "variable": "ego_initial_speed",
+      "value": 0.00016491962014697492,
+      "original_value": 0.00032983924029394984,
+      "description": "Set Ego Initial Speed to 0.00016491962014697492 (was 0.00032983924029394984)"
+    },
+    {
+      "variable": "ego_initial_speed",
+      "value": 0.0002473794302204624,
+      "original_value": 0.00032983924029394984,
+      "description": "Set Ego Initial Speed to 0.0002473794302204624 (was 0.00032983924029394984)"
+    },
+    {
+      "variable": "ego_initial_speed",
+      "value": 0.0004122990503674373,
+      "original_value": 0.00032983924029394984,
+      "description": "Set Ego Initial Speed to 0.0004122990503674373 (was 0.00032983924029394984)"
+    },
+    {
+      "variable": "maneuver_0",
+      "value": "stop",
+      "original_value": "straight",
+      "description": "Set Maneuver: straight to stop (was straight)"
+    },
+    {
+      "variable": "maneuver_1",
+      "value": "straight",
+      "original_value": "lane_change_left",
+      "description": "Set Maneuver: lane_change_left to straight (was lane_change_left)"
+    },
+    {
+      "variable": "maneuver_2",
+      "value": "straight",
+      "original_value": "left_turn",
+      "description": "Set Maneuver: left_turn to straight (was left_turn)"
+    },
+    {
+      "variable": "maneuver_2",
+      "value": "stop",
+      "original_value": "left_turn",
+      "description": "Set Maneuver: left_turn to stop (was left_turn)"
+    },
+    {
+      "variable": "maneuver_3",
+      "value": "stop",
+      "original_value": "straight",
+      "description": "Set Maneuver: straight to stop (was straight)"
+    },
+    {
+      "variable": "decision_0",
+      "value": "yield to oncoming traffic",
+      "original_value": "proceed through intersection",
+      "description": "Set Decision: proceed_or_yield to yield to oncoming traffic (was proceed through intersection)"
+    },
+    {
+      "variable": "decision_1",
+      "value": "change to left lane",
+      "original_value": "stay in current lane",
+      "description": "Set Decision: lane_choice to change to left lane (was stay in current lane)"
+    },
+    {
+      "variable": "decision_1",
+      "value": "change to right lane",
+      "original_value": "stay in current lane",
+      "description": "Set Decision: lane_choice to change to right lane (was stay in current lane)"
+    },
+    {
+      "variable": "decision_2",
+      "value": "wait for a larger gap",
+      "original_value": "accept gap to merge",
+      "description": "Set Decision: gap_acceptance to wait for a larger gap (was accept gap to merge)"
+    }
+  ],
+  "counterfactuals": [
+    {
+      "intervention": {
+        "variable": "ego_initial_speed",
+        "value": 0.00016491962014697492,
+        "original_value": 0.00032983924029394984,
+        "description": "Set Ego Initial Speed to 0.00016491962014697492 (was 0.00032983924029394984)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "collision likely",
+      "counterfactual_outcome": "collision less likely",
+      "effect_direction": "decrease",
+      "confidence": 0.85,
+      "reasoning": "Reducing the ego vehicle's initial speed from 0.00032983924029394984 to 0.00016491962014697492 decreases the likelihood of a collision. The slower speed allows more time for the ego vehicle to react to other vehicles and adjust its trajectory or speed accordingly. Given that 7 causal paths are affected, this intervention likely impacts the vehicle's ability to avoid collisions by providing more time to make decisions and execute maneuvers safely.",
+      "affected_paths": [
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "decision_0",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "maneuver_3",
+          "decision_2",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "maneuver_3",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "decision_1",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "ego_initial_speed",
+        "value": 0.0002473794302204624,
+        "original_value": 0.00032983924029394984,
+        "description": "Set Ego Initial Speed to 0.0002473794302204624 (was 0.00032983924029394984)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "collision",
+      "counterfactual_outcome": "no collision",
+      "effect_direction": "decrease",
+      "confidence": 0.85,
+      "reasoning": "The intervention reduces the ego vehicle's initial speed from 0.00032983924029394984 to 0.0002473794302204624. This slight reduction in speed, although minimal, could have a significant impact on the collision outcome due to the complex interactions between the ego vehicle and other agents. The causal paths affected suggest that the ego vehicle's speed plays a critical role in the timing and positioning relative to other vehicles. By reducing the speed, the ego vehicle likely has more time to react to other vehicles' maneuvers, reducing the likelihood of a collision.",
+      "affected_paths": [
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "decision_0",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "maneuver_3",
+          "decision_2",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "maneuver_3",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "decision_1",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "ego_initial_speed",
+        "value": 0.0004122990503674373,
+        "original_value": 0.00032983924029394984,
+        "description": "Set Ego Initial Speed to 0.0004122990503674373 (was 0.00032983924029394984)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "no_collision",
+      "counterfactual_outcome": "no_collision",
+      "effect_direction": "unchanged",
+      "confidence": 0.9,
+      "reasoning": "The intervention slightly increases the ego vehicle's initial speed from 0.00032983924029394984 to 0.0004122990503674373. Given the very low speeds involved, this change is unlikely to significantly affect the dynamics of the scenario. The causal paths affected do not seem to have a strong influence on the collision outcome, and the original speed was already very low, suggesting a low likelihood of collision. Therefore, the collision outcome remains unchanged with high confidence.",
+      "affected_paths": [
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "decision_0",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "maneuver_3",
+          "decision_2",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "maneuver_3",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "maneuver_1",
+          "decision_1",
+          "collision_outcome"
+        ],
+        [
+          "ego_initial_speed",
+          "maneuver_0",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "maneuver_0",
+        "value": "stop",
+        "original_value": "straight",
+        "description": "Set Maneuver: straight to stop (was straight)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "collision likely",
+      "counterfactual_outcome": "collision avoided",
+      "effect_direction": "decrease",
+      "confidence": 0.9,
+      "reasoning": "The original maneuver was 'straight', which likely led to a collision due to the proximity and speed of surrounding vehicles. By changing the maneuver to 'stop', the ego vehicle would halt its movement, reducing the likelihood of colliding with other vehicles. The intervention affects 7 causal paths, indicating a significant impact on the outcome. Given the initial conditions and the dynamics of the scenario, stopping would likely prevent a collision, hence the high confidence in this assessment.",
+      "affected_paths": [
+        [
+          "maneuver_0",
+          "maneuver_1",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "decision_0",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "maneuver_3",
+          "decision_2",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_0",
+          "maneuver_1",
+          "maneuver_2",
+          "maneuver_3",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_0",
+          "maneuver_1",
+          "decision_1",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_0",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "maneuver_1",
+        "value": "straight",
+        "original_value": "lane_change_left",
+        "description": "Set Maneuver: lane_change_left to straight (was lane_change_left)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "collision",
+      "counterfactual_outcome": "no_collision",
+      "effect_direction": "decrease",
+      "confidence": 0.85,
+      "reasoning": "The original maneuver was a lane change to the left, which likely increased the risk of collision due to the presence of other vehicles in adjacent lanes. By changing the maneuver to 'straight', the ego vehicle maintains its lane, reducing the likelihood of intersecting paths with other vehicles. Given the positions and speeds of nearby vehicles, maintaining a straight path is less likely to result in a collision, hence the decrease in collision outcome.",
+      "affected_paths": [
+        [
+          "maneuver_1",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_1",
+          "maneuver_2",
+          "decision_0",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_1",
+          "maneuver_2",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_1",
+          "maneuver_2",
+          "maneuver_3",
+          "decision_2",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_1",
+          "maneuver_2",
+          "maneuver_3",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_1",
+          "decision_1",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "maneuver_2",
+        "value": "straight",
+        "original_value": "left_turn",
+        "description": "Set Maneuver: left_turn to straight (was left_turn)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "collision",
+      "counterfactual_outcome": "no_collision",
+      "effect_direction": "decrease",
+      "confidence": 0.85,
+      "reasoning": "The original maneuver was a left turn, which typically involves crossing paths with oncoming traffic, increasing the risk of collision. By changing the maneuver to straight, the ego vehicle avoids crossing paths with other vehicles, thereby reducing the likelihood of a collision. Given the positions and speeds of the other vehicles, proceeding straight likely avoids potential conflict points, leading to a decrease in collision risk.",
+      "affected_paths": [
+        [
+          "maneuver_2",
+          "decision_0",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_2",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_2",
+          "maneuver_3",
+          "decision_2",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_2",
+          "maneuver_3",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "maneuver_2",
+        "value": "stop",
+        "original_value": "left_turn",
+        "description": "Set Maneuver: left_turn to stop (was left_turn)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "collision",
+      "counterfactual_outcome": "no_collision",
+      "effect_direction": "decrease",
+      "confidence": 0.9,
+      "reasoning": "The original maneuver was a left turn, which likely involved crossing paths with other vehicles, increasing the risk of collision. By changing the maneuver to stop, the vehicle avoids entering the intersection, thereby reducing the likelihood of a collision. The intervention directly affects the decision to proceed through the intersection, which is a critical point for collision risk. Given the presence of multiple vehicles and the complexity of the intersection, stopping significantly decreases the chance of collision.",
+      "affected_paths": [
+        [
+          "maneuver_2",
+          "decision_0",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_2",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_2",
+          "maneuver_3",
+          "decision_2",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_2",
+          "maneuver_3",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "maneuver_3",
+        "value": "stop",
+        "original_value": "straight",
+        "description": "Set Maneuver: straight to stop (was straight)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "collision likely",
+      "counterfactual_outcome": "collision avoided",
+      "effect_direction": "decrease",
+      "confidence": 0.9,
+      "reasoning": "The original maneuver was 'straight', which likely led to a collision due to the proximity and speeds of surrounding vehicles. By changing the maneuver to 'stop', the ego vehicle avoids moving into potential collision paths, thereby reducing the likelihood of a collision. The intervention directly affects two causal paths related to the decision to proceed through the intersection and the maneuver choice, leading to a significant decrease in collision risk.",
+      "affected_paths": [
+        [
+          "maneuver_3",
+          "decision_2",
+          "collision_outcome"
+        ],
+        [
+          "maneuver_3",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "decision_0",
+        "value": "yield to oncoming traffic",
+        "original_value": "proceed through intersection",
+        "description": "Set Decision: proceed_or_yield to yield to oncoming traffic (was proceed through intersection)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "collision likely",
+      "counterfactual_outcome": "collision avoided",
+      "effect_direction": "decrease",
+      "confidence": 0.9,
+      "reasoning": "In the original scenario, the ego vehicle's decision to proceed through the intersection increases the risk of collision with oncoming traffic, given the presence and speed of other vehicles. By changing the decision to yield, the ego vehicle allows oncoming traffic to pass, significantly reducing the likelihood of a collision. The causal path affected involves the decision-making process at the intersection, directly impacting the collision outcome.",
+      "affected_paths": [
+        [
+          "decision_0",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "decision_1",
+        "value": "change to left lane",
+        "original_value": "stay in current lane",
+        "description": "Set Decision: lane_choice to change to left lane (was stay in current lane)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "no collision",
+      "counterfactual_outcome": "collision",
+      "effect_direction": "increase",
+      "confidence": 0.85,
+      "reasoning": "The original decision to stay in the current lane likely resulted in no collision due to the relative positions and speeds of surrounding vehicles. Changing to the left lane could increase the risk of collision, particularly with agent_0 and agent_4, who are positioned close to the ego vehicle's left side. Given the low initial speed of the ego vehicle, a lane change might not be executed swiftly enough to avoid these vehicles, leading to a higher likelihood of collision.",
+      "affected_paths": [
+        [
+          "decision_1",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "decision_1",
+        "value": "change to right lane",
+        "original_value": "stay in current lane",
+        "description": "Set Decision: lane_choice to change to right lane (was stay in current lane)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "no collision",
+      "counterfactual_outcome": "collision with agent_0",
+      "effect_direction": "increase",
+      "confidence": 0.85,
+      "reasoning": "The original decision to stay in the current lane likely resulted in no collision due to the ego vehicle's initial position and speed, which allowed it to maintain a safe distance from other vehicles. Changing to the right lane would place the ego vehicle in closer proximity to agent_0, which is moving at a higher speed and is positioned slightly ahead in the right lane. This increases the likelihood of a collision due to the reduced space and time to react to the faster-moving agent_0.",
+      "affected_paths": [
+        [
+          "decision_1",
+          "collision_outcome"
+        ]
+      ]
+    },
+    {
+      "intervention": {
+        "variable": "decision_2",
+        "value": "wait for a larger gap",
+        "original_value": "accept gap to merge",
+        "description": "Set Decision: gap_acceptance to wait for a larger gap (was accept gap to merge)"
+      },
+      "outcome_variable": "collision_outcome",
+      "original_outcome": "collision likely due to small gap acceptance",
+      "counterfactual_outcome": "collision unlikely due to waiting for a larger gap",
+      "effect_direction": "decrease",
+      "confidence": 0.9,
+      "reasoning": "The original decision to accept a small gap for merging increases the risk of collision due to limited space and time to safely merge. By intervening and waiting for a larger gap, the ego vehicle has more space and time to merge safely, reducing the likelihood of a collision. The causal path affected involves the decision-making process regarding gap acceptance, which directly impacts the collision outcome. Given the traffic dynamics and the positions and speeds of surrounding vehicles, waiting for a larger gap is a safer choice, thus decreasing the probability of a collision.",
+      "affected_paths": [
+        [
+          "decision_2",
+          "collision_outcome"
+        ]
+      ]
+    }
+  ],
+  "outputs": {
+    "visualization": "outputs/grounded_dag/104202f4f2590dff/dag.png",
+    "dot_file": "outputs/grounded_dag/104202f4f2590dff/dag.dot"
+  }
+}

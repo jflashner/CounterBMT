@@ -1,0 +1,388 @@
+{
+  "scenario_id": "95486a58dcccb03c",
+  "nodes": [
+    {
+      "id": "ego_initial_position",
+      "name": "Ego Initial Position",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_speed",
+      "name": "Ego Initial Speed",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": 11.701993942260742,
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_heading",
+      "name": "Ego Initial Heading",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": -1.5240892171859741,
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_769_state",
+      "name": "Vehicle agent_769",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          253.34226989746094,
+          -14832.9072265625
+        ],
+        "speed": 0.0,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_770_state",
+      "name": "Vehicle agent_770",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          270.0523376464844,
+          -14833.0009765625
+        ],
+        "speed": 0.0,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_787_state",
+      "name": "Vehicle agent_787",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          322.4280700683594,
+          -14761.7392578125
+        ],
+        "speed": 2.6174974969635136,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_790_state",
+      "name": "Vehicle agent_790",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          268.5361328125,
+          -14784.3759765625
+        ],
+        "speed": 23.030379051218993,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_794_state",
+      "name": "Vehicle agent_794",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          281.3855285644531,
+          -14861.640625
+        ],
+        "speed": 0.0,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_0",
+      "name": "Maneuver: straight",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "straight",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_1",
+      "name": "Maneuver: decelerate",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "decelerate",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_2",
+      "name": "Maneuver: stop",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "stop",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_3",
+      "name": "Maneuver: accelerate",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "accelerate",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_0",
+      "name": "Decision: proceed_or_yield",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "proceeded through the intersection",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_1",
+      "name": "Decision: lane_choice",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "remained in the current lane",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_2",
+      "name": "Decision: gap_acceptance",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "accepted the gap to merge",
+      "is_interventionable": false
+    },
+    {
+      "id": "collision_outcome",
+      "name": "Collision Outcome",
+      "node_type": "outcome",
+      "layer": 2,
+      "value": null,
+      "is_interventionable": false
+    }
+  ],
+  "edges": [
+    {
+      "parent_id": "ego_initial_position",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial position influences the decision to maintain lane and direction."
+    },
+    {
+      "parent_id": "ego_initial_speed",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial speed influences the decision to maintain speed and direction."
+    },
+    {
+      "parent_id": "ego_initial_heading",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial heading influences the decision to maintain direction."
+    },
+    {
+      "parent_id": "agent_769_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence of agent_769 influences the decision to proceed or yield."
+    },
+    {
+      "parent_id": "agent_770_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence of agent_770 influences the decision to proceed or yield."
+    },
+    {
+      "parent_id": "agent_787_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence of agent_787 influences the decision to proceed or yield."
+    },
+    {
+      "parent_id": "agent_790_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence of agent_790 influences the decision to proceed or yield."
+    },
+    {
+      "parent_id": "agent_794_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence of agent_794 influences the decision to proceed or yield."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "maneuver_1",
+      "confidence": 0.9,
+      "mechanism": "Maintaining direction leads to the need to decelerate as the intersection approaches."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "maneuver_2",
+      "confidence": 0.9,
+      "mechanism": "Deceleration leads to stopping at the intersection."
+    },
+    {
+      "parent_id": "maneuver_2",
+      "child_id": "maneuver_3",
+      "confidence": 0.9,
+      "mechanism": "Stopping at the intersection leads to the decision to accelerate."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "maneuver_1",
+      "confidence": 0.8,
+      "mechanism": "Decision to proceed influences the need to decelerate."
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "maneuver_2",
+      "confidence": 0.8,
+      "mechanism": "Decision to remain in lane influences stopping at the intersection."
+    },
+    {
+      "parent_id": "decision_2",
+      "child_id": "maneuver_3",
+      "confidence": 0.9,
+      "mechanism": "Decision to accept the gap influences the acceleration maneuver."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Deceleration affects the likelihood of collision."
+    },
+    {
+      "parent_id": "maneuver_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Stopping affects the likelihood of collision."
+    },
+    {
+      "parent_id": "maneuver_3",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Acceleration affects the likelihood of collision."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.8,
+      "mechanism": "Decision to proceed or yield affects the likelihood of collision."
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Lane choice affects the likelihood of collision."
+    },
+    {
+      "parent_id": "decision_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.9,
+      "mechanism": "Gap acceptance affects the likelihood of collision."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Event affects collision outcome"
+    }
+  ],
+  "summary": {
+    "n_nodes": 16,
+    "n_edges": 21,
+    "n_initial_state_nodes": 8,
+    "n_event_nodes": 7,
+    "n_outcome_nodes": 1
+  },
+  "vlm_extraction": {
+    "maneuvers": [
+      {
+        "maneuver_type": "straight",
+        "start_timestep": 0,
+        "end_timestep": 37,
+        "start_timestamp": 0.0,
+        "end_timestamp": 3.8,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle maintains its lane and direction, moving straight through the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "decelerate",
+        "start_timestep": 37,
+        "end_timestep": 50,
+        "start_timestamp": 3.8,
+        "end_timestamp": 5.1,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle slows down as it approaches the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "stop",
+        "start_timestep": 50,
+        "end_timestep": 64,
+        "start_timestamp": 5.1,
+        "end_timestamp": 6.4,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle comes to a stop at the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "accelerate",
+        "start_timestep": 64,
+        "end_timestep": 90,
+        "start_timestamp": 6.4,
+        "end_timestamp": 9.0,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle accelerates after stopping, continuing straight through the intersection.",
+        "confidence": 1.0
+      }
+    ],
+    "decisions": [
+      {
+        "timestep": 37,
+        "timestamp": 3.8,
+        "decision_type": "proceed_or_yield",
+        "ground_truth_choice": "proceeded through the intersection",
+        "alternatives": [
+          "proceeded through the intersection",
+          "yielded to cross traffic"
+        ],
+        "description": "The driver chose to proceed through the intersection when there was a gap in cross traffic. Yielding could have been safer if the gap was misjudged.",
+        "confidence": 0.8
+      },
+      {
+        "timestep": 50,
+        "timestamp": 5.1,
+        "decision_type": "lane_choice",
+        "ground_truth_choice": "remained in the current lane",
+        "alternatives": [
+          "remained in the current lane",
+          "changed to the left lane"
+        ],
+        "description": "Staying in the current lane was critical to avoid potential conflicts with vehicles in the left lane.",
+        "confidence": 0.7
+      },
+      {
+        "timestep": 64,
+        "timestamp": 6.4,
+        "decision_type": "gap_acceptance",
+        "ground_truth_choice": "accepted the gap to merge",
+        "alternatives": [
+          "accepted the gap to merge",
+          "waited for a larger gap"
+        ],
+        "description": "The driver accepted a gap to merge into traffic, which was critical to avoid collision with vehicles approaching from behind.",
+        "confidence": 0.9
+      }
+    ]
+  }
+}

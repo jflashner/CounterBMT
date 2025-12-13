@@ -1,0 +1,25 @@
+{
+  "scenario_id": "90078b3dd8e4b3b1",
+  "scenario_index": 0,
+  "interventions": [
+    "Lane change: right (t=3-7)",
+    "Lane change: stay (t=8-15)"
+  ],
+  "n_samples": 10,
+  "temperature": 1.0,
+  "timestamp": "20251210_221856",
+  "exported_scenarios": [
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_00_GROUND_TRUTH.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_01_BASELINE.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_02_Lane_change:_right_(t=3-7)_+_L_s0.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_03_Lane_change:_right_(t=3-7)_+_L_s1.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_04_Lane_change:_right_(t=3-7)_+_L_s2.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_05_Lane_change:_right_(t=3-7)_+_L_s3.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_06_Lane_change:_right_(t=3-7)_+_L_s4.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_07_Lane_change:_right_(t=3-7)_+_L_s5.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_08_Lane_change:_right_(t=3-7)_+_L_s6.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_09_Lane_change:_right_(t=3-7)_+_L_s7.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_10_Lane_change:_right_(t=3-7)_+_L_s8.pkl",
+    "outputs/experiments/90078b3dd8e4b3b1_20251210_221856/replay_scenarios/sd_experiment_1.0_90078b3dd8e4b3b1_11_Lane_change:_right_(t=3-7)_+_L_s9.pkl"
+  ]
+}

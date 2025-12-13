@@ -1,0 +1,52 @@
+digraph GroundedDAG {
+    rankdir=TB;
+    node [shape=box, style=filled];
+
+    // Layer 0: Initial States
+    subgraph cluster_0 {
+        label="Layer 0: Initial States";
+        style=dashed;
+        "ego_initial_position" [label="Ego Initial Position\n{'x': 2367.407714843", fillcolor=skyblue];
+        "ego_initial_speed" [label="Ego Initial Speed\n4.557555198669434", fillcolor=skyblue];
+        "ego_initial_heading" [label="Ego Initial Heading\n1.796108365058899", fillcolor=skyblue];
+        "agent_1699_state" [label="Vehicle agent_1699\n{'position': (2383.6", fillcolor=plum];
+        "agent_1704_state" [label="Vehicle agent_1704\n{'position': (2365.4", fillcolor=plum];
+        "agent_1706_state" [label="Vehicle agent_1706\n{'position': (2354.0", fillcolor=plum];
+        "agent_1708_state" [label="Vehicle agent_1708\n{'position': (2324.9", fillcolor=plum];
+        "agent_1710_state" [label="Vehicle agent_1710\n{'position': (2342.5", fillcolor=plum];
+    }
+
+    // Layer 1: Events
+    subgraph cluster_1 {
+        label="Layer 1: Events";
+        style=dashed;
+        "maneuver_0" [label="Maneuver: straight\nstraight", fillcolor=turquoise];
+        "maneuver_1" [label="Maneuver: decelerate\ndecelerate", fillcolor=turquoise];
+        "maneuver_2" [label="Maneuver: stop\nstop", fillcolor=turquoise];
+        "maneuver_3" [label="Maneuver: accelerate\naccelerate", fillcolor=turquoise];
+        "decision_0" [label="Decision: proceed_or_yield\nproceed", fillcolor=coral];
+        "decision_1" [label="Decision: evasive_action\nno evasive action", fillcolor=coral];
+    }
+
+    // Layer 2: Outcome
+    subgraph cluster_2 {
+        label="Layer 2: Outcome";
+        style=dashed;
+        "collision_outcome" [label="Collision Outcome", fillcolor=orange];
+    }
+
+    "ego_initial_position" -> "maneuver_0" [label="0.70"];
+    "ego_initial_speed" -> "maneuver_0" [label="0.80"];
+    "ego_initial_heading" -> "maneuver_0" [label="0.80"];
+    "maneuver_0" -> "maneuver_1" [label="0.90"];
+    "maneuver_1" -> "maneuver_2" [label="0.90"];
+    "maneuver_2" -> "maneuver_3" [label="0.90"];
+    "maneuver_2" -> "decision_0" [label="0.80"];
+    "decision_0" -> "decision_1" [label="0.80"];
+    "decision_1" -> "collision_outcome" [label="0.90"];
+    "maneuver_0" -> "collision_outcome" [label="0.70"];
+    "maneuver_1" -> "collision_outcome" [label="0.70"];
+    "maneuver_2" -> "collision_outcome" [label="0.70"];
+    "maneuver_3" -> "collision_outcome" [label="0.70"];
+    "decision_0" -> "collision_outcome" [label="0.70"];
+}

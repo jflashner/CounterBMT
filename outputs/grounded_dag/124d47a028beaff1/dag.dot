@@ -1,0 +1,45 @@
+digraph GroundedDAG {
+    rankdir=TB;
+    node [shape=box, style=filled];
+
+    // Layer 0: Initial States
+    subgraph cluster_0 {
+        label="Layer 0: Initial States";
+        style=dashed;
+        "ego_initial_position" [label="Ego Initial Position\n{'x': 737.9638061523", fillcolor=skyblue];
+        "ego_initial_speed" [label="Ego Initial Speed\n6.445694923400879", fillcolor=skyblue];
+        "ego_initial_heading" [label="Ego Initial Heading\n0.022872501984238625", fillcolor=skyblue];
+        "agent_492_state" [label="Vehicle agent_492\n{'position': (746.29", fillcolor=plum];
+    }
+
+    // Layer 1: Events
+    subgraph cluster_1 {
+        label="Layer 1: Events";
+        style=dashed;
+        "maneuver_0" [label="Maneuver: left_turn\nleft_turn", fillcolor=turquoise];
+        "maneuver_1" [label="Maneuver: accelerate\naccelerate", fillcolor=turquoise];
+        "decision_0" [label="Decision: proceed_or_yield\nproceed", fillcolor=coral];
+        "decision_1" [label="Decision: evasive_action\nmaintain course", fillcolor=coral];
+        "decision_2" [label="Decision: gap_acceptance\naccept gap", fillcolor=coral];
+    }
+
+    // Layer 2: Outcome
+    subgraph cluster_2 {
+        label="Layer 2: Outcome";
+        style=dashed;
+        "collision_outcome" [label="Collision Outcome", fillcolor=orange];
+    }
+
+    "ego_initial_position" -> "maneuver_0" [label="0.80"];
+    "ego_initial_speed" -> "maneuver_0" [label="0.85"];
+    "ego_initial_heading" -> "maneuver_0" [label="0.80"];
+    "maneuver_0" -> "maneuver_1" [label="0.90"];
+    "maneuver_0" -> "decision_0" [label="0.70"];
+    "decision_0" -> "decision_1" [label="0.90"];
+    "decision_1" -> "decision_2" [label="0.85"];
+    "decision_2" -> "collision_outcome" [label="0.90"];
+    "maneuver_0" -> "collision_outcome" [label="0.70"];
+    "maneuver_1" -> "collision_outcome" [label="0.70"];
+    "decision_0" -> "collision_outcome" [label="0.70"];
+    "decision_1" -> "collision_outcome" [label="0.70"];
+}

@@ -1,0 +1,54 @@
+digraph GroundedDAG {
+    rankdir=TB;
+    node [shape=box, style=filled];
+
+    // Layer 0: Initial States
+    subgraph cluster_0 {
+        label="Layer 0: Initial States";
+        style=dashed;
+        "ego_initial_position" [label="Ego Initial Position\n{'x': 0.0, 'y': 0.0}", fillcolor=skyblue];
+        "ego_initial_speed" [label="Ego Initial Speed\n0.002216054359450936", fillcolor=skyblue];
+        "ego_initial_heading" [label="Ego Initial Heading\n-1.530601978302002", fillcolor=skyblue];
+        "agent_887_state" [label="Vehicle agent_887\n{'position': (-2591.", fillcolor=plum];
+        "agent_888_state" [label="Vehicle agent_888\n{'position': (-2553.", fillcolor=plum];
+        "agent_889_state" [label="Vehicle agent_889\n{'position': (-2646.", fillcolor=plum];
+        "agent_890_state" [label="Vehicle agent_890\n{'position': (-2655.", fillcolor=plum];
+        "agent_892_state" [label="Vehicle agent_892\n{'position': (-2534.", fillcolor=plum];
+    }
+
+    // Layer 1: Events
+    subgraph cluster_1 {
+        label="Layer 1: Events";
+        style=dashed;
+        "maneuver_0" [label="Maneuver: straight\nstraight", fillcolor=turquoise];
+        "maneuver_1" [label="Maneuver: right_turn\nright_turn", fillcolor=turquoise];
+        "maneuver_2" [label="Maneuver: straight\nstraight", fillcolor=turquoise];
+        "decision_0" [label="Decision: proceed_or_yield\nproceed through intersection", fillcolor=coral];
+        "decision_1" [label="Decision: evasive_action\nmaintain course", fillcolor=coral];
+    }
+
+    // Layer 2: Outcome
+    subgraph cluster_2 {
+        label="Layer 2: Outcome";
+        style=dashed;
+        "collision_outcome" [label="Collision Outcome", fillcolor=orange];
+    }
+
+    "ego_initial_position" -> "maneuver_0" [label="0.80"];
+    "ego_initial_speed" -> "maneuver_0" [label="0.80"];
+    "ego_initial_heading" -> "maneuver_0" [label="0.80"];
+    "agent_887_state" -> "decision_0" [label="0.70"];
+    "agent_888_state" -> "decision_0" [label="0.70"];
+    "agent_889_state" -> "decision_0" [label="0.70"];
+    "agent_890_state" -> "decision_0" [label="0.70"];
+    "agent_892_state" -> "decision_0" [label="0.70"];
+    "maneuver_0" -> "maneuver_1" [label="0.90"];
+    "maneuver_1" -> "maneuver_2" [label="0.90"];
+    "decision_0" -> "maneuver_1" [label="0.80"];
+    "maneuver_2" -> "decision_1" [label="0.80"];
+    "decision_1" -> "collision_outcome" [label="0.90"];
+    "maneuver_1" -> "collision_outcome" [label="0.80"];
+    "maneuver_2" -> "collision_outcome" [label="0.80"];
+    "maneuver_0" -> "collision_outcome" [label="0.70"];
+    "decision_0" -> "collision_outcome" [label="0.70"];
+}

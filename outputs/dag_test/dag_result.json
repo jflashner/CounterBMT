@@ -1,0 +1,242 @@
+{
+  "scenario_id": "124d47a028beaff1",
+  "extraction": {
+    "n_maneuvers": 0,
+    "n_decisions": 0
+  },
+  "dag": {
+    "scenario_id": "124d47a028beaff1",
+    "nodes": [
+      {
+        "id": "weather_conditions",
+        "name": "weather_conditions",
+        "type": "environmental",
+        "timestamp": null,
+        "value": null,
+        "description": "Current weather conditions affecting visibility and road conditions.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "road_conditions",
+        "name": "road_conditions",
+        "type": "environmental",
+        "timestamp": null,
+        "value": null,
+        "description": "Current state of the road, including surface type and quality.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "vehicle_speed",
+        "name": "vehicle_speed",
+        "type": "vehicle_state",
+        "timestamp": null,
+        "value": null,
+        "description": "Current speed of the vehicle.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "traffic_signals",
+        "name": "traffic_signals",
+        "type": "perception",
+        "timestamp": null,
+        "value": null,
+        "description": "Traffic signals perceived by the vehicle's sensors.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "pedestrian_presence",
+        "name": "pedestrian_presence",
+        "type": "perception",
+        "timestamp": null,
+        "value": null,
+        "description": "Detection of pedestrians near the vehicle.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "obstacle_detection",
+        "name": "obstacle_detection",
+        "type": "perception",
+        "timestamp": null,
+        "value": null,
+        "description": "Detection of obstacles on the road.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "lane_position",
+        "name": "lane_position",
+        "type": "vehicle_state",
+        "timestamp": null,
+        "value": null,
+        "description": "Current position of the vehicle within its lane.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "braking_decision",
+        "name": "braking_decision",
+        "type": "decision",
+        "timestamp": null,
+        "value": null,
+        "description": "Decision to apply brakes based on perceptions.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "steering_decision",
+        "name": "steering_decision",
+        "type": "decision",
+        "timestamp": null,
+        "value": null,
+        "description": "Decision to adjust steering based on perceptions.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "collision_avoidance_maneuver",
+        "name": "collision_avoidance_maneuver",
+        "type": "maneuver",
+        "timestamp": null,
+        "value": null,
+        "description": "Maneuver executed to avoid collision.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "collision_outcome",
+        "name": "collision_outcome",
+        "type": "outcome",
+        "timestamp": null,
+        "value": null,
+        "description": "Outcome related to collision occurrence or avoidance.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      },
+      {
+        "id": "injury_severity",
+        "name": "injury_severity",
+        "type": "severity",
+        "timestamp": null,
+        "value": null,
+        "description": "Severity of injuries if a collision occurs.",
+        "is_intervened": false,
+        "is_observed": true,
+        "metadata": {}
+      }
+    ],
+    "edges": [
+      {
+        "parent": "weather_conditions",
+        "child": "obstacle_detection",
+        "edge_type": "direct",
+        "mechanism": "Affects sensor accuracy",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "road_conditions",
+        "child": "vehicle_speed",
+        "edge_type": "direct",
+        "mechanism": "Influences safe driving speed",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "vehicle_speed",
+        "child": "braking_decision",
+        "edge_type": "direct",
+        "mechanism": "Determines urgency of braking",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "traffic_signals",
+        "child": "braking_decision",
+        "edge_type": "direct",
+        "mechanism": "Influences decision to stop",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "pedestrian_presence",
+        "child": "braking_decision",
+        "edge_type": "direct",
+        "mechanism": "Triggers braking to avoid collision",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "obstacle_detection",
+        "child": "braking_decision",
+        "edge_type": "direct",
+        "mechanism": "Triggers braking to avoid collision",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "lane_position",
+        "child": "steering_decision",
+        "edge_type": "direct",
+        "mechanism": "Determines need for lane correction",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "braking_decision",
+        "child": "collision_avoidance_maneuver",
+        "edge_type": "direct",
+        "mechanism": "Initiates maneuver to reduce speed",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "steering_decision",
+        "child": "collision_avoidance_maneuver",
+        "edge_type": "direct",
+        "mechanism": "Initiates maneuver to change direction",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "collision_avoidance_maneuver",
+        "child": "collision_outcome",
+        "edge_type": "direct",
+        "mechanism": "Determines if collision is avoided",
+        "confidence": 0.9,
+        "metadata": {}
+      },
+      {
+        "parent": "collision_outcome",
+        "child": "injury_severity",
+        "edge_type": "direct",
+        "mechanism": "Influences severity of injuries",
+        "confidence": 0.9,
+        "metadata": {}
+      }
+    ],
+    "metadata": {
+      "llm_reasoning": "The DAG represents the causal relationships in an autonomous driving scenario. Environmental factors like weather and road conditions are exogenous and influence perception and vehicle state. Perceptions lead to decisions, which in turn cause maneuvers. Outcomes and severity are determined by these maneuvers."
+    }
+  },
+  "counterfactuals": [],
+  "metadata": {
+    "timestamp": "2025-12-06T14:54:24.248731",
+    "llm_reasoning": "The DAG represents the causal relationships in an autonomous driving scenario. Environmental factors like weather and road conditions are exogenous and influence perception and vehicle state. Perceptions lead to decisions, which in turn cause maneuvers. Outcomes and severity are determined by these maneuvers."
+  }
+}

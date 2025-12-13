@@ -1,0 +1,480 @@
+{
+  "scenario_id": "8d4af2ca76b8cb22",
+  "nodes": [
+    {
+      "id": "ego_initial_position",
+      "name": "Ego Initial Position",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_speed",
+      "name": "Ego Initial Speed",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": 0.5516017079353333,
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_heading",
+      "name": "Ego Initial Heading",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": 1.5723304748535156,
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_3252_state",
+      "name": "Pedestrian agent_3252",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          308.7596130371094,
+          -8282.9580078125
+        ],
+        "speed": 0.1329673677590021,
+        "type": "PEDESTRIAN"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_3254_state",
+      "name": "Pedestrian agent_3254",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          359.4085998535156,
+          -8305.1396484375
+        ],
+        "speed": 1.221561130348232,
+        "type": "PEDESTRIAN"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1306_state",
+      "name": "Vehicle agent_1306",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          301.51495361328125,
+          -8277.392578125
+        ],
+        "speed": 4.987395098441692,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1307_state",
+      "name": "Vehicle agent_1307",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          309.1910400390625,
+          -8291.3583984375
+        ],
+        "speed": 0.10734034825783291,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1308_state",
+      "name": "Vehicle agent_1308",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          297.7006530761719,
+          -8266.6630859375
+        ],
+        "speed": 7.237718785722934,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_0",
+      "name": "Maneuver: decelerate",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "decelerate",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_1",
+      "name": "Maneuver: stop",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "stop",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_2",
+      "name": "Maneuver: accelerate",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "accelerate",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_3",
+      "name": "Maneuver: straight",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "straight",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_4",
+      "name": "Maneuver: decelerate",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "decelerate",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_5",
+      "name": "Maneuver: stop",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "stop",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_6",
+      "name": "Maneuver: accelerate",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "accelerate",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_0",
+      "name": "Decision: proceed_or_yield",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "proceed through intersection",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_1",
+      "name": "Decision: lane_choice",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "stay in current lane",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_2",
+      "name": "Decision: evasive_action",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "maintain speed and lane",
+      "is_interventionable": false
+    },
+    {
+      "id": "collision_outcome",
+      "name": "Collision Outcome",
+      "node_type": "outcome",
+      "layer": 2,
+      "value": null,
+      "is_interventionable": false
+    }
+  ],
+  "edges": [
+    {
+      "parent_id": "ego_initial_position",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial position influences the decision to decelerate as the ego approaches the intersection."
+    },
+    {
+      "parent_id": "ego_initial_speed",
+      "child_id": "maneuver_0",
+      "confidence": 0.9,
+      "mechanism": "Initial speed influences the need to decelerate to safely approach the intersection."
+    },
+    {
+      "parent_id": "ego_initial_heading",
+      "child_id": "maneuver_0",
+      "confidence": 0.7,
+      "mechanism": "Initial heading affects the approach to the intersection, influencing the decision to decelerate."
+    },
+    {
+      "parent_id": "agent_3252_state",
+      "child_id": "decision_0",
+      "confidence": 0.6,
+      "mechanism": "The presence and speed of pedestrian agent_3252 influence the decision to proceed or yield at the intersection."
+    },
+    {
+      "parent_id": "agent_3254_state",
+      "child_id": "decision_0",
+      "confidence": 0.6,
+      "mechanism": "The presence and speed of pedestrian agent_3254 influence the decision to proceed or yield at the intersection."
+    },
+    {
+      "parent_id": "agent_1306_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "The presence and speed of vehicle agent_1306 influence the decision to proceed or yield at the intersection."
+    },
+    {
+      "parent_id": "agent_1307_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "The presence and speed of vehicle agent_1307 influence the decision to proceed or yield at the intersection."
+    },
+    {
+      "parent_id": "agent_1308_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "The presence and speed of vehicle agent_1308 influence the decision to proceed or yield at the intersection."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "maneuver_1",
+      "confidence": 0.9,
+      "mechanism": "Deceleration leads to a complete stop at the intersection."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "maneuver_2",
+      "confidence": 0.9,
+      "mechanism": "Stopping at the intersection is followed by acceleration to move forward."
+    },
+    {
+      "parent_id": "maneuver_2",
+      "child_id": "maneuver_3",
+      "confidence": 0.8,
+      "mechanism": "Acceleration leads to continuing straight through the intersection."
+    },
+    {
+      "parent_id": "maneuver_3",
+      "child_id": "maneuver_4",
+      "confidence": 0.7,
+      "mechanism": "Continuing straight leads to deceleration after passing the intersection."
+    },
+    {
+      "parent_id": "maneuver_4",
+      "child_id": "maneuver_5",
+      "confidence": 0.8,
+      "mechanism": "Deceleration leads to another stop after passing the intersection."
+    },
+    {
+      "parent_id": "maneuver_5",
+      "child_id": "maneuver_6",
+      "confidence": 0.9,
+      "mechanism": "Stopping is followed by acceleration to continue moving forward."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "maneuver_3",
+      "confidence": 0.8,
+      "mechanism": "The decision to proceed through the intersection influences the maneuver to continue straight."
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "maneuver_4",
+      "confidence": 0.7,
+      "mechanism": "The decision to stay in the current lane influences the maneuver to decelerate after the intersection."
+    },
+    {
+      "parent_id": "decision_2",
+      "child_id": "maneuver_5",
+      "confidence": 0.9,
+      "mechanism": "The decision to maintain speed and lane influences the maneuver to stop again after passing the intersection."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Deceleration affects the likelihood of avoiding a collision."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.8,
+      "mechanism": "Stopping at the intersection affects the likelihood of avoiding a collision."
+    },
+    {
+      "parent_id": "maneuver_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Acceleration from a stop affects the likelihood of avoiding a collision."
+    },
+    {
+      "parent_id": "maneuver_3",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Continuing straight through the intersection affects the likelihood of avoiding a collision."
+    },
+    {
+      "parent_id": "maneuver_4",
+      "child_id": "collision_outcome",
+      "confidence": 0.6,
+      "mechanism": "Deceleration after the intersection affects the likelihood of avoiding a collision."
+    },
+    {
+      "parent_id": "maneuver_5",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Stopping again affects the likelihood of avoiding a collision."
+    },
+    {
+      "parent_id": "maneuver_6",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Acceleration to continue moving forward affects the likelihood of avoiding a collision."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Event affects collision outcome"
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Event affects collision outcome"
+    },
+    {
+      "parent_id": "decision_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Event affects collision outcome"
+    }
+  ],
+  "summary": {
+    "n_nodes": 19,
+    "n_edges": 27,
+    "n_initial_state_nodes": 8,
+    "n_event_nodes": 10,
+    "n_outcome_nodes": 1
+  },
+  "vlm_extraction": {
+    "maneuvers": [
+      {
+        "maneuver_type": "decelerate",
+        "start_timestep": 0,
+        "end_timestep": 11,
+        "start_timestamp": 0.0,
+        "end_timestamp": 1.2,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle slows down as it approaches the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "stop",
+        "start_timestep": 11,
+        "end_timestep": 25,
+        "start_timestamp": 1.2,
+        "end_timestamp": 2.5,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle comes to a complete stop at the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "accelerate",
+        "start_timestep": 25,
+        "end_timestep": 37,
+        "start_timestamp": 2.5,
+        "end_timestamp": 3.8,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle begins to move forward from the stop.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "straight",
+        "start_timestep": 37,
+        "end_timestep": 50,
+        "start_timestamp": 3.8,
+        "end_timestamp": 5.1,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle continues straight through the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "decelerate",
+        "start_timestep": 50,
+        "end_timestep": 64,
+        "start_timestamp": 5.1,
+        "end_timestamp": 6.4,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle slows down after passing the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "stop",
+        "start_timestep": 64,
+        "end_timestep": 77,
+        "start_timestamp": 6.4,
+        "end_timestamp": 7.7,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle comes to a stop again after passing the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "accelerate",
+        "start_timestep": 77,
+        "end_timestep": 90,
+        "start_timestamp": 7.7,
+        "end_timestamp": 9.0,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle accelerates to continue moving forward.",
+        "confidence": 1.0
+      }
+    ],
+    "decisions": [
+      {
+        "timestep": 37,
+        "timestamp": 3.8,
+        "decision_type": "proceed_or_yield",
+        "ground_truth_choice": "proceed through intersection",
+        "alternatives": [
+          "proceed through intersection",
+          "yield to cross traffic"
+        ],
+        "description": "The driver chose to proceed through the intersection when there was a gap in cross traffic. Yielding could have been safer if the gap was not sufficient.",
+        "confidence": 0.8
+      },
+      {
+        "timestep": 50,
+        "timestamp": 5.1,
+        "decision_type": "lane_choice",
+        "ground_truth_choice": "stay in current lane",
+        "alternatives": [
+          "stay in current lane",
+          "change to left lane",
+          "change to right lane"
+        ],
+        "description": "Staying in the current lane was critical to avoid potential collisions with vehicles in adjacent lanes.",
+        "confidence": 0.7
+      },
+      {
+        "timestep": 64,
+        "timestamp": 6.4,
+        "decision_type": "evasive_action",
+        "ground_truth_choice": "maintain speed and lane",
+        "alternatives": [
+          "maintain speed and lane",
+          "brake hard",
+          "swerve"
+        ],
+        "description": "Maintaining speed and lane was crucial as there was no immediate threat requiring evasive action.",
+        "confidence": 0.9
+      }
+    ]
+  }
+}

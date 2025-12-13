@@ -1,0 +1,360 @@
+{
+  "scenario_id": "eb64ff423da34de2",
+  "nodes": [
+    {
+      "id": "ego_initial_position",
+      "name": "Ego Initial Position",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_speed",
+      "name": "Ego Initial Speed",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": 12.062398910522461,
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_heading",
+      "name": "Ego Initial Heading",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": 2.5647506713867188,
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_0_state",
+      "name": "Vehicle agent_0",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          5471.712890625,
+          9796.861328125
+        ],
+        "speed": 0.0,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1_state",
+      "name": "Vehicle agent_1",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          5450.7587890625,
+          9775.052734375
+        ],
+        "speed": 12.392612754827502,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_4_state",
+      "name": "Vehicle agent_4",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          5462.54296875,
+          9788.6572265625
+        ],
+        "speed": 0.0,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_5_state",
+      "name": "Vehicle agent_5",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          5480.73779296875,
+          9738.4521484375
+        ],
+        "speed": 0.0,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_6_state",
+      "name": "Vehicle agent_6",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          5453.70263671875,
+          9768.55859375
+        ],
+        "speed": 13.178725410444999,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_0",
+      "name": "Maneuver: straight",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "straight",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_1",
+      "name": "Maneuver: lane_change_left",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "lane_change_left",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_2",
+      "name": "Maneuver: straight",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "straight",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_0",
+      "name": "Decision: proceed_or_yield",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "proceed through intersection",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_1",
+      "name": "Decision: lane_choice",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "stay in current lane",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_2",
+      "name": "Decision: evasive_action",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "maintain speed and lane",
+      "is_interventionable": false
+    },
+    {
+      "id": "collision_outcome",
+      "name": "Collision Outcome",
+      "node_type": "outcome",
+      "layer": 2,
+      "value": null,
+      "is_interventionable": false
+    }
+  ],
+  "edges": [
+    {
+      "parent_id": "ego_initial_position",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial position influences the decision to move straight initially."
+    },
+    {
+      "parent_id": "ego_initial_speed",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial speed influences the decision to maintain a straight path."
+    },
+    {
+      "parent_id": "ego_initial_heading",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial heading influences the decision to move straight initially."
+    },
+    {
+      "parent_id": "agent_0_state",
+      "child_id": "decision_0",
+      "confidence": 0.6,
+      "mechanism": "Presence of agent_0 influences the decision to proceed through the intersection."
+    },
+    {
+      "parent_id": "agent_1_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_1 influence the decision to proceed through the intersection."
+    },
+    {
+      "parent_id": "agent_4_state",
+      "child_id": "decision_0",
+      "confidence": 0.6,
+      "mechanism": "Presence of agent_4 influences the decision to proceed through the intersection."
+    },
+    {
+      "parent_id": "agent_5_state",
+      "child_id": "decision_0",
+      "confidence": 0.6,
+      "mechanism": "Presence of agent_5 influences the decision to proceed through the intersection."
+    },
+    {
+      "parent_id": "agent_6_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_6 influence the decision to proceed through the intersection."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "maneuver_1",
+      "confidence": 0.9,
+      "mechanism": "Initial straight maneuver leads to a lane change left maneuver."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "maneuver_2",
+      "confidence": 0.9,
+      "mechanism": "Lane change left maneuver leads to continuing straight in the left lane."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Decision to proceed through intersection influences the initial straight maneuver."
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "maneuver_1",
+      "confidence": 0.7,
+      "mechanism": "Decision to stay in the current lane influences the lane change left maneuver."
+    },
+    {
+      "parent_id": "decision_2",
+      "child_id": "maneuver_2",
+      "confidence": 0.9,
+      "mechanism": "Decision to maintain speed and lane influences continuing straight in the left lane."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Initial maneuver affects the likelihood of collision."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.8,
+      "mechanism": "Lane change maneuver affects the likelihood of collision."
+    },
+    {
+      "parent_id": "maneuver_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Continuing straight in the left lane affects the likelihood of collision."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.8,
+      "mechanism": "Decision to proceed through intersection affects the likelihood of collision."
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Decision to stay in the current lane affects the likelihood of collision."
+    },
+    {
+      "parent_id": "decision_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.9,
+      "mechanism": "Decision to maintain speed and lane affects the likelihood of collision."
+    }
+  ],
+  "summary": {
+    "n_nodes": 15,
+    "n_edges": 19,
+    "n_initial_state_nodes": 8,
+    "n_event_nodes": 6,
+    "n_outcome_nodes": 1
+  },
+  "vlm_extraction": {
+    "maneuvers": [
+      {
+        "maneuver_type": "straight",
+        "start_timestep": 0,
+        "end_timestep": 37,
+        "start_timestamp": 0.0,
+        "end_timestamp": 3.8,
+        "aggressiveness": "normal",
+        "description": "The vehicle maintains its lane and direction, moving straight through the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "lane_change_left",
+        "start_timestep": 37,
+        "end_timestep": 50,
+        "start_timestamp": 3.8,
+        "end_timestamp": 5.1,
+        "aggressiveness": "normal",
+        "description": "The vehicle changes to the left lane after passing the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "straight",
+        "start_timestep": 50,
+        "end_timestep": 90,
+        "start_timestamp": 5.1,
+        "end_timestamp": 9.0,
+        "aggressiveness": "normal",
+        "description": "The vehicle continues straight in the left lane.",
+        "confidence": 1.0
+      }
+    ],
+    "decisions": [
+      {
+        "timestep": 25,
+        "timestamp": 2.5,
+        "decision_type": "proceed_or_yield",
+        "ground_truth_choice": "proceed through intersection",
+        "alternatives": [
+          "proceed through intersection",
+          "yield to cross traffic"
+        ],
+        "description": "The driver chose to proceed through the intersection without yielding. This was critical as cross traffic could have been present.",
+        "confidence": 0.8
+      },
+      {
+        "timestep": 50,
+        "timestamp": 5.1,
+        "decision_type": "lane_choice",
+        "ground_truth_choice": "stay in current lane",
+        "alternatives": [
+          "stay in current lane",
+          "change to left lane",
+          "change to right lane"
+        ],
+        "description": "Staying in the current lane was critical due to the presence of vehicles in adjacent lanes, which could have led to a collision if a lane change was attempted.",
+        "confidence": 0.7
+      },
+      {
+        "timestep": 77,
+        "timestamp": 7.7,
+        "decision_type": "evasive_action",
+        "ground_truth_choice": "maintain speed and lane",
+        "alternatives": [
+          "maintain speed and lane",
+          "brake hard",
+          "swerve"
+        ],
+        "description": "Maintaining speed and lane was critical as there was no immediate threat requiring evasive action, and sudden movements could have caused an accident.",
+        "confidence": 0.9
+      }
+    ]
+  }
+}

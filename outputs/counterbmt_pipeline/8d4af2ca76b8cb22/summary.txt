@@ -1,0 +1,35 @@
+======================================================================
+COUNTERBMT PIPELINE SUMMARY
+======================================================================
+Scenario ID: 8d4af2ca76b8cb22
+Run Time: 2025-12-09T01:49:36.375361
+
+STAGE RESULTS:
+----------------------------------------
+  stage1: success (0.0ms)
+  stage2: success (0.0ms)
+  stage3: success (0.0ms)
+  stage4: success (0.0ms)
+  stage5: success (0.0ms)
+
+DAG SUMMARY:
+----------------------------------------
+  Total Nodes: 19
+  Total Edges: 27
+  Initial States: 8
+  Events: 10
+  Outcomes: 1
+
+BASELINE TRAJECTORY:
+----------------------------------------
+  Travel Distance: 94.15m
+
+INTERVENTION RESULTS:
+----------------------------------------
+  Set Ego Initial Speed to 0.2758008539676: 94.8m (+0.7%) → [predicted: unknown] ✗
+  Set Ego Initial Speed to 0.4137012809514: 94.4m (+0.3%) → [predicted: unknown] ✗
+  Set Ego Initial Speed to 0.6895021349191: 91.9m (-2.4%) → [predicted: unknown] ✗
+  Set Maneuver: decelerate to maintain (wa: 46.4m (-50.7%) ↓ [predicted: unknown] ✗
+  Set Maneuver: decelerate to accelerate (: 115.1m (+22.3%) ↑ [predicted: unknown] ✗
+
+======================================================================

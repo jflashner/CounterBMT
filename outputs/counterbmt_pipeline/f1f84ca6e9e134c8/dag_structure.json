@@ -1,0 +1,361 @@
+{
+  "scenario_id": "f1f84ca6e9e134c8",
+  "nodes": [
+    {
+      "id": "ego_initial_position",
+      "name": "Ego Initial Position",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_speed",
+      "name": "Ego Initial Speed",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": 26.36920738220215,
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_heading",
+      "name": "Ego Initial Heading",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": -1.5697773694992065,
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_2073_state",
+      "name": "Pedestrian agent_2073",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          -353.02557373046875,
+          -411.8578186035156
+        ],
+        "speed": 1.017146117676797,
+        "type": "PEDESTRIAN"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_2085_state",
+      "name": "Pedestrian agent_2085",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          -374.5528869628906,
+          -433.3111877441406
+        ],
+        "speed": 0.26863547757174544,
+        "type": "PEDESTRIAN"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_2087_state",
+      "name": "Pedestrian agent_2087",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          -385.6679992675781,
+          -428.323486328125
+        ],
+        "speed": 0.8038377001371266,
+        "type": "PEDESTRIAN"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1904_state",
+      "name": "Vehicle agent_1904",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          -341.6014099121094,
+          -437.9930419921875
+        ],
+        "speed": 0.049624622434818064,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_1905_state",
+      "name": "Vehicle agent_1905",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          -334.08843994140625,
+          -434.8429870605469
+        ],
+        "speed": 0.20651382890041323,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_0",
+      "name": "Maneuver: straight",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "straight",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_1",
+      "name": "Maneuver: lane_change_left",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "lane_change_left",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_2",
+      "name": "Maneuver: straight",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "straight",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_0",
+      "name": "Decision: lane_choice",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "Maintained lane position",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_1",
+      "name": "Decision: speed_choice",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "Maintained speed",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_2",
+      "name": "Decision: evasive_action",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "No evasive action taken",
+      "is_interventionable": false
+    },
+    {
+      "id": "collision_outcome",
+      "name": "Collision Outcome",
+      "node_type": "outcome",
+      "layer": 2,
+      "value": null,
+      "is_interventionable": false
+    }
+  ],
+  "edges": [
+    {
+      "parent_id": "ego_initial_position",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial position influences initial maneuver choice."
+    },
+    {
+      "parent_id": "ego_initial_speed",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial speed influences initial maneuver choice."
+    },
+    {
+      "parent_id": "ego_initial_heading",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial heading influences initial maneuver choice."
+    },
+    {
+      "parent_id": "agent_2073_state",
+      "child_id": "decision_0",
+      "confidence": 0.6,
+      "mechanism": "Presence of pedestrian influences lane choice decision."
+    },
+    {
+      "parent_id": "agent_2085_state",
+      "child_id": "decision_0",
+      "confidence": 0.6,
+      "mechanism": "Presence of pedestrian influences lane choice decision."
+    },
+    {
+      "parent_id": "agent_2087_state",
+      "child_id": "decision_0",
+      "confidence": 0.6,
+      "mechanism": "Presence of pedestrian influences lane choice decision."
+    },
+    {
+      "parent_id": "agent_1904_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence of vehicle influences lane choice decision."
+    },
+    {
+      "parent_id": "agent_1905_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence of vehicle influences lane choice decision."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "maneuver_1",
+      "confidence": 0.9,
+      "mechanism": "Initial maneuver influences subsequent lane change."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "maneuver_2",
+      "confidence": 0.9,
+      "mechanism": "Lane change influences continuation in new lane."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "maneuver_1",
+      "confidence": 0.8,
+      "mechanism": "Lane choice decision influences lane change maneuver."
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "maneuver_2",
+      "confidence": 0.8,
+      "mechanism": "Speed choice decision influences continuation maneuver."
+    },
+    {
+      "parent_id": "decision_2",
+      "child_id": "maneuver_2",
+      "confidence": 0.8,
+      "mechanism": "Evasive action decision influences continuation maneuver."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Initial maneuver affects collision outcome."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.8,
+      "mechanism": "Lane change maneuver affects collision outcome."
+    },
+    {
+      "parent_id": "maneuver_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.8,
+      "mechanism": "Continuation maneuver affects collision outcome."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Lane choice decision affects collision outcome."
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Speed choice decision affects collision outcome."
+    },
+    {
+      "parent_id": "decision_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Evasive action decision affects collision outcome."
+    }
+  ],
+  "summary": {
+    "n_nodes": 15,
+    "n_edges": 19,
+    "n_initial_state_nodes": 8,
+    "n_event_nodes": 6,
+    "n_outcome_nodes": 1
+  },
+  "vlm_extraction": {
+    "maneuvers": [
+      {
+        "maneuver_type": "straight",
+        "start_timestep": 0,
+        "end_timestep": 25,
+        "start_timestamp": 0.0,
+        "end_timestamp": 2.5,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle maintains its lane and direction.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "lane_change_left",
+        "start_timestep": 25,
+        "end_timestep": 50,
+        "start_timestamp": 2.5,
+        "end_timestamp": 5.1,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle changes to the left lane.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "straight",
+        "start_timestep": 50,
+        "end_timestep": 90,
+        "start_timestamp": 5.1,
+        "end_timestamp": 9.0,
+        "aggressiveness": "normal",
+        "description": "The ego vehicle continues straight in the new lane.",
+        "confidence": 1.0
+      }
+    ],
+    "decisions": [
+      {
+        "timestep": 25,
+        "timestamp": 2.5,
+        "decision_type": "lane_choice",
+        "ground_truth_choice": "Maintained lane position",
+        "alternatives": [
+          "Maintained lane position",
+          "Change to left lane",
+          "Change to right lane"
+        ],
+        "description": "Maintaining lane position was critical to avoid potential collisions with vehicles in adjacent lanes.",
+        "confidence": 0.8
+      },
+      {
+        "timestep": 50,
+        "timestamp": 5.1,
+        "decision_type": "speed_choice",
+        "ground_truth_choice": "Maintained speed",
+        "alternatives": [
+          "Maintained speed",
+          "Speed up",
+          "Slow down"
+        ],
+        "description": "Maintaining speed was important to keep a safe distance from vehicles ahead and behind.",
+        "confidence": 0.7
+      },
+      {
+        "timestep": 77,
+        "timestamp": 7.7,
+        "decision_type": "evasive_action",
+        "ground_truth_choice": "No evasive action taken",
+        "alternatives": [
+          "No evasive action taken",
+          "Hard braking",
+          "Swerving"
+        ],
+        "description": "No immediate threat required evasive action, maintaining control was the safest choice.",
+        "confidence": 0.9
+      }
+    ]
+  }
+}

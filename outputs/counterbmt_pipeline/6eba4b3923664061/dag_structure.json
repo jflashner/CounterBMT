@@ -1,0 +1,326 @@
+{
+  "scenario_id": "6eba4b3923664061",
+  "nodes": [
+    {
+      "id": "ego_initial_position",
+      "name": "Ego Initial Position",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_speed",
+      "name": "Ego Initial Speed",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": 0.0022160543594509363,
+      "is_interventionable": false
+    },
+    {
+      "id": "ego_initial_heading",
+      "name": "Ego Initial Heading",
+      "node_type": "ego_state",
+      "layer": 0,
+      "value": -1.530601978302002,
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_887_state",
+      "name": "Vehicle agent_887",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          -2591.45703125,
+          6382.7568359375
+        ],
+        "speed": 19.50811266868685,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_888_state",
+      "name": "Vehicle agent_888",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          -2553.9970703125,
+          6382.7236328125
+        ],
+        "speed": 21.92627007493249,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_889_state",
+      "name": "Vehicle agent_889",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          -2646.12744140625,
+          6376.59130859375
+        ],
+        "speed": 23.628620374895416,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_890_state",
+      "name": "Vehicle agent_890",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          -2655.931396484375,
+          6386.32275390625
+        ],
+        "speed": 17.4534696785711,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "agent_892_state",
+      "name": "Vehicle agent_892",
+      "node_type": "agent_state",
+      "layer": 0,
+      "value": {
+        "position": [
+          -2534.95068359375,
+          6386.2529296875
+        ],
+        "speed": 22.420161510748425,
+        "type": "VEHICLE"
+      },
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_0",
+      "name": "Maneuver: straight",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "straight",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_1",
+      "name": "Maneuver: right_turn",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "right_turn",
+      "is_interventionable": false
+    },
+    {
+      "id": "maneuver_2",
+      "name": "Maneuver: straight",
+      "node_type": "maneuver",
+      "layer": 1,
+      "value": "straight",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_0",
+      "name": "Decision: proceed_or_yield",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "proceed through intersection",
+      "is_interventionable": false
+    },
+    {
+      "id": "decision_1",
+      "name": "Decision: evasive_action",
+      "node_type": "decision",
+      "layer": 1,
+      "value": "maintain course",
+      "is_interventionable": false
+    },
+    {
+      "id": "collision_outcome",
+      "name": "Collision Outcome",
+      "node_type": "outcome",
+      "layer": 2,
+      "value": null,
+      "is_interventionable": false
+    }
+  ],
+  "edges": [
+    {
+      "parent_id": "ego_initial_position",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial position influences the decision to move straight initially."
+    },
+    {
+      "parent_id": "ego_initial_speed",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial speed influences the decision to maintain a straight path."
+    },
+    {
+      "parent_id": "ego_initial_heading",
+      "child_id": "maneuver_0",
+      "confidence": 0.8,
+      "mechanism": "Initial heading influences the decision to move straight initially."
+    },
+    {
+      "parent_id": "agent_887_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_887 influence the decision to proceed or yield at the intersection."
+    },
+    {
+      "parent_id": "agent_888_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_888 influence the decision to proceed or yield at the intersection."
+    },
+    {
+      "parent_id": "agent_889_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_889 influence the decision to proceed or yield at the intersection."
+    },
+    {
+      "parent_id": "agent_890_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_890 influence the decision to proceed or yield at the intersection."
+    },
+    {
+      "parent_id": "agent_892_state",
+      "child_id": "decision_0",
+      "confidence": 0.7,
+      "mechanism": "Presence and speed of agent_892 influence the decision to proceed or yield at the intersection."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "maneuver_1",
+      "confidence": 0.9,
+      "mechanism": "Continuing straight leads to the decision to make a right turn."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "maneuver_2",
+      "confidence": 0.9,
+      "mechanism": "Completing the right turn leads to continuing straight."
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "maneuver_1",
+      "confidence": 0.8,
+      "mechanism": "Decision to proceed through the intersection leads to making a right turn."
+    },
+    {
+      "parent_id": "maneuver_2",
+      "child_id": "decision_1",
+      "confidence": 0.8,
+      "mechanism": "Continuing straight after the turn influences the decision to maintain course."
+    },
+    {
+      "parent_id": "decision_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.9,
+      "mechanism": "Decision to maintain course affects the collision outcome."
+    },
+    {
+      "parent_id": "maneuver_1",
+      "child_id": "collision_outcome",
+      "confidence": 0.8,
+      "mechanism": "The right turn maneuver affects the collision outcome."
+    },
+    {
+      "parent_id": "maneuver_2",
+      "child_id": "collision_outcome",
+      "confidence": 0.8,
+      "mechanism": "Continuing straight after the turn affects the collision outcome."
+    },
+    {
+      "parent_id": "maneuver_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Event affects collision outcome"
+    },
+    {
+      "parent_id": "decision_0",
+      "child_id": "collision_outcome",
+      "confidence": 0.7,
+      "mechanism": "Event affects collision outcome"
+    }
+  ],
+  "summary": {
+    "n_nodes": 14,
+    "n_edges": 17,
+    "n_initial_state_nodes": 8,
+    "n_event_nodes": 5,
+    "n_outcome_nodes": 1
+  },
+  "vlm_extraction": {
+    "maneuvers": [
+      {
+        "maneuver_type": "straight",
+        "start_timestep": 0,
+        "end_timestep": 37,
+        "start_timestamp": 0.0,
+        "end_timestamp": 3.8,
+        "aggressiveness": "normal",
+        "description": "The vehicle maintains its lane and direction, moving straight through the area.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "right_turn",
+        "start_timestep": 37,
+        "end_timestep": 50,
+        "start_timestamp": 3.8,
+        "end_timestamp": 5.1,
+        "aggressiveness": "normal",
+        "description": "The vehicle makes a right turn at the intersection.",
+        "confidence": 1.0
+      },
+      {
+        "maneuver_type": "straight",
+        "start_timestep": 50,
+        "end_timestep": 90,
+        "start_timestamp": 5.1,
+        "end_timestamp": 9.0,
+        "aggressiveness": "normal",
+        "description": "The vehicle continues straight after completing the right turn.",
+        "confidence": 1.0
+      }
+    ],
+    "decisions": [
+      {
+        "timestep": 37,
+        "timestamp": 3.8,
+        "decision_type": "proceed_or_yield",
+        "ground_truth_choice": "proceed through intersection",
+        "alternatives": [
+          "proceed through intersection",
+          "yield to potential cross traffic"
+        ],
+        "description": "The driver chose to proceed through the intersection without yielding. This was critical as cross traffic could have been present.",
+        "confidence": 0.8
+      },
+      {
+        "timestep": 64,
+        "timestamp": 6.4,
+        "decision_type": "evasive_action",
+        "ground_truth_choice": "maintain course",
+        "alternatives": [
+          "maintain course",
+          "swerve to avoid potential obstacle"
+        ],
+        "description": "The driver maintained their course despite potential obstacles appearing on the path. This was critical to avoid a collision.",
+        "confidence": 0.7
+      }
+    ]
+  }
+}

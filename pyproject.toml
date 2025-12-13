@@ -1,0 +1,17 @@
+[project]
+name = "counterbmt"
+version = "0.1.0"
+description = "Counterfactual trajectory generation with BMT"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "adv-bmt",  # BMT package from src/Adv-BMT
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["counter_bmt*", "dag_models*", "scripts*"]
+exclude = ["Adv-BMT*"]  # BMT is a separate package
