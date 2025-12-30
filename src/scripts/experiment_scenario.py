@@ -29,16 +29,30 @@ Intervention Format:
     speed:reduce:FACTOR     - Reduce speed by factor (0.5 = half speed)
     speed:increase:FACTOR   - Increase speed by factor (1.5 = 50% faster)
     speed:set:VALUE         - Set speed to specific value (m/s)
-    lane:left               - Bias toward left lane change
-    lane:right              - Bias toward right lane change
+    lane:left               - Bias toward left lane change (normal style)
+    lane:right              - Bias toward right lane change (normal style)
+    lane:left:gentle        - Gentle left lane change (yaw 0.05-0.15 rad/s, 5-7s duration)
+    lane:right:gentle       - Gentle right lane change 
+    lane:left:aggressive    - Aggressive left lane change (yaw 0.20-0.40 rad/s, 2-3s duration)
+    lane:right:aggressive   - Aggressive right lane change
     lane:stay               - Bias toward staying in lane
     maneuver:stop           - Bias toward stopping
     maneuver:accelerate     - Bias toward acceleration
     maneuver:decelerate     - Bias toward deceleration
-    maneuver:turn_left      - Bias toward left turn
-    maneuver:turn_right     - Bias toward right turn
+    maneuver:turn_left      - Bias toward left turn (sharper than lane change)
+    maneuver:turn_right     - Bias toward right turn (sharper than lane change)
     yaw:left:STRENGTH       - Bias yaw rate left (0.0-1.0)
     yaw:right:STRENGTH      - Bias yaw rate right (0.0-1.0)
+
+Lane Change Styles:
+    The lane change interventions now use vehicle dynamics-based yaw rate ranges
+    to produce more realistic and reliable lane changes:
+    
+    - gentle:     yaw 0.05-0.15 rad/s (smooth, comfortable, 5-7 second lane change)
+    - normal:     yaw 0.08-0.25 rad/s (typical highway lane change, 3-5 seconds)
+    - aggressive: yaw 0.20-0.40 rad/s (quick lane change, 2-3 seconds)
+    
+    Example: "lane:right:gentle@2-10" for a smooth right lane change from step 2-10
 
 Time-Based Interventions:
     Append @START or @START-END to apply intervention during specific PREDICTION timesteps.
@@ -268,7 +282,21 @@ def parse_intervention_string(intervention_str: str) -> Dict[str, Any]:
     elif int_type == 'lane':
         intervention['direction'] = action
         intervention['strength'] = value or 0.8
-        intervention['description'] = f"Lane change: {action}{time_desc}"
+        # Support style specification: lane:right:gentle or lane:right:aggressive
+        # The third part (value) could be a style string or strength number
+        if len(parts) > 2:
+            style_or_value = parts[2]
+            if style_or_value in ['gentle', 'normal', 'aggressive']:
+                intervention['style'] = style_or_value
+            else:
+                try:
+                    intervention['strength'] = float(style_or_value)
+                except ValueError:
+                    intervention['style'] = style_or_value
+        else:
+            intervention['style'] = 'normal'  # default style
+        style_desc = f" ({intervention.get('style', 'normal')})" if intervention.get('style') != 'normal' else ""
+        intervention['description'] = f"Lane change: {action}{style_desc}{time_desc}"
     
     elif int_type == 'maneuver':
         intervention['maneuver'] = action
@@ -452,11 +480,32 @@ def intervention_to_timed_bias(
     elif int_type == 'lane':
         direction = intervention['direction']
         strength = intervention.get('strength', 0.8)
+        style = intervention.get('style', 'normal')  # gentle, normal, aggressive
         
         if direction == 'left':
-            add_bias(get_tokens('turn_left'), BASE_BIAS * strength, intervention['description'])
+            # Use proper lane_change tokens with constrained yaw (not broad turn_left)
+            lane_change_key = f'lane_change_left'
+            if style == 'gentle':
+                lane_change_key = 'lane_change_left_gentle'
+            elif style == 'aggressive':
+                lane_change_key = 'lane_change_left_aggressive'
+            tokens = get_tokens(lane_change_key)
+            # Fallback to turn_left if lane_change tokens not available
+            if not tokens:
+                tokens = get_tokens('turn_left')
+            add_bias(tokens, BASE_BIAS * strength, intervention['description'])
         elif direction == 'right':
-            add_bias(get_tokens('turn_right'), BASE_BIAS * strength, intervention['description'])
+            # Use proper lane_change tokens with constrained yaw (not broad turn_right)
+            lane_change_key = f'lane_change_right'
+            if style == 'gentle':
+                lane_change_key = 'lane_change_right_gentle'
+            elif style == 'aggressive':
+                lane_change_key = 'lane_change_right_aggressive'
+            tokens = get_tokens(lane_change_key)
+            # Fallback to turn_right if lane_change tokens not available
+            if not tokens:
+                tokens = get_tokens('turn_right')
+            add_bias(tokens, BASE_BIAS * strength, intervention['description'])
         elif direction == 'stay':
             add_bias(get_tokens('straight'), BASE_BIAS * strength, intervention['description'])
     

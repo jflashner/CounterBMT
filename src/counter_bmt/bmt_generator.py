@@ -132,10 +132,17 @@ class MotionTokenSpace:
             'maintain': [],       # Constant speed
             'accelerate': [],     # Speed up
             'straight': [],       # No steering
-            'turn_left': [],      # Turning left
-            'turn_right': [],     # Turning right
-            'swerve_left': [],    # Sharp left
-            'swerve_right': [],   # Sharp right
+            'turn_left': [],      # Turning left (any)
+            'turn_right': [],     # Turning right (any)
+            'swerve_left': [],    # Sharp left (emergency)
+            'swerve_right': [],   # Sharp right (emergency)
+            # NEW: Lane change specific tokens with proper yaw ranges
+            'lane_change_left_gentle': [],    # Gentle left lane change (0.05-0.15 rad/s)
+            'lane_change_left': [],           # Normal left lane change (0.08-0.25 rad/s)
+            'lane_change_left_aggressive': [],# Aggressive left lane change (0.20-0.40 rad/s)
+            'lane_change_right_gentle': [],   # Gentle right lane change
+            'lane_change_right': [],          # Normal right lane change
+            'lane_change_right_aggressive': [],# Aggressive right lane change
         }
         
         for token_id in range(self.n_tokens):
@@ -153,7 +160,7 @@ class MotionTokenSpace:
             if acc > 2.0:
                 behaviors['accelerate'].append(token_id)
             
-            # Steering-based
+            # Steering-based (original broad categories)
             if abs(yaw) < 0.15:
                 behaviors['straight'].append(token_id)
             if yaw > 0.2:
@@ -164,6 +171,28 @@ class MotionTokenSpace:
                 behaviors['swerve_left'].append(token_id)
             if yaw < -0.5:
                 behaviors['swerve_right'].append(token_id)
+            
+            # NEW: Lane change specific (constrained yaw + moderate acceleration)
+            # These are based on vehicle dynamics for comfortable lane changes
+            is_moderate_acc = -2.0 < acc < 2.0
+            
+            # Gentle lane change: yaw 0.05-0.15 rad/s (very smooth, 5-7 second lane change)
+            if is_moderate_acc and 0.05 < yaw < 0.15:
+                behaviors['lane_change_left_gentle'].append(token_id)
+            if is_moderate_acc and -0.15 < yaw < -0.05:
+                behaviors['lane_change_right_gentle'].append(token_id)
+            
+            # Normal lane change: yaw 0.08-0.25 rad/s (3-5 second lane change)
+            if is_moderate_acc and 0.08 < yaw < 0.25:
+                behaviors['lane_change_left'].append(token_id)
+            if is_moderate_acc and -0.25 < yaw < -0.08:
+                behaviors['lane_change_right'].append(token_id)
+            
+            # Aggressive lane change: yaw 0.20-0.40 rad/s (2-3 second lane change)
+            if is_moderate_acc and 0.20 < yaw < 0.40:
+                behaviors['lane_change_left_aggressive'].append(token_id)
+            if is_moderate_acc and -0.40 < yaw < -0.20:
+                behaviors['lane_change_right_aggressive'].append(token_id)
         
         return behaviors
     
@@ -175,7 +204,24 @@ class MotionTokenSpace:
         if behavior in self._behavior_tokens:
             return self._behavior_tokens[behavior]
         
-        # Fuzzy matching
+        # Fuzzy matching - prioritize lane_change over generic turn
+        if 'lane_change' in behavior or 'lanechange' in behavior:
+            # Lane change specific matching
+            if 'left' in behavior:
+                if 'gentle' in behavior:
+                    return self._behavior_tokens['lane_change_left_gentle']
+                elif 'aggressive' in behavior:
+                    return self._behavior_tokens['lane_change_left_aggressive']
+                else:
+                    return self._behavior_tokens['lane_change_left']
+            elif 'right' in behavior:
+                if 'gentle' in behavior:
+                    return self._behavior_tokens['lane_change_right_gentle']
+                elif 'aggressive' in behavior:
+                    return self._behavior_tokens['lane_change_right_aggressive']
+                else:
+                    return self._behavior_tokens['lane_change_right']
+        
         if 'stop' in behavior or 'brake' in behavior:
             return self._behavior_tokens['stop']
         if 'decel' in behavior or 'slow' in behavior:
@@ -197,6 +243,52 @@ class MotionTokenSpace:
         
         logger.warning(f"Unknown behavior: {behavior}")
         return []
+    
+    def get_lane_change_tokens(
+        self, 
+        direction: str = 'right',
+        style: str = 'normal'
+    ) -> List[int]:
+        """
+        Get tokens appropriate for lane change maneuvers.
+        
+        Uses vehicle dynamics-based yaw rate ranges:
+        - gentle: 0.05-0.15 rad/s (smooth 5-7 second lane change)
+        - normal: 0.08-0.25 rad/s (comfortable 3-5 second lane change)
+        - aggressive: 0.20-0.40 rad/s (quick 2-3 second lane change)
+        
+        Args:
+            direction: 'left' or 'right'
+            style: 'gentle', 'normal', or 'aggressive'
+            
+        Returns:
+            List of token IDs for the specified lane change maneuver
+        """
+        key = f"lane_change_{direction}"
+        if style == 'gentle':
+            key += '_gentle'
+        elif style == 'aggressive':
+            key += '_aggressive'
+        # 'normal' style uses the base key without suffix
+        
+        if key in self._behavior_tokens:
+            return self._behavior_tokens[key]
+        
+        logger.warning(f"Unknown lane change: {key}")
+        return []
+    
+    def describe_token_set(self, behavior: str) -> str:
+        """Get a human-readable description of a token set's yaw/acc ranges."""
+        tokens = self.get_tokens_by_behavior(behavior)
+        if not tokens:
+            return f"No tokens for behavior: {behavior}"
+        
+        accs = [self.token_to_action(t)[0] for t in tokens]
+        yaws = [self.token_to_action(t)[1] for t in tokens]
+        
+        return (f"{behavior}: {len(tokens)} tokens, "
+                f"acc=[{min(accs):.2f}, {max(accs):.2f}] m/s², "
+                f"yaw=[{min(yaws):.2f}, {max(yaws):.2f}] rad/s")
     
     def get_tokens_by_constraint(
         self,
