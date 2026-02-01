@@ -363,9 +363,66 @@ def export_trajectory_only(
         track['state']['velocity'] = velocity.astype(np.float32)
     
     # Compute heading from velocity (in global frame)
+    # This is tricky because arctan2 returns values in [-π, π], so a vehicle
+    # moving in the -X direction can have heading near -π or +π depending
+    # on small Y variations. Lane changes can cause the heading to "jump"
+    # across the ±π boundary, which MetaDrive interprets as a 360° spin.
     if T > 1:
-        heading = np.arctan2(velocity[:, 1], velocity[:, 0])
-        track['state']['heading'] = heading.astype(np.float32)
+        heading_raw = np.arctan2(velocity[:, 1], velocity[:, 0])
+        
+        # Key insight: We want the heading to be CONTINUOUS throughout the trajectory.
+        # np.unwrap() handles this by adding/subtracting 2π to prevent jumps > π.
+        heading_unwrapped = np.unwrap(heading_raw)
+        
+        # Now anchor to the original heading at the START of the trajectory
+        # This ensures the counterfactual starts with the same orientation
+        if len(orig_heading) > 0:
+            # Get the original starting heading
+            orig_start_heading = float(orig_heading[0])
+            
+            # Calculate offset between our computed heading and original
+            heading_offset = orig_start_heading - heading_unwrapped[0]
+            
+            # Apply offset to shift entire trajectory
+            heading_shifted = heading_unwrapped + heading_offset
+            
+            # CRITICAL: Check if we're on the same "branch" as the original trajectory
+            # If original goes from -179° to -175° (staying negative), we should too.
+            # But if our computed heading went from +179° to +175° (positive branch),
+            # we need to shift by 2π to match.
+            
+            # Use the original trajectory's average heading to determine which branch to use
+            orig_mean_heading = float(np.mean(orig_heading[:min(10, len(orig_heading))]))
+            our_start_heading = heading_shifted[0]
+            
+            # If our start heading is more than 90° different from original mean, we're on wrong branch
+            branch_diff = our_start_heading - orig_mean_heading
+            while branch_diff > np.pi:
+                heading_shifted -= 2 * np.pi
+                branch_diff = heading_shifted[0] - orig_mean_heading
+                logger.debug(f"Shifted heading -2π (branch correction)")
+            while branch_diff < -np.pi:
+                heading_shifted += 2 * np.pi
+                branch_diff = heading_shifted[0] - orig_mean_heading
+                logger.debug(f"Shifted heading +2π (branch correction)")
+            
+            logger.debug(f"Heading: orig_start={np.degrees(orig_start_heading):.1f}°, "
+                        f"computed_start={np.degrees(heading_raw[0]):.1f}°, "
+                        f"final_start={np.degrees(heading_shifted[0]):.1f}°")
+            
+            heading_continuous = heading_shifted
+        else:
+            heading_continuous = heading_unwrapped
+        
+        track['state']['heading'] = heading_continuous.astype(np.float32)
+        
+        # Log heading summary for debugging
+        heading_start = np.degrees(heading_continuous[0])
+        heading_end = np.degrees(heading_continuous[-1])
+        heading_min = np.degrees(np.min(heading_continuous))
+        heading_max = np.degrees(np.max(heading_continuous))
+        logger.info(f"Heading for '{intervention_name}': start={heading_start:.1f}°, end={heading_end:.1f}°, "
+                   f"range=[{heading_min:.1f}°, {heading_max:.1f}°]")
     
     # Update valid mask - match original length
     # Mark padded timesteps as invalid if we padded

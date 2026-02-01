@@ -42,6 +42,65 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def setup_logging(args) -> Optional[Path]:
+    """
+    Set up logging with optional file output.
+    
+    Args:
+        args: Parsed command-line arguments with log_dir, log_level, log_file
+        
+    Returns:
+        Path to log file if created, None otherwise
+    """
+    from datetime import datetime
+    
+    # Set log level
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    
+    # Update root logger level
+    logging.getLogger().setLevel(log_level)
+    logger.setLevel(log_level)
+    
+    # Determine log file path
+    log_file_path = None
+    if args.log_file:
+        log_file_path = Path(args.log_file)
+    elif args.log_dir:
+        log_dir = Path(args.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file_path = log_dir / f"counterbmt_{timestamp}.log"
+    else:
+        # Default: create logs in output directory
+        output_dir = Path(args.output_dir)
+        log_dir = output_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file_path = log_dir / f"counterbmt_{timestamp}.log"
+    
+    # Add file handler
+    if log_file_path:
+        log_file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file_path, mode='w')
+        file_handler.setLevel(log_level)
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
+        logging.getLogger().addHandler(file_handler)
+        
+        # Also add to counter_bmt loggers
+        for logger_name in ['counter_bmt', 'bmt', '__main__']:
+            log = logging.getLogger(logger_name)
+            log.addHandler(file_handler)
+        
+        logger.info(f"Logging to file: {log_file_path}")
+        logger.info(f"Log level: {args.log_level}")
+        
+        return log_file_path
+    
+    return None
+
+
 # =============================================================================
 # Import Pipeline Components
 # =============================================================================
@@ -177,27 +236,51 @@ def extract_other_agents(data_dir: str, scenario_index: int, max_agents: int = 5
     return other_agents, scenario_id
 
 
-def load_scenario_for_bmt_input(data_dir: str, scenario_index: int, config=None, tokenizer=None) -> Dict:
+def load_scenario_for_bmt_input(
+    data_dir: str, 
+    scenario_index: int = None, 
+    config=None, 
+    tokenizer=None,
+    file_path: str = None,  # NEW: Optional direct file path (takes precedence over index)
+) -> Dict:
     """
     Load and preprocess scenario for BMT input format.
+    
+    Args:
+        data_dir: Path to data directory (used if file_path not provided)
+        scenario_index: Index of scenario to load (used if file_path not provided)
+        config: BMT config for preprocessing
+        tokenizer: BMT tokenizer for preprocessing
+        file_path: Direct path to scenario file (takes precedence over index lookup)
+                   This should be used when consistency with stage_1 is required.
     """
-    from metadrive.scenario.utils import read_dataset_summary
     import pickle
     
-    data_path = Path(data_dir)
-    summary_dict, summary_list, mapping = read_dataset_summary(str(data_path))
-    
-    if scenario_index >= len(summary_list):
-        raise ValueError(f"Scenario index {scenario_index} out of range (max: {len(summary_list)-1})")
-    
-    scenario_file = summary_list[scenario_index]
-    folder = mapping.get(scenario_file, "")
-    file_path = data_path / folder / scenario_file  # Use data_path as base
+    # If file_path is provided, use it directly (ensures consistency with stage_1)
+    if file_path is not None:
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise ValueError(f"Scenario file not found: {file_path}")
+        logger.info(f"Loading scenario directly from: {file_path}")
+    else:
+        # Fallback to index-based lookup
+        from metadrive.scenario.utils import read_dataset_summary
+        
+        data_path = Path(data_dir)
+        summary_dict, summary_list, mapping = read_dataset_summary(str(data_path))
+        
+        if scenario_index is None or scenario_index >= len(summary_list):
+            raise ValueError(f"Scenario index {scenario_index} out of range (max: {len(summary_list)-1})")
+        
+        scenario_file = summary_list[scenario_index]
+        folder = mapping.get(scenario_file, "")
+        file_path = data_path / folder / scenario_file
+        logger.info(f"Loading scenario by index {scenario_index}: {file_path}")
     
     with open(file_path, 'rb') as f:
         scenario_desc = pickle.load(f)
     
-    scenario_id = scenario_desc.get('id', f'scenario_{scenario_index}')
+    scenario_id = scenario_desc.get('id', f'scenario_{scenario_index or "unknown"}')
     
     # If config provided, preprocess for BMT
     if config is not None:
@@ -238,7 +321,7 @@ def stage_1_load_and_visualize(
     Stage 1: Load scenario and generate screenshots for VLM.
     
     Returns:
-        Dict with scenario_id, trajectory, saved_images, other_agents
+        Dict with scenario_id, trajectory, saved_images, other_agents, scenario_file_path
     """
     logger.info("\n" + "=" * 60)
     logger.info("STAGE 1: Load Scenario & Generate Frames")
@@ -268,18 +351,43 @@ def stage_1_load_and_visualize(
     # Extract other agents
     other_agents, _ = extract_other_agents(str(data_dir), scenario_index)
     
+    # IMPORTANT: Find the actual scenario file path using read_dataset_summary
+    # This ensures we use the SAME file ordering as stage_5's load_scenario_for_bmt_input
+    # The prepare_for_vlm uses ScenarioEnv which may have different ordering!
+    from metadrive.scenario.utils import read_dataset_summary
+    summary_dict, summary_list, mapping = read_dataset_summary(str(data_dir))
+    
+    # Find the file that matches this scenario_id
+    scenario_file_path = None
+    for filename in summary_list:
+        if scenario_id in filename:
+            folder = mapping.get(filename, "")
+            scenario_file_path = str(data_dir / folder / filename)
+            logger.info(f"Found scenario file: {filename}")
+            break
+    
+    # Fallback: use index if scenario_id match fails
+    if scenario_file_path is None and scenario_index < len(summary_list):
+        filename = summary_list[scenario_index]
+        folder = mapping.get(filename, "")
+        scenario_file_path = str(data_dir / folder / filename)
+        logger.warning(f"Scenario ID '{scenario_id}' not found in filenames, using index fallback: {filename}")
+    
     return {
         'scenario_id': scenario_id,
         'scenario_index': scenario_index,
         'trajectory': trajectory,
         'saved_images': saved_images,
         'other_agents': other_agents,
+        'scenario_file_path': scenario_file_path,  # CRITICAL: Pass actual file path to stage 5
     }
 
 
 def stage_2_vlm_extraction(
     stage1_result: Dict,
     vlm_client,
+    output_dir: Optional[Path] = None,
+    vlm_debug: bool = False,
 ) -> Dict:
     """
     Stage 2: Extract maneuvers and decisions using VLM.
@@ -307,7 +415,8 @@ def stage_2_vlm_extraction(
     images = [TimestampedImage(path=p, timestamp=t) for p, t in saved_images]
     
     # Extract features
-    extractor = VLMSafetyCriticalExtractor(vlm_client)
+    debug_output_dir = str(output_dir) if vlm_debug and output_dir else None
+    extractor = VLMSafetyCriticalExtractor(vlm_client, debug=vlm_debug, debug_output_dir=debug_output_dir)
     features = extractor.extract(images, scenario_id, trajectory)
     
     # Get maneuvers and decisions
@@ -411,9 +520,35 @@ def stage_3_dag_construction(
 def stage_4_compile_interventions(
     stage3_result: Dict,
     max_interventions: int = 5,
+    bias_strength: float = 8.0,
+    output_dir: Optional[Path] = None,
+    llm_client: Optional[Any] = None,
+    ego_state: Optional[Dict] = None,
+    use_llm_planning: bool = True,
+    trajectory: Optional[np.ndarray] = None,
+    maneuvers: Optional[List] = None,
+    decisions: Optional[List] = None,
+    intervention_diversity: str = "medium",
+    sequence_length: int = 0,
+    speed_range: Optional[Tuple[float, float]] = None,
 ) -> Dict:
     """
     Stage 4: Compile interventions to token biases for BMT.
+    
+    Args:
+        stage3_result: Results from stage 3 (DAG construction)
+        max_interventions: Maximum number of interventions to compile
+        bias_strength: Token bias strength for encouraging behaviors (default: 8.0)
+        output_dir: Optional output directory for bias log file
+        llm_client: Optional GPT-4o client for LLM-guided intervention planning
+        ego_state: Optional dict with ego vehicle state (speed, heading, position)
+        use_llm_planning: Whether to use LLM for smart phase planning (default: True)
+        trajectory: Optional full trajectory array for building trajectory context
+        maneuvers: Optional list of maneuvers from VLM extraction
+        decisions: Optional list of decisions from VLM extraction
+        intervention_diversity: Diversity level ("low", "medium", "high")
+        sequence_length: Generate sequential interventions (0 = single only, 2+ = sequences)
+        speed_range: Optional (min, max) speed multipliers
     
     Returns:
         Dict with compiled_interventions
@@ -421,35 +556,144 @@ def stage_4_compile_interventions(
     logger.info("\n" + "=" * 60)
     logger.info("STAGE 4: Compile Interventions to Token Biases")
     logger.info("=" * 60)
+    logger.info(f"  Bias strength: {bias_strength}")
+    logger.info(f"  Diversity: {intervention_diversity}")
+    if sequence_length >= 2:
+        logger.info(f"  Sequence length: {sequence_length} maneuvers per sequence")
+    logger.info(f"  LLM planning: {'enabled' if use_llm_planning and llm_client else 'disabled (fallback mode)'}")
+    if trajectory is not None:
+        logger.info(f"  Trajectory context: {len(trajectory)} points")
     
     bmt_comps = import_bmt_components()
     InterventionCompiler = bmt_comps['InterventionCompiler']
     MotionTokenSpace = bmt_comps['MotionTokenSpace']
     
+    # Import LLM planner and trajectory context builder
+    llm_planner = None
+    build_trajectory_context = None
+    if use_llm_planning:
+        try:
+            from counter_bmt.llm_intervention_planner import (
+                LLMInterventionPlanner,
+                build_trajectory_context as _build_traj_ctx
+            )
+            llm_planner = LLMInterventionPlanner(llm_client)
+            build_trajectory_context = _build_traj_ctx
+            logger.info("  LLM intervention planner initialized")
+        except ImportError as e:
+            logger.warning(f"Could not import LLMInterventionPlanner: {e}")
+    
     interventions = stage3_result['interventions']
     counterfactuals = stage3_result['counterfactuals']
+    dag = stage3_result.get('dag')  # Get DAG for sequence enumeration
+    
+    # Import diversity enum
+    from counter_bmt.dag_constructor import InterventionDiversity, InterventionSequence
+    
+    # Map string to enum
+    diversity_enum = {
+        'low': InterventionDiversity.LOW,
+        'medium': InterventionDiversity.MEDIUM,
+        'high': InterventionDiversity.HIGH,
+        'lateral': InterventionDiversity.LATERAL,
+    }.get(intervention_diversity, InterventionDiversity.MEDIUM)
+    
+    # Re-enumerate interventions with diversity settings if DAG available
+    if dag is not None:
+        logger.info(f"  Re-enumerating interventions with diversity={intervention_diversity}")
+        interventions = dag.enumerate_interventions(diversity=diversity_enum, speed_range=speed_range)
+        logger.info(f"  Found {len(interventions)} interventions with {intervention_diversity} diversity")
     
     # Limit interventions
     if len(interventions) > max_interventions:
         logger.info(f"Limiting to {max_interventions} interventions (from {len(interventions)})")
         interventions = interventions[:max_interventions]
     
-    # Create compiler
+    # Generate sequences if requested
+    sequences = []
+    if sequence_length >= 2 and dag is not None:
+        sequences = dag.enumerate_sequences(
+            sequence_length=sequence_length,
+            diversity=diversity_enum
+        )
+        logger.info(f"  Generated {len(sequences)} {sequence_length}-step intervention sequences")
+        # Limit sequences to reasonable number
+        max_sequences = max(2, max_interventions // 2)
+        if len(sequences) > max_sequences:
+            sequences = sequences[:max_sequences]
+            logger.info(f"  Limited to {max_sequences} sequences")
+    
+    # Create compiler with LLM planner
     token_space = MotionTokenSpace()
-    compiler = InterventionCompiler(token_space)
+    compiler = InterventionCompiler(token_space, llm_planner=llm_planner)
+    
+    # Set custom bias strength
+    discourage_bias = -bias_strength * 0.375  # Keep discourage at ~-3.0 when encourage is 8.0
     
     compiled = []
+    bias_log_entries = []  # For detailed bias log file
+    llm_planning_used = 0  # Track LLM planning usage
+    
     for i, intv in enumerate(interventions):
-        # Convert Intervention object to dict
+        # Convert Intervention object to dict, including timestamp
         int_dict = {
             'variable': intv.variable_id,
             'value': intv.value,
             'original_value': intv.original_value,
-            'description': intv.description
+            'description': intv.description,
+            'timestamp': getattr(intv, 'timestamp', None),  # Include timestamp if available
+            'aggressiveness': getattr(intv, 'aggressiveness', 'normal'),
         }
         
-        # Compile to token biases
-        token_biases = compiler.compile_from_dag_intervention(int_dict)
+        # Build trajectory context for this specific intervention
+        traj_context = None
+        if build_trajectory_context is not None and trajectory is not None:
+            # Get current maneuver at intervention time
+            current_maneuver = None
+            if maneuvers and int_dict.get('timestamp'):
+                for m in maneuvers:
+                    if hasattr(m, 'start_timestamp') and hasattr(m, 'end_timestamp'):
+                        if m.start_timestamp <= int_dict['timestamp'] <= m.end_timestamp:
+                            current_maneuver = m.maneuver_type.value if hasattr(m.maneuver_type, 'value') else str(m.maneuver_type)
+                            break
+            
+            # Get upcoming decisions
+            upcoming_decisions = []
+            if decisions and int_dict.get('timestamp'):
+                for d in decisions:
+                    if hasattr(d, 'timestamp') and d.timestamp > int_dict['timestamp']:
+                        decision_type = d.decision_type.value if hasattr(d.decision_type, 'value') else str(d.decision_type)
+                        upcoming_decisions.append(decision_type)
+            
+            traj_context = build_trajectory_context(
+                trajectory=trajectory,
+                dt=0.1,  # ScenarioNet default timestep
+                intervention_time_s=int_dict.get('timestamp'),
+                current_maneuver=current_maneuver,
+                aggressiveness=int_dict.get('aggressiveness', 'normal'),
+                upcoming_decisions=upcoming_decisions[:3]  # Limit to next 3 decisions
+            )
+            
+            if traj_context and traj_context.state_at_intervention:
+                state = traj_context.state_at_intervention
+                logger.debug(f"  Intervention {i+1} at t={int_dict.get('timestamp'):.1f}s: "
+                            f"speed={state.speed:.1f}m/s, acc={state.acceleration:.1f}m/s²")
+        
+        # Compile to token biases with custom strength, LLM planning, and trajectory context
+        token_biases = compiler.compile_from_dag_intervention(
+            int_dict,
+            encourage_bias=bias_strength,
+            discourage_bias=discourage_bias,
+            ego_state=ego_state,
+            use_llm_planning=use_llm_planning,
+            trajectory_context=traj_context,
+            debug_output_dir=str(output_dir) if output_dir else None,
+            intervention_idx=i
+        )
+        
+        # Track if LLM was used (check for LLM-style phase descriptions)
+        if any('phase' in (b.description or '').lower() or ':' in (b.description or '') for b in token_biases):
+            llm_planning_used += 1
         
         # Find matching counterfactual prediction
         effect_prediction = {}
@@ -471,9 +715,154 @@ def stage_4_compile_interventions(
         n_tokens = sum(len(b.token_ids) for b in token_biases)
         logger.info(f"  [{i+1}] {intv.description}")
         logger.info(f"      -> {len(token_biases)} bias groups, {n_tokens} total tokens")
+        
+        # Build detailed log entry
+        log_entry = {
+            'intervention_id': i + 1,
+            'description': intv.description,
+            'variable': intv.variable_id,
+            'value': intv.value,
+            'original_value': intv.original_value,
+            'bias_groups': []
+        }
+        
+        for bias in token_biases:
+            # Get token set details
+            if bias.token_ids:
+                acc_values = [token_space.token_to_action(t)[0] for t in bias.token_ids]
+                yaw_values = [token_space.token_to_action(t)[1] for t in bias.token_ids]
+                
+                bias_group_info = {
+                    'description': bias.description,
+                    'n_tokens': len(bias.token_ids),
+                    'bias_value': bias.bias_value,
+                    'timestep_range': list(bias.timestep_range),
+                    'time_range_seconds': [bias.timestep_range[0] * 0.5, bias.timestep_range[1] * 0.5],
+                    'acc_range_m_s2': [float(min(acc_values)), float(max(acc_values))],
+                    'yaw_range_rad_s': [float(min(yaw_values)), float(max(yaw_values))],
+                    'sample_tokens': bias.token_ids[:10] if len(bias.token_ids) > 10 else bias.token_ids,
+                }
+                log_entry['bias_groups'].append(bias_group_info)
+        
+        bias_log_entries.append(log_entry)
+    
+    # Compile sequences (sequential multi-maneuver interventions)
+    for seq_idx, sequence in enumerate(sequences):
+        seq_biases = compiler.compile_sequence(sequence, encourage_bias=bias_strength)
+        
+        if seq_biases:
+            # Create a "fake" intervention dict for compatibility
+            seq_intervention_dict = {
+                'variable': f'sequence_{seq_idx}',
+                'value': sequence.description,
+                'original_value': None,
+                'description': f"Sequence: {sequence.description}",
+                'is_sequence': True
+            }
+            
+            compiled.append({
+                'intervention': seq_intervention_dict,
+                'token_biases': [b.to_dict() for b in seq_biases],  # Convert to dicts like regular interventions
+                'effect_prediction': {'direction': 'sequence'},
+                'is_sequence': True
+            })
+            
+            n_tokens = sum(len(b.token_ids) for b in seq_biases)
+            logger.info(f"  [SEQ {seq_idx+1}] {sequence.description}")
+            logger.info(f"      -> {len(seq_biases)} steps, {n_tokens} total tokens")
+            
+            # Add to bias log
+            seq_log_entry = {
+                'intervention_id': f'seq_{seq_idx + 1}',
+                'description': f"Sequence: {sequence.description}",
+                'variable': f'sequence_{seq_idx}',
+                'value': sequence.description,
+                'original_value': None,
+                'is_sequence': True,
+                'steps': [s.to_dict() for s in sequence.steps],
+                'bias_groups': []
+            }
+            
+            for bias in seq_biases:
+                if bias.token_ids:
+                    acc_values = [token_space.token_to_action(t)[0] for t in bias.token_ids]
+                    yaw_values = [token_space.token_to_action(t)[1] for t in bias.token_ids]
+                    seq_log_entry['bias_groups'].append({
+                        'description': bias.description,
+                        'n_tokens': len(bias.token_ids),
+                        'bias_value': bias.bias_value,
+                        'timestep_range': list(bias.timestep_range),
+                        'time_range_seconds': [bias.timestep_range[0] * 0.5, bias.timestep_range[1] * 0.5],
+                        'acc_range_m_s2': [float(min(acc_values)), float(max(acc_values))],
+                        'yaw_range_rad_s': [float(min(yaw_values)), float(max(yaw_values))],
+                    })
+            
+            bias_log_entries.append(seq_log_entry)
+    
+    # Write detailed bias log file if output_dir provided
+    if output_dir:
+        bias_log_path = output_dir / "intervention_bias_log.json"
+        with open(bias_log_path, 'w') as f:
+            json.dump({
+                'bias_strength': bias_strength,
+                'discourage_bias': discourage_bias,
+                'token_space': {
+                    'n_tokens': token_space.n_tokens,
+                    'n_acc_bins': token_space.n_acc_bins,
+                    'n_yaw_bins': token_space.n_yaw_bins,
+                    'acc_range': [token_space.acc_min, token_space.acc_max],
+                    'yaw_range': [token_space.yaw_min, token_space.yaw_max],
+                },
+                'interventions': bias_log_entries
+            }, f, indent=2)
+        logger.info(f"  Saved bias log to: {bias_log_path}")
+        
+        # Also write human-readable summary
+        bias_summary_path = output_dir / "intervention_bias_log.txt"
+        with open(bias_summary_path, 'w') as f:
+            f.write("=" * 70 + "\n")
+            f.write("INTERVENTION TOKEN BIAS LOG\n")
+            f.write("=" * 70 + "\n\n")
+            f.write(f"Bias Strength: {bias_strength} (encourage), {discourage_bias:.2f} (discourage)\n")
+            f.write(f"Token Space: {token_space.n_tokens} tokens ({token_space.n_acc_bins}x{token_space.n_yaw_bins})\n")
+            f.write(f"  Acceleration: [{token_space.acc_min:.1f}, {token_space.acc_max:.1f}] m/s²\n")
+            f.write(f"  Yaw Rate: [{token_space.yaw_min:.2f}, {token_space.yaw_max:.2f}] rad/s\n\n")
+            
+            for entry in bias_log_entries:
+                f.write("-" * 70 + "\n")
+                f.write(f"Intervention {entry['intervention_id']}: {entry['description']}\n")
+                f.write(f"  Variable: {entry['variable']} = {entry['value']}")
+                if entry['original_value']:
+                    f.write(f" (was: {entry['original_value']})")
+                f.write("\n\n")
+                
+                for bg in entry['bias_groups']:
+                    f.write(f"  Token Set: {bg['description']}\n")
+                    f.write(f"    - Bias: {bg['bias_value']:+.1f}\n")
+                    f.write(f"    - Tokens: {bg['n_tokens']}\n")
+                    f.write(f"    - Timesteps: {bg['timestep_range'][0]}-{bg['timestep_range'][1]} ")
+                    f.write(f"({bg['time_range_seconds'][0]:.1f}s - {bg['time_range_seconds'][1]:.1f}s)\n")
+                    f.write(f"    - Acc range: [{bg['acc_range_m_s2'][0]:.2f}, {bg['acc_range_m_s2'][1]:.2f}] m/s²\n")
+                    
+                    # Determine and display yaw direction
+                    yaw_min, yaw_max = bg['yaw_range_rad_s']
+                    if yaw_min > 0.01 or yaw_max > 0.1:
+                        yaw_dir = "LEFT (positive yaw)"
+                    elif yaw_max < -0.01 or yaw_min < -0.1:
+                        yaw_dir = "RIGHT (negative yaw)"
+                    else:
+                        yaw_dir = "STRAIGHT (near-zero yaw)"
+                    f.write(f"    - Yaw range: [{yaw_min:.3f}, {yaw_max:.3f}] rad/s → {yaw_dir}\n")
+                    f.write("\n")
+        logger.info(f"  Saved bias summary to: {bias_summary_path}")
+    
+    logger.info(f"  LLM planning used for {llm_planning_used}/{len(interventions)} interventions")
     
     return {
         'compiled_interventions': compiled,
+        'bias_strength': bias_strength,
+        'bias_log': bias_log_entries,
+        'llm_planning_used': llm_planning_used,
         'token_space_info': {
             'n_tokens': token_space.n_tokens,
             'n_acc_bins': token_space.n_acc_bins,
@@ -510,14 +899,60 @@ def stage_5_bmt_generation(
     TokenBias = bmt_comps['TokenBias']
     compare_trajectories = bmt_comps['compare_trajectories']
     
+    def log_trajectory_direction(traj, label, gt_traj=None):
+        """Log trajectory direction diagnostic info."""
+        if traj is None or len(traj) < 2:
+            logger.warning(f"  [{label}] No trajectory to analyze")
+            return
+        
+        start = traj[0]
+        end = traj[-1]
+        mid = traj[len(traj)//2]
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        heading_rad = np.arctan2(dy, dx)
+        heading_deg = np.degrees(heading_rad)
+        travel = np.sum(np.linalg.norm(np.diff(traj, axis=0), axis=1))
+        
+        # Check if moving forward or backward relative to initial direction
+        first_move_dx = traj[1][0] - traj[0][0]
+        first_move_dy = traj[1][1] - traj[0][1]
+        
+        logger.info(f"  [{label}] Direction Check:")
+        logger.info(f"    Start:  ({start[0]:.2f}, {start[1]:.2f})")
+        logger.info(f"    Mid:    ({mid[0]:.2f}, {mid[1]:.2f})")
+        logger.info(f"    End:    ({end[0]:.2f}, {end[1]:.2f})")
+        logger.info(f"    Delta:  dx={dx:.2f}, dy={dy:.2f}")
+        logger.info(f"    Heading: {heading_deg:.1f}° (from start to end)")
+        logger.info(f"    Travel:  {travel:.2f}m over {len(traj)} points")
+        
+        if gt_traj is not None and len(gt_traj) > 1:
+            gt_dx = gt_traj[-1][0] - gt_traj[0][0]
+            gt_dy = gt_traj[-1][1] - gt_traj[0][1]
+            gt_heading = np.degrees(np.arctan2(gt_dy, gt_dx))
+            
+            # Check if direction matches
+            heading_diff = abs(heading_deg - gt_heading)
+            if heading_diff > 180:
+                heading_diff = 360 - heading_diff
+            
+            if heading_diff > 90:
+                logger.warning(f"    ⚠️ OPPOSITE DIRECTION! GT heading: {gt_heading:.1f}°, diff: {heading_diff:.1f}°")
+            elif heading_diff > 45:
+                logger.warning(f"    ⚠️ Large heading difference from GT: {heading_diff:.1f}°")
+            else:
+                logger.info(f"    ✓ Direction matches GT (diff: {heading_diff:.1f}°)")
+    
     scenario_id = stage1_result['scenario_id']
     compiled_interventions = stage4_result['compiled_interventions']
     
     # Load BMT model
-    logger.info(f"Loading BMT model from: {bmt_checkpoint}")
+    # Resolve to absolute path to avoid path doubling in bmt_utils.get_model()
+    bmt_checkpoint_resolved = str(Path(bmt_checkpoint).resolve())
+    logger.info(f"Loading BMT model from: {bmt_checkpoint_resolved}")
     
     try:
-        pl_model = bmt_utils.get_model(checkpoint_path=bmt_checkpoint)
+        pl_model = bmt_utils.get_model(checkpoint_path=bmt_checkpoint_resolved)
         pl_model = pl_model.eval()
         config = pl_model.config
         tokenizer = pl_model.model.tokenizer
@@ -532,14 +967,40 @@ def stage_5_bmt_generation(
         return {'status': 'model_load_failed', 'error': str(e)}
     
     # Load and preprocess scenario for BMT
+    # CRITICAL: Use file_path from stage_1 to ensure we load the SAME scenario
+    # that was used for VLM screenshots. This avoids ordering mismatches between
+    # ScenarioEnv (used in stage 1) and read_dataset_summary (used here).
     logger.info("Loading scenario for BMT input...")
+    
+    scenario_file_path = stage1_result.get('scenario_file_path')
     data_dir_path = stage1_result.get('data_dir', str(output_dir.parent / "exp_converted"))
-    scenario_data = load_scenario_for_bmt_input(
-        data_dir_path,
-        stage1_result['scenario_index'],
-        config,
-        tokenizer
-    )
+    
+    if scenario_file_path:
+        logger.info(f"  Using file path from stage 1: {scenario_file_path}")
+        scenario_data = load_scenario_for_bmt_input(
+            data_dir=data_dir_path,
+            config=config,
+            tokenizer=tokenizer,
+            file_path=scenario_file_path,  # Use direct file path for consistency
+        )
+    else:
+        # Fallback to index-based loading (may have ordering issues)
+        logger.warning("  No scenario_file_path from stage 1, falling back to index lookup")
+        scenario_data = load_scenario_for_bmt_input(
+            data_dir=data_dir_path,
+            scenario_index=stage1_result['scenario_index'],
+            config=config,
+            tokenizer=tokenizer,
+        )
+    
+    # Verify scenario IDs match (diagnostic)
+    loaded_scenario_id = scenario_data.get('scenario_id', 'unknown')
+    stage1_scenario_id = stage1_result.get('scenario_id', 'unknown')
+    if loaded_scenario_id != stage1_scenario_id and stage1_scenario_id not in loaded_scenario_id:
+        logger.warning(f"  ⚠️ SCENARIO ID MISMATCH! Stage 1: {stage1_scenario_id}, Stage 5: {loaded_scenario_id}")
+        logger.warning(f"  This could cause trajectory direction issues!")
+    else:
+        logger.info(f"  ✓ Scenario ID verified: {loaded_scenario_id}")
     
     # Ground truth will be extracted from preprocessed BMT input (same coordinate frame)
     
@@ -580,6 +1041,7 @@ def stage_5_bmt_generation(
         logger.info(f"  Baseline trajectory: {baseline_traj.shape}")
         travel = np.sum(np.linalg.norm(np.diff(baseline_traj, axis=0), axis=1))
         logger.info(f"  Travel distance: {travel:.1f}m")
+        log_trajectory_direction(baseline_traj, "BASELINE", gt_ego_traj)
     
     # Generate counterfactuals
     cf_results = []
@@ -627,6 +1089,8 @@ def stage_5_bmt_generation(
                 # Store first sample's BMT output for replay export
                 if sample_idx == 0:
                     cf_bmt_outputs.append(cf_output)
+                    # Log direction check for first sample
+                    log_trajectory_direction(cf_traj, f"CF-{i+1}", baseline_traj)
         
         # Compare with baseline
         comparison = None
@@ -684,6 +1148,84 @@ def stage_5_bmt_generation(
         json.dump(generation_results, f, indent=2)
     logger.info(f"\nSaved generation results to {results_path}")
     
+    # Save trajectory direction debug file
+    direction_debug_path = scenario_output_dir / "trajectory_directions.txt"
+    with open(direction_debug_path, 'w') as f:
+        f.write("=" * 70 + "\n")
+        f.write("TRAJECTORY DIRECTION DEBUG\n")
+        f.write("=" * 70 + "\n\n")
+        
+        # Ground Truth
+        if gt_ego_traj is not None and len(gt_ego_traj) > 1:
+            gt_start = gt_ego_traj[0]
+            gt_end = gt_ego_traj[-1]
+            gt_dx = gt_end[0] - gt_start[0]
+            gt_dy = gt_end[1] - gt_start[1]
+            gt_heading = np.degrees(np.arctan2(gt_dy, gt_dx))
+            gt_travel = np.sum(np.linalg.norm(np.diff(gt_ego_traj, axis=0), axis=1))
+            f.write(f"GROUND TRUTH:\n")
+            f.write(f"  Start: ({gt_start[0]:.2f}, {gt_start[1]:.2f})\n")
+            f.write(f"  End:   ({gt_end[0]:.2f}, {gt_end[1]:.2f})\n")
+            f.write(f"  Delta: dx={gt_dx:.2f}, dy={gt_dy:.2f}\n")
+            f.write(f"  Heading: {gt_heading:.1f}°\n")
+            f.write(f"  Travel: {gt_travel:.1f}m\n\n")
+        
+        # Baseline
+        if baseline_traj is not None and len(baseline_traj) > 1:
+            bl_start = baseline_traj[0]
+            bl_end = baseline_traj[-1]
+            bl_dx = bl_end[0] - bl_start[0]
+            bl_dy = bl_end[1] - bl_start[1]
+            bl_heading = np.degrees(np.arctan2(bl_dy, bl_dx))
+            bl_travel = np.sum(np.linalg.norm(np.diff(baseline_traj, axis=0), axis=1))
+            
+            # Compare to GT
+            matches_gt = "N/A"
+            if gt_ego_traj is not None and len(gt_ego_traj) > 1:
+                heading_diff = abs(bl_heading - gt_heading)
+                if heading_diff > 180:
+                    heading_diff = 360 - heading_diff
+                matches_gt = "✓ YES" if heading_diff < 45 else f"✗ NO (diff={heading_diff:.1f}°)"
+            
+            f.write(f"BASELINE:\n")
+            f.write(f"  Start: ({bl_start[0]:.2f}, {bl_start[1]:.2f})\n")
+            f.write(f"  End:   ({bl_end[0]:.2f}, {bl_end[1]:.2f})\n")
+            f.write(f"  Delta: dx={bl_dx:.2f}, dy={bl_dy:.2f}\n")
+            f.write(f"  Heading: {bl_heading:.1f}°\n")
+            f.write(f"  Travel: {bl_travel:.1f}m\n")
+            f.write(f"  Direction matches GT: {matches_gt}\n\n")
+        
+        # Counterfactuals
+        for i, cf in enumerate(cf_results):
+            if cf.get('trajectories') and len(cf['trajectories']) > 0:
+                cf_traj = np.array(cf['trajectories'][0])
+                cf_start = cf_traj[0]
+                cf_end = cf_traj[-1]
+                cf_dx = cf_end[0] - cf_start[0]
+                cf_dy = cf_end[1] - cf_start[1]
+                cf_heading = np.degrees(np.arctan2(cf_dy, cf_dx))
+                cf_travel = np.sum(np.linalg.norm(np.diff(cf_traj, axis=0), axis=1))
+                
+                # Compare to baseline
+                matches_baseline = "N/A"
+                if baseline_traj is not None and len(baseline_traj) > 1:
+                    heading_diff = abs(cf_heading - bl_heading)
+                    if heading_diff > 180:
+                        heading_diff = 360 - heading_diff
+                    matches_baseline = "✓ YES" if heading_diff < 45 else f"✗ NO (diff={heading_diff:.1f}°)"
+                
+                int_desc = cf.get('intervention', {}).get('description', f'intervention_{i}')
+                f.write(f"-" * 70 + "\n")
+                f.write(f"COUNTERFACTUAL {i+1}: {int_desc}\n")
+                f.write(f"  Start: ({cf_start[0]:.2f}, {cf_start[1]:.2f})\n")
+                f.write(f"  End:   ({cf_end[0]:.2f}, {cf_end[1]:.2f})\n")
+                f.write(f"  Delta: dx={cf_dx:.2f}, dy={cf_dy:.2f}\n")
+                f.write(f"  Heading: {cf_heading:.1f}°\n")
+                f.write(f"  Travel: {cf_travel:.1f}m\n")
+                f.write(f"  Direction matches baseline: {matches_baseline}\n\n")
+    
+    logger.info(f"Saved trajectory directions to {direction_debug_path}")
+    
     # Export counterfactual scenarios for replay in ScenarioNet/MetaDrive
     try:
         from counter_bmt.scenario_export import (
@@ -693,6 +1235,18 @@ def stage_5_bmt_generation(
         )
         
         replay_dir = scenario_output_dir / "replay_scenarios"
+        
+        # Clear old scenario files from previous runs to avoid stale data
+        if replay_dir.exists():
+            old_files = list(replay_dir.glob('sd_*.pkl')) + list(replay_dir.glob('dataset_*.pkl'))
+            if old_files:
+                logger.info(f"Cleaning up {len(old_files)} old scenario files from {replay_dir}")
+                for old_file in old_files:
+                    try:
+                        old_file.unlink()
+                    except Exception as e:
+                        logger.warning(f"Could not delete {old_file}: {e}")
+        
         replay_dir.mkdir(parents=True, exist_ok=True)
         
         # Extract map_center from preprocessed data (used by Adv-BMT for coordinate transform)
@@ -716,31 +1270,32 @@ def stage_5_bmt_generation(
             exported_paths.append(gt_path)
             logger.info(f"Exported ground truth scenario as scenario 0")
         
-        # Then export counterfactual scenarios
+        # Then export counterfactual scenarios (ALL samples per intervention)
         for i, cf in enumerate(cf_results):
             if cf.get('trajectories') and len(cf['trajectories']) > 0:
                 # Get intervention name
                 int_desc = cf.get('intervention', {}).get('description', f'intervention_{i}')
                 
-                # Get first trajectory sample
-                traj = np.array(cf['trajectories'][0])
-                
-                # Export using trajectory-only method (simpler, more reliable)
-                # Filename must start with 'sd_' or be numeric to pass MetaDrive validation
-                # Use i+1 since ground truth is 0
-                safe_name = _sanitize_intervention_name(int_desc)[:30]
-                output_path = replay_dir / f"sd_counterfactual_1.0_{scenario_id}_cf_{i+1:02d}_{safe_name}.pkl"
-                
-                path = export_trajectory_only(
-                    trajectory=traj,
-                    original_scenario=scenario_data['raw_data'],
-                    output_path=output_path,
-                    intervention_name=int_desc,
-                    original_file_path=scenario_data.get('file_path'),
-                    map_center=map_center,
-                )
-                if path:
-                    exported_paths.append(path)
+                # Export ALL trajectory samples for this intervention
+                for sample_idx, traj_data in enumerate(cf['trajectories']):
+                    traj = np.array(traj_data)
+                    
+                    # Export using trajectory-only method (simpler, more reliable)
+                    # Filename must start with 'sd_' or be numeric to pass MetaDrive validation
+                    # Include sample index in filename for uniqueness
+                    safe_name = _sanitize_intervention_name(int_desc)[:25]
+                    output_path = replay_dir / f"sd_counterfactual_1.0_{scenario_id}_cf_{i+1:02d}_s{sample_idx}_{safe_name}.pkl"
+                    
+                    path = export_trajectory_only(
+                        trajectory=traj,
+                        original_scenario=scenario_data['raw_data'],
+                        output_path=output_path,
+                        intervention_name=f"{int_desc} (sample {sample_idx + 1})",
+                        original_file_path=scenario_data.get('file_path'),
+                        map_center=map_center,
+                    )
+                    if path:
+                        exported_paths.append(path)
         
         if exported_paths:
             # Create replay script (this also regenerates dataset_summary.pkl)
@@ -1203,9 +1758,20 @@ def run_full_pipeline(
     max_interventions: int = 5,
     n_samples: int = 3,
     temperature: Optional[float] = None,
+    bias_strength: float = 8.0,
+    intervention_diversity: str = "medium",
+    sequence_length: int = 0,
+    speed_range: Optional[Tuple[float, float]] = None,
+    vlm_debug: bool = False,
 ) -> Dict:
     """
     Run the complete CounterBMT pipeline.
+    
+    Args:
+        bias_strength: Token bias strength for interventions (default: 8.0)
+        intervention_diversity: Diversity level ("low", "medium", "high")
+        sequence_length: Generate sequential interventions (0 = single only)
+        speed_range: Optional (min, max) speed multipliers for interventions
     """
     logger.info("\n" + "=" * 70)
     logger.info("CounterBMT Full Pipeline")
@@ -1239,6 +1805,9 @@ def run_full_pipeline(
         'stages': {}
     }
     
+    # Initialize scenario_output_dir (will be set properly after stage1)
+    scenario_output_dir = None
+    
     try:
         # Stage 1: Load and visualize
         stage1 = stage_1_load_and_visualize(data_dir, scenario_index, output_dir, num_frames)
@@ -1246,8 +1815,17 @@ def run_full_pipeline(
         results['stages']['stage1'] = {'status': 'success', 'scenario_id': stage1['scenario_id']}
         results['scenario_id'] = stage1['scenario_id']
         
+        # Create output directory for this scenario (needed for stage 4 bias log)
+        scenario_output_dir = output_dir / stage1['scenario_id']
+        scenario_output_dir.mkdir(parents=True, exist_ok=True)
+        
         # Stage 2: VLM extraction
-        stage2 = stage_2_vlm_extraction(stage1, vlm_client)
+        stage2 = stage_2_vlm_extraction(
+            stage1,
+            vlm_client,
+            output_dir=scenario_output_dir,
+            vlm_debug=vlm_debug,
+        )
         results['stages']['stage2'] = {
             'status': 'success',
             'n_maneuvers': len(stage2['maneuvers']),
@@ -1263,11 +1841,39 @@ def run_full_pipeline(
             'n_interventions': len(stage3['interventions']),
         }
         
-        # Stage 4: Compile interventions
-        stage4 = stage_4_compile_interventions(stage3, max_interventions)
+        # Extract ego state from stage1 trajectory for LLM planning
+        ego_state = None
+        if stage1.get('trajectory') is not None and len(stage1['trajectory']) > 0:
+            traj = stage1['trajectory']
+            # Use the first point as initial state
+            ego_state = {
+                'speed': float(np.linalg.norm(traj[1] - traj[0]) / 0.1) if len(traj) > 1 else 0.0,
+                'heading': float(np.arctan2(traj[1][1] - traj[0][1], traj[1][0] - traj[0][0])) if len(traj) > 1 else 0.0,
+                'position': traj[0].tolist() if hasattr(traj[0], 'tolist') else list(traj[0])
+            }
+        
+        # Stage 4: Compile interventions with LLM planning
+        # Pass the VLM client for LLM-guided intervention phase planning
+        # Also pass full trajectory and VLM extractions for rich context
+        stage4 = stage_4_compile_interventions(
+            stage3, max_interventions,
+            bias_strength=bias_strength,
+            output_dir=scenario_output_dir,
+            llm_client=vlm_client if not use_mock else None,  # Use real LLM for planning
+            ego_state=ego_state,
+            use_llm_planning=not use_mock,  # Disable LLM planning in mock mode
+            trajectory=np.array(stage1['trajectory']) if stage1.get('trajectory') is not None else None,
+            maneuvers=stage2.get('maneuvers', []),
+            decisions=stage2.get('decisions', []),
+            intervention_diversity=intervention_diversity,
+            sequence_length=sequence_length,
+            speed_range=speed_range,
+        )
         results['stages']['stage4'] = {
             'status': 'success',
             'n_compiled': len(stage4['compiled_interventions']),
+            'bias_strength': bias_strength,
+            'llm_planning_used': stage4.get('llm_planning_used', 0),
         }
         
         # Stage 5: BMT generation (if checkpoint provided)
@@ -1296,8 +1902,10 @@ def run_full_pipeline(
     
     # Save overall results
     scenario_id = results.get('scenario_id', f'scenario_{scenario_index}')
-    scenario_output_dir = output_dir / scenario_id
-    scenario_output_dir.mkdir(parents=True, exist_ok=True)
+    # scenario_output_dir may already be defined from stage1, create if not
+    if scenario_output_dir is None:
+        scenario_output_dir = output_dir / scenario_id
+        scenario_output_dir.mkdir(parents=True, exist_ok=True)
     
     results_path = scenario_output_dir / "pipeline_results.json"
     with open(results_path, 'w') as f:
@@ -1485,11 +2093,18 @@ def run_batch_pipeline(
     n_samples: int = 3,
     temperature: Optional[float] = None,
     continue_on_error: bool = True,
+    bias_strength: float = 8.0,
+    intervention_diversity: str = "medium",
+    sequence_length: int = 0,
+    speed_range: Optional[Tuple[float, float]] = None,
 ) -> int:
     """
     Run the CounterBMT pipeline on multiple scenarios in batch mode.
     
     Generates aggregate metrics across all scenarios for comparison with ADV-BMT paper.
+    
+    Args:
+        bias_strength: Token bias strength for interventions (default: 8.0)
     
     Returns:
         0 if all succeeded, 1 if any failed
@@ -1585,6 +2200,10 @@ def run_batch_pipeline(
                 max_interventions=max_interventions,
                 n_samples=n_samples,
                 temperature=temperature,
+                bias_strength=bias_strength,
+                intervention_diversity=intervention_diversity,
+                sequence_length=sequence_length,
+                speed_range=speed_range,
             )
             
             # Get generation results from stage 5
@@ -1982,6 +2601,45 @@ def _save_aggregate_summary(output_dir: Path, batch_results: Dict):
     logger.info(f"Saved batch summary to {summary_path}")
 
 
+def parse_speed_range(s: Optional[str]) -> Optional[Tuple[float, float]]:
+    """Parse speed range from string like '0.25-2.0' to tuple (0.25, 2.0)."""
+    if not s:
+        return None
+    try:
+        parts = s.split('-')
+        if len(parts) == 2:
+            return (float(parts[0]), float(parts[1]))
+    except ValueError:
+        pass
+    return None
+
+
+def resolve_scenario_index(data_dir: Path, scenario_id: str) -> int:
+    """Resolve a scenario ID string to its dataset index."""
+    from metadrive.scenario.utils import read_dataset_summary
+
+    summary_dict, summary_list, _ = read_dataset_summary(str(data_dir))
+    matches = []
+
+    for idx, filename in enumerate(summary_list):
+        if scenario_id in filename:
+            matches.append(idx)
+
+    if not matches:
+        for idx, filename in enumerate(summary_list):
+            meta = summary_dict.get(filename, {})
+            if meta.get("id") == scenario_id or meta.get("scenario_id") == scenario_id:
+                matches.append(idx)
+
+    if not matches:
+        raise ValueError(f"Scenario ID '{scenario_id}' not found in dataset.")
+    if len(matches) > 1:
+        logger.warning(
+            f"Scenario ID '{scenario_id}' matched multiple entries, using first index {matches[0]}"
+        )
+    return matches[0]
+
+
 def main():
     parser = argparse.ArgumentParser(description="CounterBMT Full Pipeline")
     parser.add_argument("--data-dir", type=str, required=True,
@@ -1990,18 +2648,33 @@ def main():
                         help="Output directory")
     parser.add_argument("--scenario-index", type=int, default=0,
                         help="Scenario index to process")
+    parser.add_argument("--scenario-id", type=str, default=None,
+                        help="Scenario ID string to process (overrides --scenario-index)")
     parser.add_argument("--bmt-checkpoint", type=str, default=None,
                         help="Path to BMT checkpoint (skip BMT if not provided)")
     parser.add_argument("--mock", action="store_true",
                         help="Use mock clients (no API calls)")
     parser.add_argument("--num-frames", type=int, default=8,
                         help="Number of frames for VLM")
+    parser.add_argument("--vlm-debug", action="store_true",
+                        help="Save VLM prompts/responses to output_dir/vlm_debug")
     parser.add_argument("--max-interventions", type=int, default=5,
                         help="Maximum interventions to process")
     parser.add_argument("--n-samples", type=int, default=3,
                         help="Samples per intervention")
     parser.add_argument("--temperature", type=float, default=None,
                         help="Sampling temperature")
+    parser.add_argument("--bias-strength", type=float, default=8.0,
+                        help="Token bias strength for interventions (default: 8.0)")
+    
+    # Intervention diversity and sequence arguments
+    parser.add_argument("--intervention-diversity", type=str, default="medium",
+                        choices=["low", "medium", "high", "lateral"],
+                        help="Intervention diversity level: low (conservative), medium (balanced), high (extreme), lateral (only turns/lane changes)")
+    parser.add_argument("--sequence-length", type=int, default=0,
+                        help="Generate sequential interventions with N maneuvers (0 = single interventions only)")
+    parser.add_argument("--speed-range", type=str, default=None,
+                        help="Speed multiplier range, e.g., '0.25-2.0' (default based on diversity)")
     
     # Batch processing arguments
     parser.add_argument("--batch", action="store_true",
@@ -2015,8 +2688,27 @@ def main():
     parser.add_argument("--continue-on-error", action="store_true",
                         help="Continue processing even if a scenario fails")
     
-    args = parser.parse_args()
+    # Logging arguments
+    parser.add_argument("--log-dir", type=str, default=None,
+                        help="Directory for log files (default: output-dir/logs)")
+    parser.add_argument("--log-level", type=str, default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Logging level (default: INFO)")
+    parser.add_argument("--log-file", type=str, default=None,
+                        help="Explicit log file path (overrides log-dir)")
     
+    args = parser.parse_args()
+
+    if args.batch and args.scenario_id is not None:
+        parser.error("--scenario-id cannot be used with --batch mode.")
+    
+    # Set up logging with file output
+    setup_logging(args)
+    
+    if args.scenario_id is not None:
+        args.scenario_index = resolve_scenario_index(Path(args.data_dir), args.scenario_id)
+        logger.info(f"Resolved scenario ID '{args.scenario_id}' to index {args.scenario_index}")
+
     # Batch mode
     if args.batch:
         return run_batch_pipeline(
@@ -2032,6 +2724,10 @@ def main():
             n_samples=args.n_samples,
             temperature=args.temperature,
             continue_on_error=args.continue_on_error,
+            bias_strength=args.bias_strength,
+            intervention_diversity=args.intervention_diversity,
+            sequence_length=args.sequence_length,
+            speed_range=parse_speed_range(args.speed_range),
         )
     
     # Single scenario mode
@@ -2045,6 +2741,11 @@ def main():
         max_interventions=args.max_interventions,
         n_samples=args.n_samples,
         temperature=args.temperature,
+        bias_strength=args.bias_strength,
+        intervention_diversity=args.intervention_diversity,
+        sequence_length=args.sequence_length,
+        speed_range=parse_speed_range(args.speed_range),
+        vlm_debug=args.vlm_debug,
     )
     
     return 0 if results.get('status') == 'success' else 1

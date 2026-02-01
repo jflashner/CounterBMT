@@ -1,0 +1,102 @@
+================================================================================
+COUNTERBMT BATCH PROCESSING SUMMARY
+================================================================================
+Generated: 2026-01-11 23:01:08
+
+PROCESSING RESULTS:
+--------------------------------------------------
+  Scenarios Processed: 50
+  Scenarios Failed:    0
+  Success Rate:        100.0%
+  Total Interventions: 250
+  Effective Interventions: 151
+
+================================================================================
+SANITY CHECK: BMT BASELINE vs GROUND TRUTH
+================================================================================
+(Lower is better - measures how well BMT predicts without intervention)
+
+  ADE (m): mean=0.99m, median=0.62m, Q1-Q3=[0.08, 1.54], range=[0.00, 5.57] (n=50)
+  FDE (m): mean=3.22m, median=2.18m, Q1-Q3=[0.15, 4.33], range=[0.00, 19.70] (n=50)
+
+  Baseline Distance: mean=57.70m, median=41.94m, Q1-Q3=[3.60, 91.85], range=[0.00, 250.43] (n=50)
+  GT Distance:       mean=54.57m, median=46.44m, Q1-Q3=[1.32, 91.87], range=[0.01, 239.26] (n=50)
+
+================================================================================
+ADV-BMT REALISM METRICS (per intervention)
+================================================================================
+(Compare with ADV-BMT paper Table (a))
+
+  Format: mean (median)
+
+  Metric          Mean    Median    Q1      Q3      Min     Max     N
+  ----------------------------------------------------------------------
+  SFDE_avg          7.76    4.89    1.26   10.56    0.00   67.62   250
+  SFDE_min          4.99    1.84    0.20    6.00    0.00   67.56   250
+  SADE_avg          2.56    1.57    0.44    3.37    0.00   20.33   250
+  SADE_min          1.72    0.75    0.08    2.27    0.00   20.29   250
+  VehColl_avg       0.01    0.00    0.00    0.00    0.00    0.39   250
+  VehColl_min       0.01    0.00    0.00    0.00    0.00    0.22   250
+  JSD_velocity      0.18    0.14    0.08    0.23    0.00    0.66   250
+  JSD_TTC           0.01    0.00    0.00    0.00   -0.00    0.69   250
+
+================================================================================
+ADV-BMT DIVERSITY METRICS (per intervention)
+================================================================================
+(Compare with ADV-BMT paper Table (b))
+
+  Metric          Mean    Median    Q1      Q3      Min     Max     N
+  ----------------------------------------------------------------------
+  FDD               8.40    5.04    1.16   11.55    0.00   56.10   250
+  SDD               8.52    5.63    1.62   11.63    0.00   56.10   250
+  ADD               2.83    2.00    0.47    3.88    0.00   19.46   250
+
+================================================================================
+INTERVENTION EFFECTIVENESS
+================================================================================
+  Distance Change (%): mean=5007.52%, median=-0.00%, Q1-Q3=[-11.50, 4.23], range=[-99.89, 606195.44] (n=250)
+
+================================================================================
+COMPARISON WITH ADV-BMT PAPER (Forward method)
+================================================================================
+
+  ADV-BMT Paper Values (Forward):
+    SFDE_avg: 3.52    SFDE_min: 2.35
+    SADE_avg: 2.39    SADE_min: 1.98
+    VehColl_min: 0.03  VehColl_avg: 0.05
+    JSD_velocity: 0.23  JSD_TTC: 0.30
+    FDD: 10.78  ADD: 4.40
+
+  CounterBMT Results (this batch):
+    SFDE_avg: 3.22    SFDE_min: 1.95
+    SADE_avg: 2.56    SADE_min: 1.72
+    VehColl_min: 0.01  VehColl_avg: 0.01
+    JSD_velocity: 0.18  JSD_TTC: --
+    FDD: 8.40  ADD: 2.83
+
+================================================================================
+PER-SCENARIO BREAKDOWN
+================================================================================
+  ✓ [   0] 90078b3dd8e4b3b1: 139.6m, 5 interventions
+  ✓ [   1] 2ff20c0841a51211: 91.6m, 5 interventions
+  ✓ [   2] f715fd2228b0fccc: 61.6m, 5 interventions
+  ✓ [   3] 8d123d77a355e167: 107.5m, 5 interventions
+  ✓ [   4] b3e42499458e549d: 25.7m, 5 interventions
+  ✓ [   5] 255dce09debcf15d: 91.7m, 5 interventions
+  ✓ [   6] 3b4c6dfdffc4c3f3: 0.8m, 5 interventions
+  ✓ [   7] ea217cff15168d5e: 49.3m, 5 interventions
+  ✓ [   8] 61a26c46c7983c44: 133.8m, 5 interventions
+  ✓ [   9] ed3a9447569516ca: 113.5m, 5 interventions
+  ✓ [  10] 206a1c1c517aada5: 0.8m, 5 interventions
+  ✓ [  11] 83788c09a8257b8a: 0.0m, 5 interventions
+  ✓ [  12] 6821f5516eec2f34: 157.8m, 5 interventions
+  ✓ [  13] 81964694606bdeba: 5.0m, 5 interventions
+  ✓ [  14] 478008b87e227282: 35.3m, 5 interventions
+  ✓ [  15] 136c18683a6035b5: 21.2m, 5 interventions
+  ✓ [  16] 8d4af2ca76b8cb22: 91.9m, 5 interventions
+  ✓ [  17] 6475c53c59bdac31: 2.0m, 5 interventions
+  ✓ [  18] ba50b3f55cb440e3: 0.0m, 5 interventions
+  ✓ [  19] 419a01ba6d1efe6b: 34.8m, 5 interventions
+  ... and 30 more scenarios
+
+================================================================================

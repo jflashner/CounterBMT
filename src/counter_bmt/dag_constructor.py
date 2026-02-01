@@ -111,12 +111,28 @@ class DAGEdge:
 
 @dataclass
 class Intervention:
+    """
+    Represents a counterfactual intervention on a DAG node.
+    
+    Includes aggressiveness and timestamp for proper mapping to
+    granular token sets in the InterventionCompiler.
+    """
     variable_id: str
     value: Any
     original_value: Optional[Any] = None
     description: str = ""
-    def to_dict(self): return {"variable": self.variable_id, "value": self.value,
-                               "original_value": self.original_value, "description": self.description}
+    aggressiveness: str = "normal"  # passive, normal, aggressive
+    timestamp: Optional[float] = None  # Time of intervention for time-based biasing
+    
+    def to_dict(self): 
+        return {
+            "variable": self.variable_id, 
+            "value": self.value,
+            "original_value": self.original_value, 
+            "description": self.description,
+            "aggressiveness": self.aggressiveness,
+            "timestamp": self.timestamp
+        }
 
 
 @dataclass
@@ -133,6 +149,121 @@ class CounterfactualResult:
         "outcome_variable": self.outcome_variable, "original_outcome": self.original_outcome,
         "counterfactual_outcome": self.counterfactual_outcome, "effect_direction": self.effect_direction,
         "confidence": self.confidence, "reasoning": self.reasoning, "affected_paths": self.affected_paths}
+
+
+# =============================================================================
+# Intervention Sequences (Sequential Multi-Maneuver Interventions)
+# =============================================================================
+
+class InterventionDiversity(Enum):
+    """Controls how extreme/diverse the generated interventions are."""
+    LOW = "low"          # Conservative: only safe alternatives
+    MEDIUM = "medium"    # Balanced (current default)
+    HIGH = "high"        # Extreme: includes aggressive/risky alternatives
+    LATERAL = "lateral"  # Only lateral maneuvers (turns, lane changes) - no straight/accel/brake
+
+
+@dataclass
+class InterventionStep:
+    """
+    A single step in an intervention sequence.
+    
+    Represents one maneuver at a specific time in a sequential chain.
+    """
+    maneuver: str           # "accelerate", "lane_change_right", "turn_right", etc.
+    start_time_s: float     # When to start this maneuver
+    duration_s: float       # How long the maneuver lasts
+    intensity: str = "normal"  # "gentle", "normal", "aggressive"
+    
+    def to_dict(self) -> Dict:
+        return {
+            "maneuver": self.maneuver,
+            "start_time_s": self.start_time_s,
+            "duration_s": self.duration_s,
+            "intensity": self.intensity
+        }
+    
+    @classmethod
+    def from_dict(cls, d: Dict) -> "InterventionStep":
+        return cls(
+            maneuver=d["maneuver"],
+            start_time_s=d["start_time_s"],
+            duration_s=d["duration_s"],
+            intensity=d.get("intensity", "normal")
+        )
+
+
+@dataclass  
+class InterventionSequence:
+    """
+    A sequence of maneuvers to apply at different times.
+    
+    Example: accelerate → lane_change_right → turn_right
+    
+    This enables complex driving "scripts" in a single counterfactual trajectory.
+    """
+    steps: List[InterventionStep]
+    description: str = ""
+    sequence_id: str = ""
+    
+    def __post_init__(self):
+        # Sort steps by start time
+        self.steps = sorted(self.steps, key=lambda s: s.start_time_s)
+        
+        # Generate description if not provided
+        if not self.description and self.steps:
+            maneuvers = [s.maneuver for s in self.steps]
+            self.description = " → ".join(maneuvers)
+    
+    @property
+    def total_duration(self) -> float:
+        """Total duration covered by all steps."""
+        if not self.steps:
+            return 0.0
+        last_step = self.steps[-1]
+        return last_step.start_time_s + last_step.duration_s
+    
+    def to_dict(self) -> Dict:
+        return {
+            "sequence_id": self.sequence_id,
+            "description": self.description,
+            "steps": [s.to_dict() for s in self.steps],
+            "total_duration": self.total_duration
+        }
+    
+    @classmethod
+    def from_dict(cls, d: Dict) -> "InterventionSequence":
+        return cls(
+            steps=[InterventionStep.from_dict(s) for s in d.get("steps", [])],
+            description=d.get("description", ""),
+            sequence_id=d.get("sequence_id", "")
+        )
+    
+    @classmethod
+    def from_string(cls, s: str) -> "InterventionSequence":
+        """
+        Parse a sequence from a string specification.
+        
+        Format: "maneuver1:start-end:intensity,maneuver2:start-end:intensity,..."
+        Example: "accelerate:0-2:aggressive,lane_change_right:2-4:normal,turn_right:4-7:gentle"
+        """
+        steps = []
+        parts = s.split(",")
+        for part in parts:
+            tokens = part.strip().split(":")
+            if len(tokens) >= 2:
+                maneuver = tokens[0]
+                time_range = tokens[1].split("-")
+                start = float(time_range[0])
+                end = float(time_range[1]) if len(time_range) > 1 else start + 2.0
+                intensity = tokens[2] if len(tokens) > 2 else "normal"
+                steps.append(InterventionStep(
+                    maneuver=maneuver,
+                    start_time_s=start,
+                    duration_s=end - start,
+                    intensity=intensity
+                ))
+        return cls(steps=steps)
 
 
 class ScenarioDAG:
@@ -247,33 +378,278 @@ class ScenarioDAG:
         types = {NodeType.DECISION, NodeType.MANEUVER, NodeType.EGO_STATE}
         return [n for n in self.nodes.values() if n.node_type in types and n.layer < 2]
     
-    def enumerate_interventions(self) -> List[Intervention]:
+    def enumerate_interventions(
+        self, 
+        diversity: InterventionDiversity = InterventionDiversity.MEDIUM,
+        speed_range: Optional[Tuple[float, float]] = None
+    ) -> List[Intervention]:
+        """
+        Enumerate all possible interventions on intervenable nodes.
+        
+        Args:
+            diversity: Controls how extreme the interventions are
+                - LOW: Only safe/conservative alternatives
+                - MEDIUM: Balanced alternatives (default)
+                - HIGH: Includes aggressive/extreme alternatives
+            speed_range: Optional (min_multiplier, max_multiplier) for speed changes
+                        Default depends on diversity level
+        
+        Includes aggressiveness and timestamp from node metadata for
+        proper mapping to granular token sets.
+        """
         interventions = []
-        for node in self.get_intervenable_nodes():
-            alts = self._get_alternatives(node)
+
+        def _node_priority(n: DAGNode) -> int:
+            if n.node_type == NodeType.DECISION:
+                return 0
+            if n.node_type == NodeType.MANEUVER:
+                return 1
+            if n.node_type == NodeType.EGO_STATE:
+                return 2
+            return 3
+
+        nodes = sorted(self.get_intervenable_nodes(), key=_node_priority)
+        for node in nodes:
+            alts = self._get_alternatives(node, diversity, speed_range)
             for alt in alts:
                 if alt != node.value:
                     interventions.append(Intervention(
-                        variable_id=node.id, value=alt, original_value=node.value,
-                        description=f"Set {node.name} to {alt} (was {node.value})"))
+                        variable_id=node.id, 
+                        value=alt, 
+                        original_value=node.value,
+                        description=f"Set {node.name} to {alt} (was {node.value})",
+                        aggressiveness=node.metadata.get('aggressiveness', 'normal'),
+                        timestamp=node.timestamp
+                    ))
         return interventions
     
-    def _get_alternatives(self, node: DAGNode) -> List[Any]:
-        if "alternatives" in node.metadata: return node.metadata["alternatives"]
+    def enumerate_sequences(
+        self,
+        sequence_length: int = 2,
+        diversity: InterventionDiversity = InterventionDiversity.MEDIUM,
+        prediction_horizon_s: float = 9.5
+    ) -> List[InterventionSequence]:
+        """
+        Enumerate sequential intervention chains (multi-maneuver trajectories).
+        
+        Generates sequences of maneuvers that happen at different times,
+        e.g., "accelerate → lane_change_right → turn_right"
+        
+        Args:
+            sequence_length: Number of maneuvers per sequence (2, 3, etc.)
+            diversity: Controls which maneuvers are included
+            prediction_horizon_s: Total time horizon (default 9.5s for 19 timesteps)
+            
+        Returns:
+            List of InterventionSequence objects
+        """
+        if sequence_length < 2:
+            return []
+        
+        # Get available maneuvers based on diversity
+        maneuvers = self._get_sequence_maneuvers(diversity)
+        
+        # Calculate time per maneuver
+        maneuver_duration = prediction_horizon_s / sequence_length
+        
+        # Generate combinations
+        import itertools
+        sequences = []
+        seq_id = 0
+        
+        for combo in itertools.product(maneuvers, repeat=sequence_length):
+            # Skip sequences with all same maneuvers
+            if len(set(combo)) == 1:
+                continue
+            
+            # Skip incompatible sequences (e.g., left_turn after lane_change_right on highway)
+            if not self._is_valid_sequence(combo):
+                continue
+            
+            steps = []
+            for i, maneuver in enumerate(combo):
+                steps.append(InterventionStep(
+                    maneuver=maneuver,
+                    start_time_s=i * maneuver_duration,
+                    duration_s=maneuver_duration,
+                    intensity="normal"
+                ))
+            
+            sequences.append(InterventionSequence(
+                steps=steps,
+                sequence_id=f"seq_{seq_id:03d}"
+            ))
+            seq_id += 1
+        
+        return sequences
+    
+    def _get_sequence_maneuvers(self, diversity: InterventionDiversity) -> List[str]:
+        """Get available maneuvers for sequence generation based on diversity."""
+        if diversity == InterventionDiversity.LOW:
+            return ["straight", "decelerate", "lane_change_left", "lane_change_right"]
+        elif diversity == InterventionDiversity.HIGH:
+            return [
+                "straight", "accelerate", "decelerate", "hard_brake",
+                "lane_change_left", "lane_change_right", 
+                "turn_left", "turn_right", "swerve"
+            ]
+        elif diversity == InterventionDiversity.LATERAL:
+            # Only lateral maneuvers - no straight, accelerate, or brake
+            return [
+                "lane_change_left", "lane_change_right",
+                "turn_left", "turn_right", "swerve"
+            ]
+        else:  # MEDIUM
+            return [
+                "straight", "accelerate", "decelerate",
+                "lane_change_left", "lane_change_right",
+                "turn_left", "turn_right"
+            ]
+    
+    def _is_valid_sequence(self, maneuvers: Tuple[str, ...]) -> bool:
+        """Check if a maneuver sequence is physically plausible."""
+        # Can't turn immediately after opposite lane change
+        for i in range(len(maneuvers) - 1):
+            if maneuvers[i] == "lane_change_left" and maneuvers[i+1] == "turn_right":
+                return False
+            if maneuvers[i] == "lane_change_right" and maneuvers[i+1] == "turn_left":
+                return False
+            # Can't do hard brake then accelerate immediately
+            if maneuvers[i] == "hard_brake" and maneuvers[i+1] == "accelerate":
+                return False
+        return True
+    
+    def _get_alternatives(
+        self, 
+        node: DAGNode, 
+        diversity: InterventionDiversity = InterventionDiversity.MEDIUM,
+        speed_range: Optional[Tuple[float, float]] = None
+    ) -> List[Any]:
+        """Get alternatives for a node based on diversity level."""
+        if "alternatives" in node.metadata: 
+            return node.metadata["alternatives"]
+        
         if node.node_type == NodeType.DECISION:
-            alts = {"proceed": ["proceed", "yield", "stop"], "yield": ["proceed", "yield", "stop"],
-                    "maintain_course": ["maintain_course", "brake", "swerve"],
-                    "accept_gap": ["accept_gap", "reject_gap"]}
-            return alts.get(node.value, [node.value])
+            return self._get_decision_alternatives(node.value, diversity)
+        
         if node.node_type == NodeType.MANEUVER:
-            alts = {"left_turn": ["left_turn", "straight", "stop"],
-                    "straight": ["straight", "stop"], "lane_change_left": ["lane_change_left", "straight"]}
-            return alts.get(node.value, [node.value])
+            return self._get_maneuver_alternatives(node.value, diversity)
+        
         if node.node_type == NodeType.EGO_STATE and "speed" in node.name.lower():
-            if isinstance(node.value, (int, float)) and node.value > 0:
-                v = float(node.value)
-                return [v * 0.5, v * 0.75, v, v * 1.25]
+            return self._get_speed_alternatives(node.value, diversity, speed_range)
+        
         return [node.value]
+    
+    def _get_decision_alternatives(self, value: str, diversity: InterventionDiversity) -> List[str]:
+        """Get decision alternatives based on diversity."""
+        if diversity == InterventionDiversity.LOW:
+            alts = {
+                "proceed": ["proceed", "yield"],
+                "yield": ["yield", "stop"],
+                "maintain_course": ["maintain_course", "brake"],
+                "accept_gap": ["accept_gap", "reject_gap"]
+            }
+        elif diversity == InterventionDiversity.HIGH:
+            alts = {
+                "proceed": ["proceed", "yield", "stop", "accelerate_through"],
+                "yield": ["proceed", "yield", "stop", "ignore_yield"],
+                "maintain_course": ["maintain_course", "brake", "swerve", "hard_brake"],
+                "accept_gap": ["accept_gap", "reject_gap", "force_gap"]
+            }
+        else:  # MEDIUM
+            alts = {
+                "proceed": ["proceed", "yield", "stop"],
+                "yield": ["proceed", "yield", "stop"],
+                "maintain_course": ["maintain_course", "brake", "swerve"],
+                "accept_gap": ["accept_gap", "reject_gap"]
+            }
+        return alts.get(value, [value])
+    
+    def _get_maneuver_alternatives(self, value: str, diversity: InterventionDiversity) -> List[str]:
+        """Get maneuver alternatives based on diversity."""
+        if diversity == InterventionDiversity.LOW:
+            alts = {
+                "left_turn": ["left_turn", "straight"],
+                "right_turn": ["right_turn", "straight"],
+                "lane_change_left": ["lane_change_left", "straight"],
+                "lane_change_right": ["lane_change_right", "straight"],
+                "straight": ["straight", "decelerate"],
+                "stop": ["stop", "decelerate"],
+            }
+        elif diversity == InterventionDiversity.HIGH:
+            alts = {
+                "left_turn": ["left_turn", "straight", "stop", "sharp_left_turn", "u_turn"],
+                "right_turn": ["right_turn", "straight", "stop", "sharp_right_turn"],
+                "lane_change_left": ["lane_change_left", "lane_change_right", "straight", "aggressive_lane_left"],
+                "lane_change_right": ["lane_change_right", "lane_change_left", "straight", "aggressive_lane_right"],
+                "straight": ["straight", "lane_change_left", "lane_change_right", "accelerate", "hard_brake", "swerve"],
+                "stop": ["stop", "decelerate", "straight", "reverse"],
+                "decelerate": ["decelerate", "stop", "straight", "hard_brake"],
+                "accelerate": ["accelerate", "straight", "decelerate", "hard_accelerate"],
+            }
+        elif diversity == InterventionDiversity.LATERAL:
+            # Only lateral maneuvers - no straight, accelerate, brake, or stop
+            alts = {
+                "left_turn": ["left_turn", "right_turn", "lane_change_left", "swerve"],
+                "right_turn": ["right_turn", "left_turn", "lane_change_right", "swerve"],
+                "lane_change_left": ["lane_change_left", "lane_change_right", "turn_left", "swerve"],
+                "lane_change_right": ["lane_change_right", "lane_change_left", "turn_right", "swerve"],
+                "straight": ["lane_change_left", "lane_change_right", "turn_left", "turn_right", "swerve"],
+                "stop": ["lane_change_left", "lane_change_right", "swerve"],
+                "decelerate": ["lane_change_left", "lane_change_right", "swerve"],
+                "accelerate": ["lane_change_left", "lane_change_right", "swerve"],
+            }
+        else:  # MEDIUM
+            alts = {
+                "left_turn": ["left_turn", "straight", "stop"],
+                "right_turn": ["right_turn", "straight", "stop"],
+                "lane_change_left": ["lane_change_left", "lane_change_right", "straight"],
+                "lane_change_right": ["lane_change_right", "lane_change_left", "straight"],
+                "straight": ["straight", "lane_change_left", "lane_change_right", "stop"],
+                "stop": ["stop", "decelerate", "straight"],
+                "decelerate": ["decelerate", "stop", "straight", "accelerate"],
+                "accelerate": ["accelerate", "straight", "decelerate"],
+            }
+        return alts.get(value, [value])
+    
+    def _get_speed_alternatives(
+        self, 
+        value: Any, 
+        diversity: InterventionDiversity,
+        speed_range: Optional[Tuple[float, float]] = None
+    ) -> List[float]:
+        """Get speed alternatives based on diversity and optional range."""
+        if not isinstance(value, (int, float)) or value <= 0:
+            return [value]
+        
+        v = float(value)
+        
+        # Use provided range or default based on diversity
+        if speed_range:
+            min_mult, max_mult = speed_range
+        else:
+            if diversity == InterventionDiversity.LOW:
+                min_mult, max_mult = 0.75, 1.25
+            elif diversity == InterventionDiversity.HIGH:
+                min_mult, max_mult = 0.0, 2.0  # Include full stop and double speed
+            else:  # MEDIUM
+                min_mult, max_mult = 0.5, 1.5
+        
+        # Generate speed alternatives
+        multipliers = []
+        if min_mult == 0.0:
+            multipliers.append(0.0)  # Full stop
+            multipliers.extend([0.25, 0.5, 0.75, 1.0, 1.25, 1.5])
+            if max_mult >= 1.75:
+                multipliers.append(1.75)
+            if max_mult >= 2.0:
+                multipliers.append(2.0)
+        else:
+            # Generate evenly spaced multipliers
+            step = (max_mult - min_mult) / 4
+            multipliers = [min_mult + i * step for i in range(5)]
+        
+        return [v * m for m in multipliers if min_mult <= m <= max_mult]
     
     def to_dict(self) -> Dict: return {"scenario_id": self.scenario_id,
         "nodes": [n.to_dict() for n in self.nodes.values()],
@@ -708,12 +1084,26 @@ class GroundedDAGConstructor:
                           "confidence": d_conf}))
     
     def _maneuver_alternatives(self, m_type: str) -> List[str]:
-        alts = {"left_turn": ["left_turn", "straight", "stop"],
-                "right_turn": ["right_turn", "straight", "stop"],
-                "straight": ["straight", "stop"],
-                "lane_change_left": ["lane_change_left", "straight"],
-                "lane_change_right": ["lane_change_right", "straight"],
-                "stop": ["stop", "proceed"], "decelerate": ["decelerate", "maintain", "accelerate"]}
+        """
+        Get alternative maneuvers for counterfactual generation.
+        
+        Returns alternatives that map to the new granular token sets:
+        - Lane changes: lane_change_{left,right}
+        - Turns: left_turn, right_turn (mapped to turn_{left,right}_moderate)
+        """
+        alts = {
+            # Turns - alternatives include going straight or stopping
+            "left_turn": ["left_turn", "straight", "stop"],
+            "right_turn": ["right_turn", "straight", "stop"],
+            # Lane changes - alternatives include staying straight
+            "lane_change_left": ["lane_change_left", "lane_change_right", "straight"],
+            "lane_change_right": ["lane_change_right", "lane_change_left", "straight"],
+            # Basic maneuvers
+            "straight": ["straight", "lane_change_left", "lane_change_right", "stop"],
+            "stop": ["stop", "decelerate", "straight"],
+            "decelerate": ["decelerate", "stop", "straight", "accelerate"],
+            "accelerate": ["accelerate", "straight", "decelerate"],
+        }
         return alts.get(m_type, [m_type])
     
     def _decision_alternatives(self, choice: str) -> List[str]:

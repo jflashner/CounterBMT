@@ -20,6 +20,7 @@ import json
 import base64
 import logging
 import argparse
+from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Tuple, Union
@@ -162,6 +163,7 @@ class CriticalDecisionPoint:
     ground_truth_choice: str
     alternatives: List[str]
     description: str = ""
+    reasoning: str = ""
     confidence: float = 1.0
 
 
@@ -175,6 +177,7 @@ class ManeuverSegment:
     end_timestamp: float
     aggressiveness: Aggressiveness
     description: str = ""
+    reasoning: str = ""
     confidence: float = 1.0
 
 
@@ -205,6 +208,7 @@ class ScenarioFeatures:
                     "end_timestamp": m.end_timestamp,
                     "aggressiveness": m.aggressiveness.value,
                     "description": m.description,
+                    "reasoning": m.reasoning,
                     "confidence": m.confidence
                 }
                 for m in self.maneuver_sequence
@@ -217,6 +221,7 @@ class ScenarioFeatures:
                     "choice": d.ground_truth_choice,
                     "alternatives": d.alternatives,
                     "description": d.description,
+                    "reasoning": d.reasoning,
                     "confidence": d.confidence
                 }
                 for d in self.critical_decisions
@@ -416,12 +421,18 @@ class VLMSafetyCriticalExtractor:
     # PROMPTS - Edit these to tune extraction
     # =========================================================================
     
-    MANEUVER_PROMPT_TEMPLATE = """Analyze these simulator screenshots showing a driving scenario. 
+    MANEUVER_PROMPT_TEMPLATE = """Analyze these simulator screenshots showing a driving scenario.
 The images are in chronological order with the following timestamps: {timestamps}
 
 For each image, I'll tell you its timestamp in seconds from the start of the scenario.
 
-Identify ALL MANEUVERS the ego vehicle (the main vehicle being controlled) performs throughout this sequence.
+The ego vehicle is the GREEN car. There will only ever be ONE green car in any scene.
+Only describe actions of the green car; ignore all other vehicles.
+If you are unsure about the ego vehicle in a frame, state that in reasoning and skip the maneuver.
+Identify ALL MANEUVERS the ego vehicle (the green car) performs throughout this sequence.
+
+Ego state per frame (ground truth from simulation):
+{ego_state}
 
 Maneuver types to look for:
 - straight: Vehicle maintaining lane and direction
@@ -437,6 +448,8 @@ For each maneuver, estimate:
 1. Start time (seconds) - when this maneuver begins
 2. End time (seconds) - when this maneuver ends
 3. Aggressiveness: passive (gentle/slow), normal, or aggressive (fast/sharp)
+4. Reasoning: reference the frames (timestamps), where the green car is, and
+   what motion between those frames indicates the maneuver
 
 Respond ONLY with valid JSON:
 {{
@@ -446,7 +459,8 @@ Respond ONLY with valid JSON:
             "start_time": <float>,
             "end_time": <float>,
             "aggressiveness": "passive" | "normal" | "aggressive",
-            "description": "<brief description of what you observe>"
+            "description": "<brief description of what you observe>",
+            "reasoning": "<which frames, where the green car is, what motion indicates the maneuver>"
         }}
     ],
     "overall_description": "<one sentence summary of the entire sequence>"
@@ -458,7 +472,13 @@ If unsure about exact timing, use the timestamps of the images as reference poin
     DECISION_PROMPT_TEMPLATE = """Analyze these simulator screenshots showing a driving scenario.
 The images are in chronological order with the following timestamps: {timestamps}
 
-Identify any CRITICAL SAFETY DECISIONS the driver made or should have made.
+The ego vehicle is the GREEN car. There will only ever be ONE green car in any scene.
+Only describe decisions made by the green car; ignore other vehicles.
+If you are unsure about the ego vehicle in a frame, state that in reasoning and skip the decision.
+Identify any CRITICAL SAFETY DECISIONS the ego driver made or should have made.
+
+Ego state per frame (ground truth from simulation):
+{ego_state}
 
 Decision types to look for:
 - proceed_or_yield: Choosing to proceed vs yield/wait (at intersections, crossings)
@@ -472,6 +492,8 @@ For each decision:
 2. What choice was made
 3. What alternatives existed
 4. Why this was safety-critical
+5. Reasoning: reference the frames (timestamps), where the green car is, and
+   what motion/context indicates the decision point
 
 Respond ONLY with valid JSON:
 {{
@@ -482,6 +504,7 @@ Respond ONLY with valid JSON:
             "choice_made": "<what the driver did>",
             "alternatives": ["<other>", "<options>", "<available>"],
             "description": "<why this was a critical decision>",
+            "reasoning": "<which frames, where the green car is, what indicates the decision>",
             "confidence": <0.0-1.0>
         }}
     ],
@@ -499,7 +522,8 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
         self, 
         client: Union[GPT4oClient, MockGPT4oClient],
         debug: bool = True,
-        max_images_per_call: int = 10
+        max_images_per_call: int = 10,
+        debug_output_dir: Optional[str] = None
     ):
         """
         Args:
@@ -511,6 +535,7 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
         self.debug = debug
         self.max_images_per_call = max_images_per_call
         self.extraction_log = []
+        self.debug_output_dir = debug_output_dir
     
     # =========================================================================
     # MAIN EXTRACTION
@@ -548,12 +573,14 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
         # Load images
         for img in images:
             img.load()
-        
+
+        ego_state_summary = self._build_ego_state_summary(images, trajectory)
+
         # Extract maneuvers
-        maneuvers, maneuver_raw = self._extract_maneuvers(images)
+        maneuvers, maneuver_raw, maneuver_prompt = self._extract_maneuvers(images, ego_state_summary)
         
         # Extract decisions
-        decisions, decision_raw = self._extract_decisions(images)
+        decisions, decision_raw, decision_prompt = self._extract_decisions(images, ego_state_summary)
         
         # Ground to trajectory timesteps if provided
         if trajectory is not None:
@@ -577,6 +604,19 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
                 "has_trajectory": trajectory is not None
             }
         )
+
+        # Optional: save prompt/response logs to disk
+        if self.debug_output_dir:
+            self._save_debug_log(
+                output_dir=self.debug_output_dir,
+                scenario_id=scenario_id,
+                images=images,
+                ego_state_summary=ego_state_summary,
+                maneuver_prompt=maneuver_prompt,
+                maneuver_response=maneuver_raw,
+                decision_prompt=decision_prompt,
+                decision_response=decision_raw,
+            )
         
         # Log extraction
         self.extraction_log.append({
@@ -654,13 +694,17 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
     
     def _extract_maneuvers(
         self, 
-        images: List[TimestampedImage]
-    ) -> Tuple[List[ManeuverSegment], str]:
+        images: List[TimestampedImage],
+        ego_state_summary: str
+    ) -> Tuple[List[ManeuverSegment], str, str]:
         """Extract maneuvers using VLM."""
         
         # Build timestamp string for prompt
         timestamps_str = ", ".join([f"{img.timestamp:.2f}s" for img in images])
-        prompt = self.MANEUVER_PROMPT_TEMPLATE.format(timestamps=timestamps_str)
+        prompt = self.MANEUVER_PROMPT_TEMPLATE.format(
+            timestamps=timestamps_str,
+            ego_state=ego_state_summary
+        )
         
         # Get base64 images (limit if too many)
         image_data = [img.base64_data for img in images[:self.max_images_per_call]]
@@ -678,7 +722,7 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
             
             if "error" in parsed:
                 logger.warning(f"Maneuver parse error: {parsed['error']}")
-                return [], response
+                return [], response, prompt
             
             maneuvers = []
             for m in parsed.get("maneuvers", []):
@@ -686,11 +730,11 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
                 if maneuver:
                     maneuvers.append(maneuver)
             
-            return maneuvers, response
+            return maneuvers, response, prompt
             
         except Exception as e:
             logger.error(f"Maneuver extraction failed: {e}")
-            return [], str(e)
+            return [], str(e), prompt
     
     def _parse_maneuver_dict(self, m: Dict) -> Optional[ManeuverSegment]:
         """Parse a maneuver dict from VLM response."""
@@ -709,6 +753,7 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
                 end_timestamp=end_time,
                 aggressiveness=aggressiveness,
                 description=m.get("description", ""),
+                reasoning=m.get("reasoning", ""),
                 confidence=float(m.get("confidence", 1.0))
             )
             
@@ -722,12 +767,16 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
     
     def _extract_decisions(
         self, 
-        images: List[TimestampedImage]
-    ) -> Tuple[List[CriticalDecisionPoint], str]:
+        images: List[TimestampedImage],
+        ego_state_summary: str
+    ) -> Tuple[List[CriticalDecisionPoint], str, str]:
         """Extract decisions using VLM."""
         
         timestamps_str = ", ".join([f"{img.timestamp:.2f}s" for img in images])
-        prompt = self.DECISION_PROMPT_TEMPLATE.format(timestamps=timestamps_str)
+        prompt = self.DECISION_PROMPT_TEMPLATE.format(
+            timestamps=timestamps_str,
+            ego_state=ego_state_summary
+        )
         
         image_data = [img.base64_data for img in images[:self.max_images_per_call]]
         
@@ -741,7 +790,7 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
             
             if "error" in parsed:
                 logger.warning(f"Decision parse error: {parsed['error']}")
-                return [], response
+                return [], response, prompt
             
             decisions = []
             for d in parsed.get("decisions", []):
@@ -749,11 +798,49 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
                 if decision:
                     decisions.append(decision)
             
-            return decisions, response
+            return decisions, response, prompt
             
         except Exception as e:
             logger.error(f"Decision extraction failed: {e}")
-            return [], str(e)
+            return [], str(e), prompt
+
+    def _save_debug_log(
+        self,
+        output_dir: str,
+        scenario_id: str,
+        images: List[TimestampedImage],
+        ego_state_summary: Optional[str],
+        maneuver_prompt: str,
+        maneuver_response: str,
+        decision_prompt: str,
+        decision_response: str,
+    ) -> None:
+        """Save VLM prompt/response logs to disk."""
+        from pathlib import Path
+
+        try:
+            debug_dir = Path(output_dir) / "vlm_debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = debug_dir / f"{scenario_id}_vlm_{timestamp}.json"
+
+            debug_data = {
+                "scenario_id": scenario_id,
+                "timestamps": [img.timestamp for img in images],
+                "image_paths": [img.path for img in images],
+                "ego_state": ego_state_summary,
+                "maneuver_prompt": maneuver_prompt,
+                "maneuver_response": maneuver_response,
+                "decision_prompt": decision_prompt,
+                "decision_response": decision_response,
+            }
+
+            with open(log_path, "w") as f:
+                json.dump(debug_data, f, indent=2)
+
+            logger.debug(f"Saved VLM debug log to {log_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save VLM debug log: {e}")
     
     def _parse_decision_dict(self, d: Dict) -> Optional[CriticalDecisionPoint]:
         """Parse a decision dict from VLM response."""
@@ -774,12 +861,69 @@ Only include decisions that are genuinely safety-relevant. Not every action is a
                 ground_truth_choice=choice,
                 alternatives=alternatives,
                 description=d.get("description", ""),
+                reasoning=d.get("reasoning", ""),
                 confidence=float(d.get("confidence", 1.0))
             )
             
         except Exception as e:
             logger.warning(f"Failed to parse decision {d}: {e}")
             return None
+
+    def _build_ego_state_summary(
+        self,
+        images: List[TimestampedImage],
+        trajectory: Optional[np.ndarray],
+        dt: float = 0.1,
+    ) -> str:
+        """Build a per-frame ego state summary aligned to image timestamps."""
+        if trajectory is None or len(trajectory) == 0:
+            return "Ego state unavailable."
+
+        traj = np.asarray(trajectory)
+        if traj.shape[1] < 4:
+            return "Ego state unavailable."
+
+        headings = np.unwrap(traj[:, 2].astype(float))
+        speeds = traj[:, 3].astype(float)
+        n = len(traj)
+
+        def idx_from_time(t: float) -> int:
+            return max(0, min(n - 1, int(round(t / dt))))
+
+        lines = []
+        for img in images:
+            idx = idx_from_time(img.timestamp)
+            pos = (float(traj[idx, 0]), float(traj[idx, 1]))
+            heading = float(headings[idx])
+            speed = float(speeds[idx])
+
+            # Acceleration (finite difference on speed)
+            if 0 < idx < n - 1:
+                acc = (speeds[idx + 1] - speeds[idx - 1]) / (2 * dt)
+            elif idx == 0 and n > 1:
+                acc = (speeds[1] - speeds[0]) / dt
+            elif n > 1:
+                acc = (speeds[-1] - speeds[-2]) / dt
+            else:
+                acc = 0.0
+
+            # Yaw rate (finite difference on heading)
+            if 0 < idx < n - 1:
+                yaw_rate = (headings[idx + 1] - headings[idx - 1]) / (2 * dt)
+            elif idx == 0 and n > 1:
+                yaw_rate = (headings[1] - headings[0]) / dt
+            elif n > 1:
+                yaw_rate = (headings[-1] - headings[-2]) / dt
+            else:
+                yaw_rate = 0.0
+
+            lines.append(
+                f"- t={img.timestamp:.2f}s: pos=({pos[0]:.2f}, {pos[1]:.2f}), "
+                f"heading={heading:.3f} rad, speed={speed:.2f} m/s, "
+                f"accel={acc:.2f} m/s^2, yaw_rate={yaw_rate:.3f} rad/s"
+            )
+
+        return "\n".join(lines)
     
     # =========================================================================
     # TRAJECTORY GROUNDING

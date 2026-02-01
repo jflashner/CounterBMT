@@ -39,8 +39,14 @@ Intervention Format:
     maneuver:stop           - Bias toward stopping
     maneuver:accelerate     - Bias toward acceleration
     maneuver:decelerate     - Bias toward deceleration
-    maneuver:turn_left      - Bias toward left turn (sharper than lane change)
-    maneuver:turn_right     - Bias toward right turn (sharper than lane change)
+    turn:left               - Left turn at intersection (moderate style)
+    turn:right              - Right turn at intersection (moderate style)
+    turn:left:moderate      - Moderate left turn (yaw 0.30-0.60 rad/s)
+    turn:right:moderate     - Moderate right turn
+    turn:left:sharp         - Sharp left turn/U-turn (yaw 0.50-0.90 rad/s)
+    turn:right:sharp        - Sharp right turn
+    turn:left:with_brake    - Left turn with braking (realistic approach)
+    turn:right:with_brake   - Right turn with braking
     yaw:left:STRENGTH       - Bias yaw rate left (0.0-1.0)
     yaw:right:STRENGTH      - Bias yaw rate right (0.0-1.0)
 
@@ -53,6 +59,15 @@ Lane Change Styles:
     - aggressive: yaw 0.20-0.40 rad/s (quick lane change, 2-3 seconds)
     
     Example: "lane:right:gentle@2-10" for a smooth right lane change from step 2-10
+
+Turn Styles:
+    Turn interventions use higher yaw rates for intersection-style turns:
+    
+    - moderate:   yaw 0.30-0.60 rad/s (typical intersection turn)
+    - sharp:      yaw 0.50-0.90 rad/s (tight turn, U-turn) with braking
+    - with_brake: yaw 0.25-0.60 rad/s + deceleration (realistic approach)
+    
+    Example: "turn:right:moderate@5-12" for a right turn at intersection
 
 Time-Based Interventions:
     Append @START or @START-END to apply intervention during specific PREDICTION timesteps.
@@ -250,7 +265,14 @@ def parse_intervention_string(intervention_str: str) -> Dict[str, Any]:
     
     int_type = parts[0]
     action = parts[1]
-    value = float(parts[2]) if len(parts) > 2 else None
+    # Try to parse third part as float, but it might be a style string
+    value = None
+    if len(parts) > 2:
+        try:
+            value = float(parts[2])
+        except ValueError:
+            # Not a number - could be a style like 'gentle', 'moderate', 'sharp'
+            value = None
     
     intervention = {
         'type': int_type,
@@ -297,6 +319,24 @@ def parse_intervention_string(intervention_str: str) -> Dict[str, Any]:
             intervention['style'] = 'normal'  # default style
         style_desc = f" ({intervention.get('style', 'normal')})" if intervention.get('style') != 'normal' else ""
         intervention['description'] = f"Lane change: {action}{style_desc}{time_desc}"
+    
+    elif int_type == 'turn':
+        intervention['direction'] = action
+        intervention['strength'] = value or 0.8
+        # Support style specification: turn:right:moderate or turn:right:sharp
+        if len(parts) > 2:
+            style_or_value = parts[2]
+            if style_or_value in ['moderate', 'sharp', 'with_brake']:
+                intervention['style'] = style_or_value
+            else:
+                try:
+                    intervention['strength'] = float(style_or_value)
+                except ValueError:
+                    intervention['style'] = style_or_value
+        else:
+            intervention['style'] = 'moderate'  # default turn style
+        style_desc = f" ({intervention.get('style', 'moderate')})" if intervention.get('style') != 'moderate' else ""
+        intervention['description'] = f"Turn: {action}{style_desc}{time_desc}"
     
     elif int_type == 'maneuver':
         intervention['maneuver'] = action
@@ -509,6 +549,23 @@ def intervention_to_timed_bias(
         elif direction == 'stay':
             add_bias(get_tokens('straight'), BASE_BIAS * strength, intervention['description'])
     
+    elif int_type == 'turn':
+        direction = intervention['direction']
+        strength = intervention.get('strength', 0.8)
+        style = intervention.get('style', 'moderate')  # moderate, sharp, with_brake
+        
+        # Use the new turn-specific tokens with constrained yaw ranges
+        turn_key = f'turn_{direction}_{style}'
+        tokens = get_tokens(turn_key)
+        
+        # Fallback to generic turn_left/turn_right if specific style not found
+        if not tokens:
+            tokens = get_tokens(f'turn_{direction}')
+            logger.warning(f"Turn style '{style}' not found, using generic turn_{direction}")
+        
+        if tokens:
+            add_bias(tokens, BASE_BIAS * strength * 1.5, intervention['description'])
+    
     elif int_type == 'maneuver':
         maneuver = intervention['maneuver']
         strength = intervention.get('strength', 0.8)
@@ -518,9 +575,17 @@ def intervention_to_timed_bias(
         elif maneuver in ['accelerate', 'speed_up']:
             add_bias(get_tokens('accelerate'), BASE_BIAS * strength, intervention['description'])
         elif maneuver in ['turn_left', 'left_turn', 'left']:
-            add_bias(get_tokens('turn_left'), BASE_BIAS * strength * 1.5, intervention['description'])
+            # Use turn_left_moderate for more reliable turns
+            tokens = get_tokens('turn_left_moderate')
+            if not tokens:
+                tokens = get_tokens('turn_left')
+            add_bias(tokens, BASE_BIAS * strength * 1.5, intervention['description'])
         elif maneuver in ['turn_right', 'right_turn', 'right']:
-            add_bias(get_tokens('turn_right'), BASE_BIAS * strength * 1.5, intervention['description'])
+            # Use turn_right_moderate for more reliable turns
+            tokens = get_tokens('turn_right_moderate')
+            if not tokens:
+                tokens = get_tokens('turn_right')
+            add_bias(tokens, BASE_BIAS * strength * 1.5, intervention['description'])
         elif maneuver in ['straight', 'continue']:
             add_bias(get_tokens('straight'), BASE_BIAS * strength, intervention['description'])
     

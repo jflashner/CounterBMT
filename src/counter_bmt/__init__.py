@@ -68,12 +68,15 @@ from .dag_constructor import (
     # Enums
     NodeType,
     EdgeType,
+    InterventionDiversity,
     
     # Data classes
     DAGNode,
     DAGEdge,
     Intervention,
     CounterfactualResult,
+    InterventionStep,
+    InterventionSequence,
     
     # DAG class
     ScenarioDAG,

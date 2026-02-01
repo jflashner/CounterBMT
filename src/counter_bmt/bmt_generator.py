@@ -136,13 +136,20 @@ class MotionTokenSpace:
             'turn_right': [],     # Turning right (any)
             'swerve_left': [],    # Sharp left (emergency)
             'swerve_right': [],   # Sharp right (emergency)
-            # NEW: Lane change specific tokens with proper yaw ranges
+            # Lane change specific tokens with proper yaw ranges
             'lane_change_left_gentle': [],    # Gentle left lane change (0.05-0.15 rad/s)
             'lane_change_left': [],           # Normal left lane change (0.08-0.25 rad/s)
             'lane_change_left_aggressive': [],# Aggressive left lane change (0.20-0.40 rad/s)
             'lane_change_right_gentle': [],   # Gentle right lane change
             'lane_change_right': [],          # Normal right lane change
             'lane_change_right_aggressive': [],# Aggressive right lane change
+            # Turn tokens (intersection-style, sharper than lane changes)
+            'turn_left_moderate': [],         # Normal intersection turn (yaw 0.30-0.60 rad/s)
+            'turn_right_moderate': [],        
+            'turn_left_sharp': [],            # Sharp turn, U-turn (yaw 0.50-0.90 rad/s)
+            'turn_right_sharp': [],           
+            'turn_left_with_brake': [],       # Turn with deceleration (realistic approach)
+            'turn_right_with_brake': [],
         }
         
         for token_id in range(self.n_tokens):
@@ -172,7 +179,7 @@ class MotionTokenSpace:
             if yaw < -0.5:
                 behaviors['swerve_right'].append(token_id)
             
-            # NEW: Lane change specific (constrained yaw + moderate acceleration)
+            # Lane change specific (constrained yaw + moderate acceleration)
             # These are based on vehicle dynamics for comfortable lane changes
             is_moderate_acc = -2.0 < acc < 2.0
             
@@ -193,6 +200,37 @@ class MotionTokenSpace:
                 behaviors['lane_change_left_aggressive'].append(token_id)
             if is_moderate_acc and -0.40 < yaw < -0.20:
                 behaviors['lane_change_right_aggressive'].append(token_id)
+            
+            # ===== TURN TOKENS (intersection-style) =====
+            # Turns require higher yaw rates than lane changes
+            # and often involve deceleration for safety
+            
+            # Moderate turn: yaw 0.30-0.60 rad/s (typical intersection turn)
+            # Allow slight decel to maintain speed through turn (-3 to +1.5 m/s²)
+            is_turn_acc = -3.0 < acc < 1.5
+            
+            if is_turn_acc and 0.30 < yaw < 0.60:
+                behaviors['turn_left_moderate'].append(token_id)
+            if is_turn_acc and -0.60 < yaw < -0.30:
+                behaviors['turn_right_moderate'].append(token_id)
+            
+            # Sharp turn: yaw 0.50-0.90 rad/s (tight turns, U-turns)
+            # Usually with braking for control
+            is_sharp_turn_acc = acc < 0  # Require some braking for sharp turns
+            
+            if is_sharp_turn_acc and 0.50 < yaw < 0.90:
+                behaviors['turn_left_sharp'].append(token_id)
+            if is_sharp_turn_acc and -0.90 < yaw < -0.50:
+                behaviors['turn_right_sharp'].append(token_id)
+            
+            # Turn with braking: moderate yaw + deceleration (realistic turn approach)
+            # This captures the "slow down before turn" behavior
+            is_braking = acc < -1.5
+            
+            if is_braking and 0.25 < yaw < 0.60:
+                behaviors['turn_left_with_brake'].append(token_id)
+            if is_braking and -0.60 < yaw < -0.25:
+                behaviors['turn_right_with_brake'].append(token_id)
         
         return behaviors
     
@@ -222,6 +260,23 @@ class MotionTokenSpace:
                 else:
                     return self._behavior_tokens['lane_change_right']
         
+        # Turn-specific matching (intersection turns)
+        if 'turn' in behavior and ('moderate' in behavior or 'sharp' in behavior or 'brake' in behavior):
+            if 'left' in behavior:
+                if 'moderate' in behavior:
+                    return self._behavior_tokens['turn_left_moderate']
+                elif 'sharp' in behavior:
+                    return self._behavior_tokens['turn_left_sharp']
+                elif 'brake' in behavior or 'with_brake' in behavior:
+                    return self._behavior_tokens['turn_left_with_brake']
+            elif 'right' in behavior:
+                if 'moderate' in behavior:
+                    return self._behavior_tokens['turn_right_moderate']
+                elif 'sharp' in behavior:
+                    return self._behavior_tokens['turn_right_sharp']
+                elif 'brake' in behavior or 'with_brake' in behavior:
+                    return self._behavior_tokens['turn_right_with_brake']
+        
         if 'stop' in behavior or 'brake' in behavior:
             return self._behavior_tokens['stop']
         if 'decel' in behavior or 'slow' in behavior:
@@ -233,11 +288,11 @@ class MotionTokenSpace:
         if 'straight' in behavior or 'forward' in behavior:
             return self._behavior_tokens['straight']
         if 'left' in behavior:
-            if 'swerve' in behavior or 'sharp' in behavior:
+            if 'swerve' in behavior:
                 return self._behavior_tokens['swerve_left']
             return self._behavior_tokens['turn_left']
         if 'right' in behavior:
-            if 'swerve' in behavior or 'sharp' in behavior:
+            if 'swerve' in behavior:
                 return self._behavior_tokens['swerve_right']
             return self._behavior_tokens['turn_right']
         
@@ -275,6 +330,34 @@ class MotionTokenSpace:
             return self._behavior_tokens[key]
         
         logger.warning(f"Unknown lane change: {key}")
+        return []
+    
+    def get_turn_tokens(
+        self,
+        direction: str = 'right',
+        style: str = 'moderate'
+    ) -> List[int]:
+        """
+        Get tokens appropriate for intersection turn maneuvers.
+        
+        Uses vehicle dynamics-based yaw rate ranges (higher than lane changes):
+        - moderate: yaw 0.30-0.60 rad/s (typical intersection turn)
+        - sharp: yaw 0.50-0.90 rad/s (tight turn, U-turn)
+        - with_brake: yaw 0.25-0.60 rad/s + deceleration (realistic approach)
+        
+        Args:
+            direction: 'left' or 'right'
+            style: 'moderate', 'sharp', or 'with_brake'
+            
+        Returns:
+            List of token IDs for the specified turn maneuver
+        """
+        key = f"turn_{direction}_{style}"
+        
+        if key in self._behavior_tokens:
+            return self._behavior_tokens[key]
+        
+        logger.warning(f"Unknown turn: {key}")
         return []
     
     def describe_token_set(self, behavior: str) -> str:
@@ -325,18 +408,63 @@ class InterventionCompiler:
     
     Translates DAG interventions (e.g., "change maneuver to stop") 
     into specific token biases for BMT sampling.
+    
+    Uses granular token sets for reliable maneuver generation:
+    - Lane changes: lane_change_{left,right}_{gentle,normal,aggressive}
+    - Turns: turn_{left,right}_{moderate,sharp,with_brake}
     """
     
     # Default bias strengths
-    DEFAULT_ENCOURAGE_BIAS = 5.0
-    DEFAULT_DISCOURAGE_BIAS = -5.0
+    DEFAULT_ENCOURAGE_BIAS = 8.0  # Increased for more reliable intervention
+    DEFAULT_DISCOURAGE_BIAS = -3.0
     
     # BMT timestep = 0.5s, prediction horizon = 19 steps (9.5s)
     DT = 0.5
     MAX_TIMESTEPS = 19
     
-    def __init__(self, token_space: Optional[MotionTokenSpace] = None):
+    # Mapping from VLM maneuver types to token set keys
+    # Format: maneuver_type -> (token_key_prefix, uses_style)
+    MANEUVER_TOKEN_MAPPING = {
+        # Lane changes use style (gentle/normal/aggressive)
+        'lane_change_left': ('lane_change_left', True),
+        'lane_change_right': ('lane_change_right', True),
+        # Turns use style (moderate/sharp/with_brake)
+        'left_turn': ('turn_left', True),
+        'right_turn': ('turn_right', True),
+        # Simple maneuvers without style variants
+        'straight': ('straight', False),
+        'stop': ('stop', False),
+        'decelerate': ('decelerate', False),
+        'accelerate': ('accelerate', False),
+    }
+    
+    # Mapping from VLM aggressiveness to token style
+    AGGRESSIVENESS_TO_LANE_STYLE = {
+        'passive': 'gentle',
+        'normal': 'normal', 
+        'aggressive': 'aggressive',
+    }
+    
+    AGGRESSIVENESS_TO_TURN_STYLE = {
+        'passive': 'with_brake',  # Slow, careful turns
+        'normal': 'moderate',
+        'aggressive': 'sharp',
+    }
+    
+    def __init__(
+        self,
+        token_space: Optional[MotionTokenSpace] = None,
+        llm_planner: Optional[Any] = None
+    ):
+        """
+        Initialize the intervention compiler.
+        
+        Args:
+            token_space: MotionTokenSpace instance for token lookup
+            llm_planner: Optional LLMInterventionPlanner for smart phase planning
+        """
         self.token_space = token_space or MotionTokenSpace()
+        self.llm_planner = llm_planner
         
         # Intervention type handlers
         self._handlers = {
@@ -350,7 +478,13 @@ class InterventionCompiler:
         self,
         intervention: Dict,
         encourage_bias: float = None,
-        discourage_bias: float = None
+        discourage_bias: float = None,
+        ego_state: Optional[Dict] = None,
+        scenario_context: Optional[Dict] = None,
+        use_llm_planning: bool = True,
+        trajectory_context: Optional[Any] = None,
+        debug_output_dir: Optional[str] = None,
+        intervention_idx: int = 0
     ) -> List[TokenBias]:
         """
         Compile a DAG intervention dict to token biases.
@@ -361,8 +495,16 @@ class InterventionCompiler:
                 - value: new value to encourage
                 - original_value: value to discourage (optional)
                 - description: human description (optional)
-            encourage_bias: Bias for encouraging tokens (default: 5.0)
-            discourage_bias: Bias for discouraging tokens (default: -5.0)
+                - aggressiveness: optional style hint ("passive", "normal", "aggressive")
+                - timestamp: optional timestamp for time-based bias
+            encourage_bias: Bias for encouraging tokens (default: 8.0)
+            discourage_bias: Bias for discouraging tokens (default: -3.0)
+            ego_state: Optional dict with ego vehicle state (speed, heading, position)
+            scenario_context: Optional dict with scenario context (road_type, traffic, etc.)
+            use_llm_planning: Whether to use LLM for smart phase planning (default: True)
+            trajectory_context: Optional TrajectoryContext with full trajectory data and timing
+            debug_output_dir: Optional path to save LLM debug logs
+            intervention_idx: Index of this intervention for logging
             
         Returns:
             List of TokenBias objects
@@ -373,9 +515,45 @@ class InterventionCompiler:
         variable = intervention.get('variable', '')
         new_value = intervention.get('value', '')
         original_value = intervention.get('original_value')
+        aggressiveness = intervention.get('aggressiveness', 'normal')
+        timestamp = intervention.get('timestamp')
         
         # Determine intervention type from variable name
         int_type = self._infer_intervention_type(variable)
+        
+        # Try LLM-based planning if available and enabled
+        if use_llm_planning and self.llm_planner is not None:
+            try:
+                plan = self.llm_planner.plan_intervention(
+                    intervention=intervention,
+                    ego_state=ego_state,
+                    scenario_context=scenario_context,
+                    trajectory_context=trajectory_context,
+                    debug_output_dir=debug_output_dir,
+                    intervention_idx=intervention_idx
+                )
+                
+                if plan and plan.phases:
+                    biases = self._compile_from_plan(plan, encourage, discourage)
+                    if biases:
+                        logger.info(f"LLM planning generated {len(biases)} bias phases for '{variable}'")
+                        return biases
+                        
+            except Exception as e:
+                logger.warning(f"LLM planning failed for '{variable}': {e}, using fallback")
+        
+        # Fallback to hardcoded handlers
+        # Special handling for maneuver interventions to pass extra params
+        if int_type == 'maneuver':
+            return self._compile_maneuver_intervention(
+                variable=variable,
+                new_value=new_value,
+                original_value=original_value,
+                encourage_bias=encourage,
+                discourage_bias=discourage,
+                aggressiveness=aggressiveness,
+                timestamp=timestamp
+            )
         
         handler = self._handlers.get(int_type, self._compile_generic_intervention)
         
@@ -386,6 +564,101 @@ class InterventionCompiler:
             encourage_bias=encourage,
             discourage_bias=discourage
         )
+    
+    def _compile_from_plan(
+        self,
+        plan: Any,  # InterventionPlan from llm_intervention_planner
+        encourage_bias: float,
+        discourage_bias: float
+    ) -> List[TokenBias]:
+        """
+        Convert an LLM-generated intervention plan to TokenBias objects.
+        
+        Each phase in the plan becomes a TokenBias with tokens matching
+        the phase's acceleration and yaw constraints.
+        
+        For lateral movement phases (lane changes, turns), we expand the 
+        acceleration constraint to ensure enough tokens are biased.
+        """
+        biases = []
+        
+        # Minimum number of tokens per phase for effective biasing
+        MIN_TOKENS_FOR_EFFECTIVE_BIAS = 8
+        
+        # Default acceleration ranges for different phase types
+        LANE_CHANGE_ACC_RANGE = (-2.0, 2.0)  # For lane changes, acc is flexible
+        TURN_ACC_RANGE = (-4.0, 2.0)  # Turns often involve braking
+        
+        for phase in plan.phases:
+            acc_min, acc_max = phase.acc_range
+            yaw_min, yaw_max = phase.yaw_range
+            
+            # Fix inverted ranges (LLM sometimes returns min > max for negative values)
+            if acc_min > acc_max:
+                acc_min, acc_max = acc_max, acc_min
+                logger.debug(f"Phase '{phase.phase_name}': Swapped inverted acc range")
+            if yaw_min > yaw_max:
+                yaw_min, yaw_max = yaw_max, yaw_min
+                logger.debug(f"Phase '{phase.phase_name}': Swapped inverted yaw range")
+            
+            # Detect if this is a lateral movement phase (significant yaw)
+            # Lane change yaw: 0.08-0.40 rad/s, Turn yaw: 0.25-0.90 rad/s
+            is_lateral_phase = abs(yaw_min) > 0.05 or abs(yaw_max) > 0.05
+            is_turn_phase = abs(yaw_min) > 0.25 or abs(yaw_max) > 0.25
+            
+            # Get tokens with original constraints
+            tokens = self.token_space.get_tokens_by_constraint(
+                acc_min=acc_min,
+                acc_max=acc_max,
+                yaw_min=yaw_min,
+                yaw_max=yaw_max
+            )
+            
+            # If too few tokens for lateral phases, expand acceleration range
+            # For lane changes and turns, the yaw is what matters, not exact acceleration
+            if is_lateral_phase and len(tokens) < MIN_TOKENS_FOR_EFFECTIVE_BIAS:
+                if is_turn_phase:
+                    expanded_acc_range = TURN_ACC_RANGE
+                else:
+                    expanded_acc_range = LANE_CHANGE_ACC_RANGE
+                
+                logger.info(f"Phase '{phase.phase_name}': Expanding acc range from "
+                           f"[{acc_min:.2f}, {acc_max:.2f}] to {expanded_acc_range} "
+                           f"for effective lateral biasing")
+                
+                tokens = self.token_space.get_tokens_by_constraint(
+                    acc_min=expanded_acc_range[0],
+                    acc_max=expanded_acc_range[1],
+                    yaw_min=yaw_min,
+                    yaw_max=yaw_max
+                )
+                
+                # Update for logging
+                acc_min, acc_max = expanded_acc_range
+            
+            if not tokens:
+                logger.warning(f"No tokens for phase '{phase.phase_name}' with "
+                             f"acc=[{acc_min:.2f}, {acc_max:.2f}], "
+                             f"yaw=[{yaw_min:.3f}, {yaw_max:.3f}]")
+                continue
+            
+            # Apply bias strength multiplier
+            phase_bias = encourage_bias * phase.bias_strength_multiplier
+            
+            biases.append(TokenBias(
+                token_ids=tokens,
+                bias_value=phase_bias,
+                timestep_range=(phase.start_timestep, phase.end_timestep),
+                description=f"{phase.phase_name}: {phase.reasoning}"
+            ))
+            
+            logger.debug(f"Phase '{phase.phase_name}': {len(tokens)} tokens, "
+                        f"acc=[{acc_min:.2f}, {acc_max:.2f}], "
+                        f"yaw=[{yaw_min:.3f}, {yaw_max:.3f}], "
+                        f"steps {phase.start_timestep}-{phase.end_timestep}, "
+                        f"bias={phase_bias:.1f}")
+        
+        return biases
     
     def _infer_intervention_type(self, variable: str) -> str:
         """Infer intervention type from variable name."""
@@ -402,40 +675,111 @@ class InterventionCompiler:
         
         return 'generic'
     
+    def map_maneuver_to_tokens(
+        self,
+        maneuver_type: str,
+        aggressiveness: str = 'normal'
+    ) -> List[int]:
+        """
+        Map a VLM-extracted maneuver to the appropriate token set.
+        
+        Uses granular token sets based on maneuver type and aggressiveness:
+        - Lane changes: gentle/normal/aggressive based on aggressiveness
+        - Turns: with_brake/moderate/sharp based on aggressiveness
+        
+        Args:
+            maneuver_type: Maneuver type from VLM (e.g., "lane_change_left", "left_turn")
+            aggressiveness: Aggressiveness from VLM ("passive", "normal", "aggressive")
+            
+        Returns:
+            List of token IDs for the specified maneuver
+        """
+        # Normalize maneuver type
+        maneuver_type = maneuver_type.lower().replace(' ', '_').replace('-', '_')
+        aggressiveness = aggressiveness.lower() if aggressiveness else 'normal'
+        
+        # Look up mapping
+        if maneuver_type in self.MANEUVER_TOKEN_MAPPING:
+            prefix, uses_style = self.MANEUVER_TOKEN_MAPPING[maneuver_type]
+            
+            if uses_style:
+                # Determine style based on maneuver type and aggressiveness
+                if 'lane_change' in maneuver_type:
+                    style = self.AGGRESSIVENESS_TO_LANE_STYLE.get(aggressiveness, 'normal')
+                    # Use get_lane_change_tokens for lane changes
+                    direction = 'left' if 'left' in maneuver_type else 'right'
+                    return self.token_space.get_lane_change_tokens(direction, style)
+                elif 'turn' in prefix:
+                    style = self.AGGRESSIVENESS_TO_TURN_STYLE.get(aggressiveness, 'moderate')
+                    # Use get_turn_tokens for turns
+                    direction = 'left' if 'left' in maneuver_type else 'right'
+                    return self.token_space.get_turn_tokens(direction, style)
+            else:
+                # Simple behavior without style
+                return self.token_space.get_tokens_by_behavior(prefix)
+        
+        # Fallback to generic behavior lookup
+        logger.debug(f"No mapping for maneuver '{maneuver_type}', using generic lookup")
+        return self.token_space.get_tokens_by_behavior(maneuver_type)
+    
     def _compile_maneuver_intervention(
         self,
         variable: str,
         new_value: str,
         original_value: Optional[str],
         encourage_bias: float,
-        discourage_bias: float
+        discourage_bias: float,
+        aggressiveness: str = 'normal',
+        timestamp: Optional[float] = None
     ) -> List[TokenBias]:
-        """Compile maneuver change intervention."""
+        """
+        Compile maneuver change intervention using granular token sets.
+        
+        Args:
+            variable: Node ID (e.g., "maneuver_0")
+            new_value: New maneuver value (e.g., "lane_change_left")
+            original_value: Original maneuver to discourage
+            encourage_bias: Bias strength for encouraging tokens
+            discourage_bias: Bias strength for discouraging tokens
+            aggressiveness: Maneuver aggressiveness ("passive", "normal", "aggressive")
+            timestamp: Optional timestamp for time-based bias range
+        """
         biases = []
         
-        # Determine timestep range based on maneuver type
-        # Earlier maneuvers (maneuver_0) affect early timesteps
-        try:
-            maneuver_idx = int(variable.split('_')[-1])
-            # Rough heuristic: each maneuver ~2 seconds
-            start_step = min(maneuver_idx * 4, self.MAX_TIMESTEPS - 4)
+        # Determine timestep range
+        if timestamp is not None:
+            # Convert timestamp to BMT prediction steps (2 steps/second)
+            start_step = max(0, int(timestamp * 2) - 2)
             end_step = min(start_step + 8, self.MAX_TIMESTEPS)
-        except (ValueError, IndexError):
-            start_step, end_step = 0, 8
+        else:
+            # Default: use maneuver index heuristic
+            try:
+                maneuver_idx = int(variable.split('_')[-1])
+                # Each maneuver ~2 seconds = 4 steps
+                start_step = min(maneuver_idx * 4, self.MAX_TIMESTEPS - 4)
+                end_step = min(start_step + 8, self.MAX_TIMESTEPS)
+            except (ValueError, IndexError):
+                start_step, end_step = 0, 8
         
-        # Encourage new behavior
-        encourage_tokens = self.token_space.get_tokens_by_behavior(new_value)
+        # Get tokens using granular mapping
+        encourage_tokens = self.map_maneuver_to_tokens(new_value, aggressiveness)
+        
         if encourage_tokens:
+            token_info = f"{len(encourage_tokens)} tokens"
             biases.append(TokenBias(
                 token_ids=encourage_tokens,
                 bias_value=encourage_bias,
                 timestep_range=(start_step, end_step),
-                description=f"Encourage {new_value}"
+                description=f"Encourage {new_value} ({aggressiveness}) [{token_info}]"
             ))
+            logger.info(f"Mapped '{new_value}' ({aggressiveness}) -> {len(encourage_tokens)} tokens, "
+                       f"steps {start_step}-{end_step}")
+        else:
+            logger.warning(f"No tokens found for maneuver: {new_value}")
         
-        # Discourage original behavior
-        if original_value:
-            discourage_tokens = self.token_space.get_tokens_by_behavior(original_value)
+        # Discourage original behavior if different
+        if original_value and original_value != new_value:
+            discourage_tokens = self.map_maneuver_to_tokens(original_value, aggressiveness)
             # Remove overlap with encourage tokens
             discourage_tokens = [t for t in discourage_tokens if t not in encourage_tokens]
             if discourage_tokens:
@@ -515,7 +859,19 @@ class InterventionCompiler:
         encourage_bias: float,
         discourage_bias: float
     ) -> List[TokenBias]:
-        """Compile speed change intervention."""
+        """
+        Compile speed change intervention.
+        
+        Uses realistic acceleration ranges for vehicles:
+        - Gentle acceleration: 0.5-2.0 m/s² (comfortable, normal driving)
+        - Moderate acceleration: 2.0-4.0 m/s² (assertive)
+        - Hard acceleration: 4.0-6.0 m/s² (aggressive, near performance limit)
+        - Gentle deceleration: -0.5 to -2.0 m/s² (comfortable coasting/braking)
+        - Moderate deceleration: -2.0 to -4.0 m/s² (normal braking)
+        - Hard braking: -4.0 to -8.0 m/s² (emergency braking, ~0.5-0.8g)
+        
+        Also adds bias for straight driving (low yaw) to prevent erratic steering.
+        """
         biases = []
         
         try:
@@ -534,30 +890,99 @@ class InterventionCompiler:
                     )
             return biases
         
-        # Determine required acceleration
+        # Calculate required speed change
+        speed_diff = new_speed - (orig_speed or new_speed)
+        
+        # Determine realistic acceleration range based on speed ratio
         if orig_speed is not None and orig_speed > 0:
             speed_ratio = new_speed / orig_speed
-            if speed_ratio < 0.5:
-                behavior = 'hard_brake'
-            elif speed_ratio < 0.8:
+            
+            if speed_ratio < 0.3:
+                # Emergency stop: hard braking -6 to -10 m/s²
+                acc_min, acc_max = -10.0, -6.0
+                behavior_desc = "emergency_brake"
+            elif speed_ratio < 0.6:
+                # Strong deceleration: -4 to -6 m/s²
+                acc_min, acc_max = -6.0, -4.0
+                behavior_desc = "hard_brake"
+            elif speed_ratio < 0.85:
+                # Moderate deceleration: -2 to -4 m/s²
+                acc_min, acc_max = -4.0, -2.0
+                behavior_desc = "decelerate"
+            elif speed_ratio < 1.15:
+                # Maintain speed: -1.5 to +1.5 m/s²
+                acc_min, acc_max = -1.5, 1.5
+                behavior_desc = "maintain"
+            elif speed_ratio < 1.3:
+                # Gentle acceleration: 1 to 3 m/s²
+                acc_min, acc_max = 1.0, 3.0
+                behavior_desc = "gentle_accelerate"
+            elif speed_ratio < 1.5:
+                # Moderate acceleration: 2 to 4 m/s²
+                acc_min, acc_max = 2.0, 4.0
+                behavior_desc = "accelerate"
+            else:
+                # Strong acceleration: 3 to 6 m/s² (realistic max for most vehicles)
+                acc_min, acc_max = 3.0, 6.0
+                behavior_desc = "hard_accelerate"
+        else:
+            # No original speed reference
+            if new_speed < 3:
+                acc_min, acc_max = -6.0, -2.0
+                behavior_desc = "stop"
+            elif new_speed < 10:
+                acc_min, acc_max = -1.5, 1.5
+                behavior_desc = "maintain_slow"
+            else:
+                acc_min, acc_max = -1.5, 1.5
+                behavior_desc = "maintain"
+        
+        # Get tokens with realistic acceleration AND low yaw (straight driving)
+        # This prevents erratic steering during speed changes
+        yaw_limit = 0.15  # Low yaw for straight driving
+        
+        speed_tokens = self.token_space.get_tokens_by_constraint(
+            acc_min=acc_min,
+            acc_max=acc_max,
+            yaw_min=-yaw_limit,
+            yaw_max=yaw_limit
+        )
+        
+        if speed_tokens:
+            biases.append(TokenBias(
+                token_ids=speed_tokens,
+                bias_value=encourage_bias,
+                timestep_range=(0, 12),  # Apply for first 6 seconds
+                description=f"Speed: {orig_speed:.1f} -> {new_speed:.1f} m/s ({behavior_desc}, acc=[{acc_min:.1f},{acc_max:.1f}])"
+            ))
+            logger.info(f"Speed intervention: {len(speed_tokens)} tokens, "
+                       f"acc=[{acc_min:.1f}, {acc_max:.1f}], yaw=[{-yaw_limit:.2f}, {yaw_limit:.2f}]")
+        else:
+            # Fallback to behavior-based tokens if constraint-based fails
+            logger.warning(f"No tokens for acc=[{acc_min}, {acc_max}], falling back to behavior")
+            if speed_ratio < 0.8:
                 behavior = 'decelerate'
             elif speed_ratio > 1.2:
                 behavior = 'accelerate'
             else:
                 behavior = 'maintain'
-        else:
-            if new_speed < 5:
-                behavior = 'stop'
-            else:
-                behavior = 'maintain'
+            tokens = self.token_space.get_tokens_by_behavior(behavior)
+            if tokens:
+                biases.append(TokenBias(
+                    token_ids=tokens,
+                    bias_value=encourage_bias,
+                    timestep_range=(0, 10),
+                    description=f"Speed: {orig_speed} -> {new_speed} m/s (fallback: {behavior})"
+                ))
         
-        tokens = self.token_space.get_tokens_by_behavior(behavior)
-        if tokens:
+        # Also add a weaker bias for straight driving throughout the prediction
+        straight_tokens = self.token_space.get_tokens_by_behavior('straight')
+        if straight_tokens:
             biases.append(TokenBias(
-                token_ids=tokens,
-                bias_value=encourage_bias,
-                timestep_range=(0, 10),
-                description=f"Speed: {orig_speed} -> {new_speed} m/s"
+                token_ids=straight_tokens,
+                bias_value=encourage_bias * 0.3,  # Weaker bias
+                timestep_range=(0, 19),  # Full horizon
+                description="Maintain straight heading during speed change"
             ))
         
         return biases
@@ -604,6 +1029,135 @@ class InterventionCompiler:
                 ))
         
         return biases
+    
+    def compile_sequence(
+        self,
+        sequence: Any,  # InterventionSequence from dag_constructor
+        encourage_bias: float = None
+    ) -> List[TokenBias]:
+        """
+        Compile a sequential intervention chain into token biases.
+        
+        This enables complex driving "scripts" like:
+        "accelerate → lane_change_right → turn_right"
+        
+        Each step in the sequence gets biases applied during its time window.
+        
+        Args:
+            sequence: InterventionSequence with steps containing:
+                - maneuver: str (e.g., "accelerate", "lane_change_right")
+                - start_time_s: float
+                - duration_s: float
+                - intensity: str ("gentle", "normal", "aggressive")
+            encourage_bias: Bias strength (default: DEFAULT_ENCOURAGE_BIAS)
+            
+        Returns:
+            List of TokenBias objects, one or more per step
+        """
+        encourage = encourage_bias or self.DEFAULT_ENCOURAGE_BIAS
+        biases = []
+        
+        # Import to access step attributes
+        steps = sequence.steps if hasattr(sequence, 'steps') else []
+        
+        for i, step in enumerate(steps):
+            maneuver = step.maneuver if hasattr(step, 'maneuver') else step.get('maneuver', 'straight')
+            start_time = step.start_time_s if hasattr(step, 'start_time_s') else step.get('start_time_s', 0)
+            duration = step.duration_s if hasattr(step, 'duration_s') else step.get('duration_s', 2.0)
+            intensity = step.intensity if hasattr(step, 'intensity') else step.get('intensity', 'normal')
+            
+            # Convert times to BMT timesteps (2 steps per second)
+            start_step = max(0, int(start_time * 2))
+            end_step = min(int((start_time + duration) * 2), self.MAX_TIMESTEPS)
+            
+            # Skip if timestep range is invalid
+            if start_step >= end_step:
+                logger.warning(f"Skipping sequence step {i}: invalid time range "
+                              f"{start_time}s-{start_time + duration}s (steps {start_step}-{end_step})")
+                continue
+            
+            # Map maneuver to tokens
+            tokens = self._get_sequence_step_tokens(maneuver, intensity)
+            
+            if tokens:
+                biases.append(TokenBias(
+                    token_ids=tokens,
+                    bias_value=encourage,
+                    timestep_range=(start_step, end_step),
+                    description=f"Seq[{i}] {maneuver} ({intensity}) @ {start_time:.1f}-{start_time + duration:.1f}s"
+                ))
+                logger.info(f"Sequence step {i}: {maneuver} ({intensity}) -> "
+                           f"{len(tokens)} tokens, steps {start_step}-{end_step}")
+            else:
+                logger.warning(f"No tokens found for sequence step {i}: {maneuver}")
+        
+        return biases
+    
+    def _get_sequence_step_tokens(self, maneuver: str, intensity: str) -> List[int]:
+        """
+        Get tokens for a sequence step maneuver.
+        
+        Args:
+            maneuver: Maneuver type (e.g., "accelerate", "lane_change_right")
+            intensity: Intensity level ("gentle", "normal", "aggressive")
+            
+        Returns:
+            List of token IDs
+        """
+        # Map intensity to style names
+        intensity_to_lane_style = {
+            'gentle': 'gentle',
+            'normal': 'normal',
+            'aggressive': 'aggressive'
+        }
+        intensity_to_turn_style = {
+            'gentle': 'with_brake',
+            'normal': 'moderate',
+            'aggressive': 'sharp'
+        }
+        
+        # Handle different maneuver types
+        if maneuver.startswith('lane_change'):
+            direction = 'right' if 'right' in maneuver else 'left'
+            style = intensity_to_lane_style.get(intensity, 'normal')
+            return self.token_space.get_lane_change_tokens(direction, style)
+        
+        elif maneuver in ('turn_left', 'left_turn'):
+            style = intensity_to_turn_style.get(intensity, 'moderate')
+            return self.token_space.get_turn_tokens('left', style)
+        
+        elif maneuver in ('turn_right', 'right_turn'):
+            style = intensity_to_turn_style.get(intensity, 'moderate')
+            return self.token_space.get_turn_tokens('right', style)
+        
+        elif maneuver == 'hard_brake':
+            return self.token_space.get_tokens_by_constraint(
+                acc_min=-8.0, acc_max=-4.0, yaw_min=-0.1, yaw_max=0.1
+            )
+        
+        elif maneuver == 'swerve':
+            # Quick yaw change
+            return self.token_space.get_tokens_by_constraint(
+                acc_min=-2.0, acc_max=2.0, yaw_min=0.2, yaw_max=0.5
+            ) + self.token_space.get_tokens_by_constraint(
+                acc_min=-2.0, acc_max=2.0, yaw_min=-0.5, yaw_max=-0.2
+            )
+        
+        elif maneuver in ('accelerate', 'hard_accelerate'):
+            acc_min = 2.0 if maneuver == 'hard_accelerate' else 1.0
+            acc_max = 4.0 if maneuver == 'hard_accelerate' else 3.0
+            return self.token_space.get_tokens_by_constraint(
+                acc_min=acc_min, acc_max=acc_max, yaw_min=-0.1, yaw_max=0.1
+            )
+        
+        elif maneuver in ('decelerate', 'slow_down'):
+            return self.token_space.get_tokens_by_constraint(
+                acc_min=-3.0, acc_max=-0.5, yaw_min=-0.1, yaw_max=0.1
+            )
+        
+        else:
+            # Try generic behavior lookup
+            return self.token_space.get_tokens_by_behavior(maneuver)
 
 
 # =============================================================================
