@@ -1,0 +1,727 @@
+"""Forward-pass validation metrics for the NNX Adv-BMT rewrite.
+
+Paper alignment notes:
+- This module implements the scenario-level forward-pass metrics used in
+  Adv-BMT evaluation (`bmt/eval/scenario_evaluator.py`) using NumPy/JAX-only
+  primitives so it can run directly inside CounterBMT v2 training.
+- Metrics include supervised trajectory fit (minSFDE/minSADE/minSSDE),
+  diversity (FDD/ADD/SDD), realism (Vel/Acc/TTC JSD), and safety/comfort
+  summaries (collision and SDC accel/jerk statistics).
+- Original Adv-BMT collision/TTC metrics use Waymo metric operators. Here we
+  provide a dependency-light approximation that preserves metric intent.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+import numpy as np
+
+import jax
+import jax.numpy as jnp
+
+from counter_bmt_v2.trajectory_jax import (
+    BidirectionalMotionTokenizer,
+    NNXBidirectionalMotionTransformer,
+    sample_motion_tokens,
+)
+
+
+@dataclass
+class ForwardPassEvalConfig:
+    """Configuration for Adv-BMT-style forward-pass validation.
+
+    Defaults track the histogram ranges and sampling style used by the
+    original Adv-BMT evaluator where possible.
+    """
+
+    enabled: bool = True
+    num_modes: int = 6
+
+    sampling_method: str = "topp"
+    temperature: float = 1.0
+    topp: float = 0.95
+    topk: int = 5
+
+    vel_hist_min: float = 0.0
+    vel_hist_max: float = 50.0
+    vel_hist_bins: int = 100
+
+    acc_hist_min: float = -10.0
+    acc_hist_max: float = 10.0
+    acc_hist_bins: int = 200
+
+    # Adv-BMT uses WOD TTC bins in [0, 5].
+    ttc_hist_min: float = 0.0
+    ttc_hist_max: float = 5.0
+    ttc_hist_bins: int = 10
+
+    # Circle approximation radius floor for collision checks.
+    collision_radius_floor_m: float = 0.5
+
+
+def _safe_mean(values: List[float]) -> float:
+    if not values:
+        return float("nan")
+    return float(np.mean(np.asarray(values, dtype=np.float32)))
+
+
+def nanmean_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
+    """NaN-aware metric aggregation across scenarios."""
+    if not metrics_list:
+        return {}
+
+    keys = sorted({k for m in metrics_list for k in m.keys()})
+    out: Dict[str, float] = {}
+    for k in keys:
+        vals = np.asarray([m.get(k, float("nan")) for m in metrics_list], dtype=np.float32)
+        if np.all(np.isnan(vals)):
+            out[k] = float("nan")
+        else:
+            out[k] = float(np.nanmean(vals))
+    return out
+
+
+def _histogram_jsd(
+    gt_values: np.ndarray,
+    pred_values: np.ndarray,
+    *,
+    min_val: float,
+    max_val: float,
+    num_bins: int,
+    eps: float = 1e-10,
+) -> float:
+    gt = np.asarray(gt_values, dtype=np.float32)
+    pred = np.asarray(pred_values, dtype=np.float32)
+
+    gt = gt[np.isfinite(gt)]
+    pred = pred[np.isfinite(pred)]
+    if gt.size == 0 or pred.size == 0:
+        return float("nan")
+
+    gt = np.clip(gt, min_val, max_val)
+    pred = np.clip(pred, min_val, max_val)
+
+    gt_hist, _ = np.histogram(gt, bins=int(num_bins), range=(float(min_val), float(max_val)))
+    pred_hist, _ = np.histogram(pred, bins=int(num_bins), range=(float(min_val), float(max_val)))
+
+    if gt_hist.sum() <= 0 or pred_hist.sum() <= 0:
+        return float("nan")
+
+    p = gt_hist.astype(np.float64) / float(gt_hist.sum())
+    q = pred_hist.astype(np.float64) / float(pred_hist.sum())
+
+    p = np.clip(p, eps, 1.0)
+    q = np.clip(q, eps, 1.0)
+    m = 0.5 * (p + q)
+
+    kl_pm = np.sum(p * (np.log(p) - np.log(m)))
+    kl_qm = np.sum(q * (np.log(q) - np.log(m)))
+    return float(0.5 * (kl_pm + kl_qm))
+
+
+def _first_last_valid_indices(mask_tn: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return first/last valid timestep indices per agent.
+
+    Args:
+        mask_tn: [T,N] boolean mask.
+    Returns:
+        has_valid: [N] bool
+        first_idx: [N] int
+        last_idx: [N] int
+    """
+    has_valid = np.any(mask_tn, axis=0)
+    first_idx = np.argmax(mask_tn, axis=0)
+    last_idx = mask_tn.shape[0] - 1 - np.argmax(mask_tn[::-1, :], axis=0)
+    return has_valid, first_idx.astype(np.int32), last_idx.astype(np.int32)
+
+
+def _pairwise_max_dist(points_k2: np.ndarray) -> float:
+    """Maximum pairwise distance across K trajectory modes for one state."""
+    if points_k2.shape[0] < 2:
+        return float("nan")
+    diffs = points_k2[:, None, :] - points_k2[None, :, :]
+    d = np.linalg.norm(diffs, axis=-1)
+    return float(np.max(d))
+
+
+def _central_diff_2d(values_tn: np.ndarray, valid_tn: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray]:
+    """Central difference on [T,N] with validity-aware mask."""
+    t_steps = int(values_tn.shape[0])
+    out = np.full_like(values_tn, np.nan, dtype=np.float32)
+    out_mask = np.zeros_like(valid_tn, dtype=bool)
+
+    if t_steps < 3 or dt <= 0.0:
+        return out, out_mask
+
+    out[1:-1, :] = (values_tn[2:, :] - values_tn[:-2, :]) / float(2.0 * dt)
+    out_mask[1:-1, :] = valid_tn[2:, :] & valid_tn[1:-1, :] & valid_tn[:-2, :]
+    return out, out_mask
+
+
+def _central_diff_3d(values_btn: np.ndarray, valid_btn: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray]:
+    """Central difference on [B,T,N] with validity-aware mask."""
+    t_steps = int(values_btn.shape[1])
+    out = np.full_like(values_btn, np.nan, dtype=np.float32)
+    out_mask = np.zeros_like(valid_btn, dtype=bool)
+
+    if t_steps < 3 or dt <= 0.0:
+        return out, out_mask
+
+    out[:, 1:-1, :] = (values_btn[:, 2:, :] - values_btn[:, :-2, :]) / float(2.0 * dt)
+    out_mask[:, 1:-1, :] = valid_btn[:, 2:, :] & valid_btn[:, 1:-1, :] & valid_btn[:, :-2, :]
+    return out, out_mask
+
+
+def _approx_ttc_values(
+    *,
+    position_tn2: np.ndarray,
+    velocity_tn2: np.ndarray,
+    valid_tn: np.ndarray,
+    radii_n: np.ndarray,
+) -> np.ndarray:
+    """Approximate TTC per agent/time using relative-motion collision checks.
+
+    This is a dependency-light proxy for the WOD TTC operator used in Adv-BMT.
+    """
+    t_steps, n_agents, _ = position_tn2.shape
+    out = np.full((t_steps, n_agents), np.nan, dtype=np.float32)
+    eps = 1e-6
+
+    for t in range(t_steps):
+        idx = np.where(valid_tn[t])[0]
+        if idx.size < 2:
+            continue
+
+        pos = position_tn2[t, idx]  # [M,2]
+        vel = velocity_tn2[t, idx]  # [M,2]
+
+        rel_pos = pos[None, :, :] - pos[:, None, :]  # i->j
+        rel_vel = vel[None, :, :] - vel[:, None, :]
+
+        vel_sq = np.sum(rel_vel * rel_vel, axis=-1)
+        dot = np.sum(rel_pos * rel_vel, axis=-1)
+
+        ttc = -dot / (vel_sq + eps)
+        valid_pair = (vel_sq > eps) & (ttc > 0.0)
+
+        closest = rel_pos + rel_vel * ttc[..., None]
+        closest_sq = np.sum(closest * closest, axis=-1)
+
+        thresh_sq = (radii_n[idx][:, None] + radii_n[idx][None, :]) ** 2
+        valid_pair = valid_pair & (closest_sq <= thresh_sq)
+
+        np.fill_diagonal(valid_pair, False)
+        ttc = np.where(valid_pair, ttc, np.inf)
+
+        min_ttc = np.min(ttc, axis=1)
+        min_ttc[~np.isfinite(min_ttc)] = np.nan
+        out[t, idx] = min_ttc.astype(np.float32)
+
+    return out
+
+
+def _reconstruct_rollout_states(
+    *,
+    predicted_tokens_kbtn: np.ndarray,
+    action_table: np.ndarray,
+    init_pos_bn2: np.ndarray,
+    init_heading_bn: np.ndarray,
+    init_speed_bn: np.ndarray,
+    dt_chunk_b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Reconstruct per-mode trajectory states from sampled token rollouts.
+
+    Integration follows the midpoint scheme used by Adv-BMT motion tokenization.
+    """
+    n_mode, bsz, horizon, n_agents = predicted_tokens_kbtn.shape
+
+    pos = np.zeros((n_mode, bsz, horizon, n_agents, 2), dtype=np.float32)
+    vel = np.zeros((n_mode, bsz, horizon, n_agents, 2), dtype=np.float32)
+    heading = np.zeros((n_mode, bsz, horizon, n_agents), dtype=np.float32)
+    speed = np.zeros((n_mode, bsz, horizon, n_agents), dtype=np.float32)
+
+    dt_bn = dt_chunk_b[:, None].astype(np.float32)
+
+    for k in range(n_mode):
+        x = init_pos_bn2[..., 0].astype(np.float32).copy()
+        y = init_pos_bn2[..., 1].astype(np.float32).copy()
+        hd = init_heading_bn.astype(np.float32).copy()
+        sp = init_speed_bn.astype(np.float32).copy()
+
+        for t in range(horizon):
+            tok = predicted_tokens_kbtn[k, :, t, :]
+            acc = action_table[tok, 0].astype(np.float32)
+            yaw = action_table[tok, 1].astype(np.float32)
+
+            sp_next = sp + acc * dt_bn
+            hd_next = hd + yaw * dt_bn
+
+            sp_mid = 0.5 * (sp + sp_next)
+            hd_mid = 0.5 * (hd + hd_next)
+
+            x = x + sp_mid * np.cos(hd_mid) * dt_bn
+            y = y + sp_mid * np.sin(hd_mid) * dt_bn
+
+            vx = sp_next * np.cos(hd_next)
+            vy = sp_next * np.sin(hd_next)
+
+            pos[k, :, t, :, 0] = x
+            pos[k, :, t, :, 1] = y
+            vel[k, :, t, :, 0] = vx
+            vel[k, :, t, :, 1] = vy
+            heading[k, :, t, :] = hd_next
+            speed[k, :, t, :] = np.abs(sp_next)
+
+            sp = sp_next
+            hd = hd_next
+
+    return pos, vel, heading, speed
+
+
+def _rollout_tokens_fixed_horizon(
+    *,
+    model: NNXBidirectionalMotionTransformer,
+    agent_type_ids: jnp.ndarray,  # [B,N]
+    agent_shape: jnp.ndarray,  # [B,N,3]
+    agent_ids: jnp.ndarray,  # [B,N]
+    reverse_indicator: jnp.ndarray,  # [B]
+    horizon_steps: int,
+    start_token_id: int,
+    action_table: jnp.ndarray,  # [V,2]
+    sampling_method: str,
+    temperature: float,
+    topp: float,
+    topk: int,
+    key: Any,
+    scene_map_feature: jnp.ndarray | None = None,
+    scene_map_valid_mask: jnp.ndarray | None = None,
+    scene_map_position: jnp.ndarray | None = None,
+    scene_tl_feature: jnp.ndarray | None = None,
+    scene_tl_valid_mask: jnp.ndarray | None = None,
+    scene_tl_position: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """Static-shape rollout for JIT-friendly forward-pass validation.
+
+    This avoids dynamic sequence-length recompilation while preserving
+    iterative token feedback through the `prev_token_ids` and motion channels.
+    """
+    bsz, n_agents = agent_type_ids.shape
+    token_seq = jnp.full((bsz, horizon_steps, n_agents), int(start_token_id), dtype=jnp.int32)
+    motion_seq = jnp.zeros((bsz, horizon_steps, n_agents, 2), dtype=jnp.float32)
+
+    model_kwargs = {
+        "agent_type_ids": agent_type_ids,
+        "agent_shape": agent_shape,
+        "agent_ids": agent_ids,
+        "reverse_indicator": reverse_indicator,
+    }
+    if scene_map_feature is not None:
+        model_kwargs["scene_map_feature"] = scene_map_feature
+    if scene_map_valid_mask is not None:
+        model_kwargs["scene_map_valid_mask"] = scene_map_valid_mask
+    if scene_map_position is not None:
+        model_kwargs["scene_map_position"] = scene_map_position
+    if scene_tl_feature is not None:
+        model_kwargs["scene_tl_feature"] = scene_tl_feature
+    if scene_tl_valid_mask is not None:
+        model_kwargs["scene_tl_valid_mask"] = scene_tl_valid_mask
+    if scene_tl_position is not None:
+        model_kwargs["scene_tl_position"] = scene_tl_position
+
+    for t in range(horizon_steps):
+        logits = model(
+            prev_token_ids=token_seq,
+            continuous_motion=motion_seq,
+            **model_kwargs,
+        )
+        step_logits = logits[:, t, :, :]
+        key, sub = jax.random.split(key)
+        next_tok = sample_motion_tokens(
+            step_logits,
+            sub,
+            sampling_method=sampling_method,
+            temperature=float(temperature),
+            topp=float(topp),
+            topk=int(topk),
+        )
+        token_seq = token_seq.at[:, t, :].set(next_tok)
+        next_motion = jnp.take(action_table, next_tok, axis=0)  # [B,N,2]
+        motion_seq = motion_seq.at[:, t, :, :].set(next_motion)
+
+    return token_seq
+
+
+def _compute_collision_and_comfort_metrics(
+    *,
+    pred_pos_ktn2: np.ndarray,
+    pred_speed_ktn: np.ndarray,
+    pred_valid_ktn: np.ndarray,
+    radii_n: np.ndarray,
+    sdc_index: int,
+    dt_chunk_s: float,
+) -> Dict[str, float]:
+    """Approximate Adv-BMT collision/comfort metrics for one scenario."""
+    n_mode, t_steps, n_agents = pred_valid_ktn.shape
+
+    mode_collision_rates: List[float] = []
+    mode_max_collision_speed: List[float] = []
+    sdc_collision_speed_values: List[float] = []
+
+    for k in range(n_mode):
+        valid_tn = pred_valid_ktn[k]
+        collided_n = np.zeros((n_agents,), dtype=bool)
+        collision_speed_values: List[float] = []
+
+        for t in range(t_steps):
+            idx = np.where(valid_tn[t])[0]
+            if idx.size < 2:
+                continue
+
+            pts = pred_pos_ktn2[k, t, idx]  # [M,2]
+            d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+            thresh = radii_n[idx][:, None] + radii_n[idx][None, :]
+
+            coll = d <= thresh
+            np.fill_diagonal(coll, False)
+            if not np.any(coll):
+                continue
+
+            coll_local = np.any(coll, axis=1)
+            coll_agents = idx[coll_local]
+            collided_n[coll_agents] = True
+
+            collision_speed_values.extend(pred_speed_ktn[k, t, coll_agents].astype(np.float32).tolist())
+            if int(sdc_index) in coll_agents.tolist():
+                sdc_collision_speed_values.append(float(pred_speed_ktn[k, t, sdc_index]))
+
+        valid_agents = np.any(valid_tn, axis=0)
+        denom = int(valid_agents.sum())
+        if denom > 0:
+            mode_collision_rates.append(float(collided_n[valid_agents].mean()))
+
+        if collision_speed_values:
+            mode_max_collision_speed.append(float(np.max(collision_speed_values)))
+
+    # SDC comfort metrics (same spirit as Adv-BMT evaluator).
+    sdc_acc_avgtime: List[float] = []
+    sdc_acc_maxtime: List[float] = []
+    sdc_jerk_avgtime: List[float] = []
+    sdc_jerk_maxtime: List[float] = []
+
+    if 0 <= int(sdc_index) < n_agents:
+        sdc_speed_kt = pred_speed_ktn[:, :, sdc_index]
+        sdc_valid_kt = pred_valid_ktn[:, :, sdc_index]
+
+        sdc_acc_kt, sdc_acc_mask_kt = _central_diff_3d(sdc_speed_kt[:, :, None], sdc_valid_kt[:, :, None], dt_chunk_s)
+        sdc_acc_kt = np.abs(sdc_acc_kt[:, :, 0])
+        sdc_acc_mask_kt = sdc_acc_mask_kt[:, :, 0]
+
+        sdc_jerk_kt, sdc_jerk_mask_kt = _central_diff_3d(sdc_acc_kt[:, :, None], sdc_acc_mask_kt[:, :, None], dt_chunk_s)
+        sdc_jerk_kt = np.abs(sdc_jerk_kt[:, :, 0])
+        sdc_jerk_mask_kt = sdc_jerk_mask_kt[:, :, 0]
+
+        for k in range(n_mode):
+            if np.any(sdc_acc_mask_kt[k]):
+                vals = sdc_acc_kt[k][sdc_acc_mask_kt[k]]
+                sdc_acc_avgtime.append(float(np.mean(vals)))
+                sdc_acc_maxtime.append(float(np.max(vals)))
+            if np.any(sdc_jerk_mask_kt[k]):
+                vals = sdc_jerk_kt[k][sdc_jerk_mask_kt[k]]
+                sdc_jerk_avgtime.append(float(np.mean(vals)))
+                sdc_jerk_maxtime.append(float(np.max(vals)))
+
+    return {
+        "veh_coll_avg": _safe_mean(mode_collision_rates),
+        "veh_coll_min": float(np.min(mode_collision_rates)) if mode_collision_rates else float("nan"),
+        "veh_coll_max": float(np.max(mode_collision_rates)) if mode_collision_rates else float("nan"),
+        "coll_vel_maxagent_avg": _safe_mean(mode_max_collision_speed),
+        "coll_vel_maxagent_min": float(np.min(mode_max_collision_speed)) if mode_max_collision_speed else float("nan"),
+        "coll_vel_maxagent_max": float(np.max(mode_max_collision_speed)) if mode_max_collision_speed else float("nan"),
+        "coll_vel_sdc_avg": _safe_mean(sdc_collision_speed_values),
+        "coll_vel_sdc_min": float(np.min(sdc_collision_speed_values)) if sdc_collision_speed_values else float("nan"),
+        "coll_vel_sdc_max": float(np.max(sdc_collision_speed_values)) if sdc_collision_speed_values else float("nan"),
+        "sdc_acc_avgtime_avg": _safe_mean(sdc_acc_avgtime),
+        "sdc_acc_avgtime_min": float(np.min(sdc_acc_avgtime)) if sdc_acc_avgtime else float("nan"),
+        "sdc_acc_avgtime_max": float(np.max(sdc_acc_avgtime)) if sdc_acc_avgtime else float("nan"),
+        "sdc_acc_maxtime_avg": _safe_mean(sdc_acc_maxtime),
+        "sdc_acc_maxtime_min": float(np.min(sdc_acc_maxtime)) if sdc_acc_maxtime else float("nan"),
+        "sdc_acc_maxtime_max": float(np.max(sdc_acc_maxtime)) if sdc_acc_maxtime else float("nan"),
+        "sdc_jerk_avgtime_avg": _safe_mean(sdc_jerk_avgtime),
+        "sdc_jerk_avgtime_min": float(np.min(sdc_jerk_avgtime)) if sdc_jerk_avgtime else float("nan"),
+        "sdc_jerk_avgtime_max": float(np.max(sdc_jerk_avgtime)) if sdc_jerk_avgtime else float("nan"),
+        "sdc_jerk_maxtime_avg": _safe_mean(sdc_jerk_maxtime),
+        "sdc_jerk_maxtime_min": float(np.min(sdc_jerk_maxtime)) if sdc_jerk_maxtime else float("nan"),
+        "sdc_jerk_maxtime_max": float(np.max(sdc_jerk_maxtime)) if sdc_jerk_maxtime else float("nan"),
+    }
+
+
+def _compute_scenario_metrics(
+    *,
+    pred_pos_ktn2: np.ndarray,
+    pred_vel_ktn2: np.ndarray,
+    pred_speed_ktn: np.ndarray,
+    pred_valid_ktn: np.ndarray,
+    gt_pos_tn2: np.ndarray,
+    gt_vel_tn2: np.ndarray,
+    gt_valid_tn: np.ndarray,
+    agent_shape_n3: np.ndarray,
+    dt_chunk_s: float,
+    sdc_index: int,
+    cfg: ForwardPassEvalConfig,
+) -> Dict[str, float]:
+    """Compute Adv-BMT-style forward-pass metrics for one scenario."""
+    n_mode, t_steps, n_agents, _ = pred_pos_ktn2.shape
+
+    has_valid, first_idx, last_idx = _first_last_valid_indices(gt_valid_tn)
+    valid_agents = np.where(has_valid)[0]
+
+    error_ktn = np.linalg.norm(pred_pos_ktn2 - gt_pos_tn2[None, ...], axis=-1)  # [K,T,N]
+
+    sfde_modes: List[float] = []
+    sade_modes: List[float] = []
+    ssde_modes: List[float] = []
+
+    for k in range(n_mode):
+        fde_vals: List[float] = []
+        sde_vals: List[float] = []
+        ade_vals: List[float] = []
+
+        for n in valid_agents.tolist():
+            f = int(first_idx[n])
+            l = int(last_idx[n])
+
+            fde_vals.append(float(error_ktn[k, l, n]))
+            sde_vals.append(float(error_ktn[k, f, n]))
+
+            t_mask = gt_valid_tn[:, n]
+            if np.any(t_mask):
+                ade_vals.append(float(np.mean(error_ktn[k, t_mask, n])))
+
+        sfde_modes.append(_safe_mean(fde_vals))
+        ssde_modes.append(_safe_mean(sde_vals))
+        sade_modes.append(_safe_mean(ade_vals))
+
+    # Diversity metrics from Adv-BMT evaluator (FDD/ADD/SDD).
+    fdd_vals: List[float] = []
+    sdd_vals: List[float] = []
+    add_vals: List[float] = []
+
+    if n_mode >= 2:
+        for n in valid_agents.tolist():
+            f = int(first_idx[n])
+            l = int(last_idx[n])
+            fdd_vals.append(_pairwise_max_dist(pred_pos_ktn2[:, l, n, :]))
+            sdd_vals.append(_pairwise_max_dist(pred_pos_ktn2[:, f, n, :]))
+
+        for t in range(t_steps):
+            for n in valid_agents.tolist():
+                if not gt_valid_tn[t, n]:
+                    continue
+                add_vals.append(_pairwise_max_dist(pred_pos_ktn2[:, t, n, :]))
+
+    # Distribution realism histograms.
+    gt_speed_tn = np.linalg.norm(gt_vel_tn2, axis=-1)
+    pred_speed_flat = pred_speed_ktn[pred_valid_ktn]
+    gt_speed_flat = gt_speed_tn[gt_valid_tn]
+
+    gt_acc_tn, gt_acc_mask_tn = _central_diff_2d(gt_speed_tn, gt_valid_tn, dt_chunk_s)
+    pred_acc_ktn, pred_acc_mask_ktn = _central_diff_3d(pred_speed_ktn, pred_valid_ktn, dt_chunk_s)
+
+    gt_acc_flat = gt_acc_tn[gt_acc_mask_tn]
+    pred_acc_flat = pred_acc_ktn[pred_acc_mask_ktn]
+
+    # TTC proxy histogram.
+    length = np.asarray(agent_shape_n3[:, 0], dtype=np.float32)
+    width = np.asarray(agent_shape_n3[:, 1], dtype=np.float32)
+    radius = 0.5 * np.sqrt(np.maximum(length, 0.0) ** 2 + np.maximum(width, 0.0) ** 2)
+    radius = np.maximum(radius, float(cfg.collision_radius_floor_m)).astype(np.float32)
+
+    gt_ttc_tn = _approx_ttc_values(
+        position_tn2=gt_pos_tn2,
+        velocity_tn2=gt_vel_tn2,
+        valid_tn=gt_valid_tn,
+        radii_n=radius,
+    )
+    pred_ttc_list: List[np.ndarray] = []
+    for k in range(n_mode):
+        pred_ttc_list.append(
+            _approx_ttc_values(
+                position_tn2=pred_pos_ktn2[k],
+                velocity_tn2=pred_vel_ktn2[k],
+                valid_tn=pred_valid_ktn[k],
+                radii_n=radius,
+            )
+        )
+    pred_ttc_ktn = np.stack(pred_ttc_list, axis=0)
+
+    gt_ttc_flat = gt_ttc_tn[gt_valid_tn]
+    pred_ttc_flat = pred_ttc_ktn[pred_valid_ktn]
+
+    out = {
+        "sfde_min": float(np.min(sfde_modes)) if sfde_modes else float("nan"),
+        "sfde_avg": _safe_mean(sfde_modes),
+        "sade_min": float(np.min(sade_modes)) if sade_modes else float("nan"),
+        "sade_avg": _safe_mean(sade_modes),
+        "ssde_min": float(np.min(ssde_modes)) if ssde_modes else float("nan"),
+        "ssde_avg": _safe_mean(ssde_modes),
+        "fdd": _safe_mean(fdd_vals),
+        "sdd": _safe_mean(sdd_vals),
+        "add": _safe_mean(add_vals),
+        "vel_jsd": _histogram_jsd(
+            gt_speed_flat,
+            pred_speed_flat,
+            min_val=float(cfg.vel_hist_min),
+            max_val=float(cfg.vel_hist_max),
+            num_bins=int(cfg.vel_hist_bins),
+        ),
+        "acc_jsd": _histogram_jsd(
+            gt_acc_flat,
+            pred_acc_flat,
+            min_val=float(cfg.acc_hist_min),
+            max_val=float(cfg.acc_hist_max),
+            num_bins=int(cfg.acc_hist_bins),
+        ),
+        "ttc_jsd": _histogram_jsd(
+            gt_ttc_flat,
+            pred_ttc_flat,
+            min_val=float(cfg.ttc_hist_min),
+            max_val=float(cfg.ttc_hist_max),
+            num_bins=int(cfg.ttc_hist_bins),
+        ),
+    }
+
+    out.update(
+        _compute_collision_and_comfort_metrics(
+            pred_pos_ktn2=pred_pos_ktn2,
+            pred_speed_ktn=pred_speed_ktn,
+            pred_valid_ktn=pred_valid_ktn,
+            radii_n=radius,
+            sdc_index=int(sdc_index),
+            dt_chunk_s=float(dt_chunk_s),
+        )
+    )
+    return out
+
+
+def compute_forward_pass_metrics_for_batch(
+    *,
+    model: NNXBidirectionalMotionTransformer,
+    prepared_batch: Dict[str, Any],
+    tokenizer: BidirectionalMotionTokenizer,
+    skip_steps: int,
+    eval_cfg: ForwardPassEvalConfig,
+    seed: int,
+) -> List[Dict[str, float]]:
+    """Compute scenario-level forward-pass metrics for one validation batch.
+
+    The rollout path is intentionally aligned with Adv-BMT evaluation intent:
+    multi-mode autoregressive sampling followed by scenario-level metric
+    aggregation against the same scenario's ground-truth future trajectory.
+    """
+    if not eval_cfg.enabled:
+        return []
+
+    model_inputs = prepared_batch["model_inputs"]
+    raw = prepared_batch["raw_batch"]
+
+    sample_steps = np.asarray(prepared_batch["sample_steps"], dtype=np.int32)
+    gt_action_valid_btn = np.asarray(prepared_batch["target_mask"], dtype=np.float32) > 0.5
+
+    bsz = int(raw["agent_position_xy"].shape[0])
+    n_agents = int(raw["agent_position_xy"].shape[2])
+    horizon = int(gt_action_valid_btn.shape[1])
+
+    if horizon <= 0:
+        return []
+
+    # Adv-BMT forward-pass eval samples K trajectory modes.
+    n_mode = max(1, int(eval_cfg.num_modes))
+    start_token_id = int(tokenizer.cfg.n_tokens)
+
+    key = jax.random.PRNGKey(int(seed))
+    pred_tokens: List[np.ndarray] = []
+
+    action_table_jnp = jnp.asarray(tokenizer.action_table_np())
+    for _ in range(n_mode):
+        key, sub = jax.random.split(key)
+        sampled_tok = _rollout_tokens_fixed_horizon(
+            model=model,
+            agent_type_ids=model_inputs["agent_type_ids"],
+            agent_shape=model_inputs["agent_shape"],
+            agent_ids=model_inputs["agent_ids"],
+            reverse_indicator=jnp.zeros_like(prepared_batch["reverse_indicator"], dtype=jnp.int32),
+            horizon_steps=int(horizon),
+            start_token_id=start_token_id,
+            action_table=action_table_jnp,
+            scene_map_feature=model_inputs.get("scene_map_feature"),
+            scene_map_valid_mask=model_inputs.get("scene_map_valid_mask"),
+            scene_map_position=model_inputs.get("scene_map_position"),
+            scene_tl_feature=model_inputs.get("scene_tl_feature"),
+            scene_tl_valid_mask=model_inputs.get("scene_tl_valid_mask"),
+            scene_tl_position=model_inputs.get("scene_tl_position"),
+            sampling_method=eval_cfg.sampling_method,
+            temperature=float(eval_cfg.temperature),
+            topp=float(eval_cfg.topp),
+            topk=int(eval_cfg.topk),
+            key=sub,
+        )
+        pred_tokens.append(np.asarray(jax.device_get(sampled_tok), dtype=np.int32))
+
+    pred_tokens_kbtn = np.stack(pred_tokens, axis=0)  # [K,B,T,N]
+
+    agent_pos_btn2 = np.asarray(raw["agent_position_xy"], dtype=np.float32)
+    agent_vel_btn2 = np.asarray(raw["agent_velocity_xy"], dtype=np.float32)
+    agent_heading_btn = np.asarray(raw["agent_heading"], dtype=np.float32)
+    agent_valid_btn = np.asarray(raw["agent_valid_mask"], dtype=bool)
+    agent_shape_bn3 = np.asarray(raw["agent_shape"], dtype=np.float32)
+
+    init_t = int(sample_steps[0])
+    eval_steps = sample_steps[1:]
+
+    init_pos_bn2 = agent_pos_btn2[:, init_t, :, :]
+    init_heading_bn = agent_heading_btn[:, init_t, :]
+    init_speed_bn = np.linalg.norm(agent_vel_btn2[:, init_t, :, :], axis=-1)
+
+    dt_chunk_b = np.asarray(raw["dt_s"], dtype=np.float32) * float(skip_steps)
+    action_table = tokenizer.action_table_np()
+
+    pred_pos_kbtn2, pred_vel_kbtn2, _, pred_speed_kbtn = _reconstruct_rollout_states(
+        predicted_tokens_kbtn=pred_tokens_kbtn,
+        action_table=action_table,
+        init_pos_bn2=init_pos_bn2,
+        init_heading_bn=init_heading_bn,
+        init_speed_bn=init_speed_bn,
+        dt_chunk_b=dt_chunk_b,
+    )
+
+    gt_pos_btn2 = agent_pos_btn2[:, eval_steps, :, :]
+    gt_vel_btn2 = agent_vel_btn2[:, eval_steps, :, :]
+
+    # Validity is action-transition validity (both endpoints valid).
+    valid_sampled_btn = agent_valid_btn[:, sample_steps, :]
+    gt_valid_btn = valid_sampled_btn[:, 1:, :] & valid_sampled_btn[:, :-1, :]
+
+    # Model does not currently predict valid-mask logits; use GT transition validity.
+    pred_valid_kbtn = np.broadcast_to(gt_valid_btn[None, :, :, :], pred_speed_kbtn.shape)
+
+    per_scenario_metrics: List[Dict[str, float]] = []
+    for b in range(bsz):
+        per_scenario_metrics.append(
+            _compute_scenario_metrics(
+                pred_pos_ktn2=pred_pos_kbtn2[:, b],
+                pred_vel_ktn2=pred_vel_kbtn2[:, b],
+                pred_speed_ktn=pred_speed_kbtn[:, b],
+                pred_valid_ktn=pred_valid_kbtn[:, b],
+                gt_pos_tn2=gt_pos_btn2[b],
+                gt_vel_tn2=gt_vel_btn2[b],
+                gt_valid_tn=gt_valid_btn[b],
+                agent_shape_n3=agent_shape_bn3[b],
+                dt_chunk_s=float(max(dt_chunk_b[b], 1e-6)),
+                sdc_index=0,
+                cfg=eval_cfg,
+            )
+        )
+
+    return per_scenario_metrics

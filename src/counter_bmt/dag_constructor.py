@@ -692,6 +692,16 @@ class DAGClient(ABC):
                                 outcome_var: str) -> CounterfactualResult:
         pass
 
+    @abstractmethod
+    def infer_cpts(
+        self,
+        nodes: List[Dict],
+        edges: List[Dict],
+        scenario_context: str,
+    ) -> Dict[str, Dict]:
+        """Infer CPTs for nodes (returns mapping node_id -> CPT dict)."""
+        pass
+
 
 class MockDAGClient(DAGClient):
     """Mock client using domain heuristics."""
@@ -752,6 +762,98 @@ class MockDAGClient(DAGClient):
             effect_direction=effect, confidence=0.75,
             reasoning=f"Changing {intervention.variable_id} to {intervention.value} would {effect} collision risk via {len(paths)} path(s)",
             affected_paths=paths)
+
+    def infer_cpts(
+        self,
+        nodes: List[Dict],
+        edges: List[Dict],
+        scenario_context: str,
+    ) -> Dict[str, Dict]:
+        """
+        Build CPTs conditioned on observed continuous parent values.
+
+        Continuous parents (ego_state, agent_state, environmental) are
+        collapsed into an ``observed_context`` note; only discrete parents
+        appear as conditioning variables in the CPT rows.
+        """
+        import itertools as _it
+
+        # Build parent map
+        parents: Dict[str, List[str]] = {}
+        for e in edges:
+            parents.setdefault(e["child"], []).append(e["parent"])
+
+        node_map = {n["id"]: n for n in nodes}
+        _CONTINUOUS = {"ego_state", "agent_state", "environmental"}
+
+        def _is_continuous(nid: str) -> bool:
+            n = node_map.get(nid, {})
+            return n.get("type", "") in _CONTINUOUS
+
+        def _values_for(nid: str) -> Optional[List[Any]]:
+            n = node_map.get(nid, {})
+            alts = n.get("metadata", {}).get("alternatives", [])
+            val = n.get("value")
+            values = []
+            if val is not None and not isinstance(val, dict):
+                values.append(val)
+            for a in alts:
+                if a not in values:
+                    values.append(a)
+            return values if values else None
+
+        def _observed_summary(nid: str) -> str:
+            n = node_map.get(nid, {})
+            val = n.get("value")
+            name = n.get("name", nid)
+            if isinstance(val, dict):
+                return f"{name}={val}"
+            return f"{name}={val}"
+
+        cpts: Dict[str, Dict] = {}
+        for nid in node_map:
+            values = _values_for(nid)
+            if not values:
+                continue
+
+            all_pids = parents.get(nid, [])
+            discrete_pids = [p for p in all_pids if not _is_continuous(p)]
+            continuous_pids = [p for p in all_pids if _is_continuous(p)]
+
+            # Build observed context string from continuous parents
+            observed_context = ""
+            if continuous_pids:
+                parts = [_observed_summary(p) for p in continuous_pids]
+                observed_context = "; ".join(parts)
+
+            # Build CPT over discrete parents only
+            parent_values = {pid: _values_for(pid) for pid in discrete_pids}
+            # Drop parents whose values we cannot enumerate
+            discrete_pids = [p for p in discrete_pids if parent_values.get(p)]
+
+            prob = 1.0 / len(values)
+            table: Dict[str, Dict[str, float]] = {}
+
+            if discrete_pids:
+                combos = list(_it.product(*(parent_values[p] for p in discrete_pids)))
+                for combo in combos:
+                    key = ",".join(
+                        f"{p}={v}" for p, v in zip(discrete_pids, combo)
+                    )
+                    table[key] = {str(v): prob for v in values}
+            else:
+                table["*"] = {str(v): prob for v in values}
+
+            entry: Dict[str, Any] = {
+                "values": [str(v) for v in values],
+                "parents": discrete_pids,
+                "cpt": table,
+            }
+            if observed_context:
+                entry["observed_context"] = observed_context
+
+            cpts[nid] = entry
+        return cpts
 
 
 class GPT4oDAGClient(DAGClient):
@@ -882,6 +984,134 @@ Return JSON only:"""
                 original_outcome=None, counterfactual_outcome=None, effect_direction="unknown",
                 confidence=0.0, reasoning="Parse error", affected_paths=paths)
 
+    def infer_cpts(
+        self,
+        nodes: List[Dict],
+        edges: List[Dict],
+        scenario_context: str,
+    ) -> Dict[str, Dict]:
+        """
+        Infer CPTs using GPT-4o, conditioning on observed continuous parents.
+
+        Continuous parents (ego_state, agent_state, environmental) are passed
+        as observed evidence in the prompt so the LLM can use physical intuition.
+        Only discrete parents appear as conditioning variables in the CPT rows.
+        """
+        _CONTINUOUS = {"ego_state", "agent_state", "environmental"}
+        node_map = {n["id"]: n for n in nodes}
+
+        # Build parent map
+        parents: Dict[str, List[str]] = {}
+        for e in edges:
+            parents.setdefault(e["child"], []).append(e["parent"])
+
+        # Classify nodes
+        def _is_continuous(nid: str) -> bool:
+            return node_map.get(nid, {}).get("type", "") in _CONTINUOUS
+
+        def _values_for(nid: str) -> Optional[List[str]]:
+            n = node_map.get(nid, {})
+            alts = n.get("metadata", {}).get("alternatives", [])
+            val = n.get("value")
+            values = []
+            if val is not None and not isinstance(val, dict):
+                values.append(str(val))
+            for a in alts:
+                s = str(a)
+                if s not in values:
+                    values.append(s)
+            return values if values else None
+
+        # Build per-node CPT requests
+        node_requests = []
+        for nid, n in node_map.items():
+            values = _values_for(nid)
+            if not values:
+                continue
+            all_pids = parents.get(nid, [])
+            discrete_pids = [p for p in all_pids if not _is_continuous(p)]
+            continuous_pids = [p for p in all_pids if _is_continuous(p)]
+
+            obs_parts = []
+            for cp in continuous_pids:
+                cn = node_map.get(cp, {})
+                obs_parts.append(f"{cn.get('name', cp)} = {cn.get('value')}")
+
+            discrete_parent_info = []
+            for dp in discrete_pids:
+                dp_vals = _values_for(dp)
+                discrete_parent_info.append({
+                    "parent_id": dp,
+                    "parent_name": node_map.get(dp, {}).get("name", dp),
+                    "values": dp_vals or [],
+                })
+
+            node_requests.append({
+                "node_id": nid,
+                "node_name": n.get("name", nid),
+                "values": values,
+                "discrete_parents": discrete_parent_info,
+                "observed_continuous_context": "; ".join(obs_parts) if obs_parts else "none",
+            })
+
+        if not node_requests:
+            return {}
+
+        system = """You are a Bayesian network expert for autonomous driving scenarios.
+Given a list of DISCRETE nodes and their parents, produce conditional probability tables (CPTs).
+
+IMPORTANT:
+- Continuous parents (ego speed, heading, agent positions) have ALREADY been observed.
+  Their observed values are given as context. Use your physical intuition about driving
+  to estimate probabilities conditioned on those observed values.
+- Only DISCRETE parents appear as conditioning variables in the CPT rows.
+- For each combination of discrete parent values, provide P(node | parents).
+- Probabilities for each row MUST sum to 1.0.
+- Use "*" as the key when a node has NO discrete parents (marginal distribution).
+
+Return ONLY JSON:
+{
+  "cpts": [
+    {
+      "node_id": "...",
+      "values": ["val1", "val2"],
+      "parents": ["discrete_parent_id"],
+      "observed_context": "ego speed = 15.96 m/s; ...",
+      "cpt": {
+        "discrete_parent_id=val_a": {"val1": 0.7, "val2": 0.3},
+        "discrete_parent_id=val_b": {"val1": 0.4, "val2": 0.6}
+      }
+    }
+  ]
+}"""
+
+        user = f"""Scenario context: {scenario_context}
+
+Nodes requiring CPTs:
+{json.dumps(node_requests, indent=2)}
+
+Use your physical intuition about driving to assign realistic probabilities.
+Return JSON only:"""
+
+        logger.info(f"GPT-4o CPT inference: {len(node_requests)} nodes")
+        resp = self._call(system, user)
+        try:
+            if "```json" in resp:
+                resp = resp.split("```json")[1].split("```")[0]
+            elif "```" in resp:
+                resp = resp.split("```")[1].split("```")[0]
+            parsed = json.loads(resp.strip())
+            cpts = {}
+            for item in parsed.get("cpts", []):
+                node_id = item.get("node_id")
+                if node_id:
+                    cpts[node_id] = item
+            logger.info(f"Parsed CPTs for {len(cpts)} nodes")
+            return cpts
+        except Exception:
+            logger.error(f"Failed to parse CPT response: {resp}")
+            return {}
+
 
 # =============================================================================
 # Grounded DAG Constructor
@@ -901,7 +1131,8 @@ class GroundedDAGConstructor:
         self.client = client
     
     def construct(self, scenario_features: Any, trajectory: Optional[np.ndarray] = None,
-                  other_agents: Optional[List[Dict]] = None, scenario_id: str = "") -> ScenarioDAG:
+                  other_agents: Optional[List[Dict]] = None, scenario_id: str = "",
+                  compute_cpts: bool = False) -> ScenarioDAG:
         """
         Construct a grounded DAG.
         
@@ -927,9 +1158,10 @@ class GroundedDAGConstructor:
         
         # Layer 2: Outcome node
         dag.add_node(DAGNode(
-            id="collision_outcome", name="Collision Outcome", 
+            id="collision_outcome", name="Collision Outcome",
             node_type=NodeType.OUTCOME, layer=2,
-            description="Whether collision occurs or is avoided"))
+            description="Whether collision occurs or is avoided",
+            metadata={"alternatives": ["collision_avoided", "collision_possible"]}))
         
         # Build node list for LLM
         nodes_for_llm = [n.to_dict() for n in dag.nodes.values()]
@@ -953,6 +1185,14 @@ class GroundedDAGConstructor:
         
         # Ensure connectivity: all layer 1 nodes connect to outcome
         self._ensure_connectivity(dag)
+
+        # Optional: infer CPTs for discrete nodes
+        if compute_cpts:
+            edge_dicts = [e.to_dict() for e in dag.edges]
+            cpt_map = self.client.infer_cpts(nodes_for_llm, edge_dicts, context)
+            for node_id, cpt in cpt_map.items():
+                if node_id in dag.nodes:
+                    dag.nodes[node_id].metadata["cpt"] = cpt
         
         dag.metadata["llm_reasoning"] = f"Edges inferred between {len(dag.nodes)} grounded nodes"
         logger.info(f"Constructed DAG with {len(dag.nodes)} nodes and {len(dag.edges)} edges")

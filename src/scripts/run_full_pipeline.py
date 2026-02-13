@@ -128,6 +128,7 @@ def import_dag_components():
     from counter_bmt.dag_visualization import (
         visualize_dag,
         export_dag_to_dot,
+        export_dag_to_html,
         print_dag_summary,
     )
     return {
@@ -144,6 +145,7 @@ def import_dag_components():
         'TimestampedImage': TimestampedImage,
         'visualize_dag': visualize_dag,
         'export_dag_to_dot': export_dag_to_dot,
+        'export_dag_to_html': export_dag_to_html,
         'print_dag_summary': print_dag_summary,
     }
 
@@ -453,6 +455,7 @@ def stage_3_dag_construction(
     stage2_result: Dict,
     dag_client,
     output_dir: Path,
+    compute_cpts: bool = False,
 ) -> Dict:
     """
     Stage 3: Construct grounded causal DAG and enumerate interventions.
@@ -468,6 +471,7 @@ def stage_3_dag_construction(
     GroundedDAGConstructor = dag_comps['GroundedDAGConstructor']
     visualize_dag = dag_comps['visualize_dag']
     export_dag_to_dot = dag_comps['export_dag_to_dot']
+    export_dag_to_html = dag_comps['export_dag_to_html']
     print_dag_summary = dag_comps['print_dag_summary']
     
     trajectory = stage1_result['trajectory']
@@ -477,7 +481,13 @@ def stage_3_dag_construction(
     
     # Construct DAG
     constructor = GroundedDAGConstructor(dag_client)
-    dag = constructor.construct(features, trajectory, other_agents, scenario_id)
+    dag = constructor.construct(
+        features,
+        trajectory,
+        other_agents,
+        scenario_id,
+        compute_cpts=compute_cpts,
+    )
     
     # Print summary
     print_dag_summary(dag)
@@ -505,6 +515,12 @@ def stage_3_dag_construction(
     
     dot_path = scenario_output_dir / "dag.dot"
     export_dag_to_dot(dag, dot_path)
+
+    html_path = scenario_output_dir / "dag.html"
+    export_dag_to_html(dag, html_path, title=f"Grounded DAG: {scenario_id}")
+
+    dag_json_path = scenario_output_dir / "dag.json"
+    dag_json_path.write_text(dag.to_json(indent=2))
     
     logger.info(f"Saved DAG visualization to {viz_path}")
     
@@ -514,6 +530,7 @@ def stage_3_dag_construction(
         'counterfactuals': counterfactuals,
         'viz_path': str(viz_path),
         'dot_path': str(dot_path),
+        'dag_json_path': str(dag_json_path),
     }
 
 
@@ -1763,6 +1780,11 @@ def run_full_pipeline(
     sequence_length: int = 0,
     speed_range: Optional[Tuple[float, float]] = None,
     vlm_debug: bool = False,
+    dag_only: bool = False,
+    dag_cpt: bool = False,
+    sample_dag: bool = False,
+    dag_samples: int = 5,
+    sample_rare: bool = False,
 ) -> Dict:
     """
     Run the complete CounterBMT pipeline.
@@ -1772,6 +1794,9 @@ def run_full_pipeline(
         intervention_diversity: Diversity level ("low", "medium", "high")
         sequence_length: Generate sequential interventions (0 = single only)
         speed_range: Optional (min, max) speed multipliers for interventions
+        sample_dag: Sample interventions from the Bayesian DAG (requires dag_cpt)
+        dag_samples: Number of samples to draw from DAG
+        sample_rare: Condition sampling on collision outcome (tail scenarios)
     """
     logger.info("\n" + "=" * 70)
     logger.info("CounterBMT Full Pipeline")
@@ -1833,7 +1858,13 @@ def run_full_pipeline(
         }
         
         # Stage 3: DAG construction
-        stage3 = stage_3_dag_construction(stage1, stage2, dag_client, output_dir)
+        stage3 = stage_3_dag_construction(
+            stage1,
+            stage2,
+            dag_client,
+            output_dir,
+            compute_cpts=dag_cpt,
+        )
         results['stages']['stage3'] = {
             'status': 'success',
             'n_nodes': len(stage3['dag'].nodes),
@@ -1852,44 +1883,133 @@ def run_full_pipeline(
                 'position': traj[0].tolist() if hasattr(traj[0], 'tolist') else list(traj[0])
             }
         
-        # Stage 4: Compile interventions with LLM planning
-        # Pass the VLM client for LLM-guided intervention phase planning
-        # Also pass full trajectory and VLM extractions for rich context
-        stage4 = stage_4_compile_interventions(
-            stage3, max_interventions,
-            bias_strength=bias_strength,
-            output_dir=scenario_output_dir,
-            llm_client=vlm_client if not use_mock else None,  # Use real LLM for planning
-            ego_state=ego_state,
-            use_llm_planning=not use_mock,  # Disable LLM planning in mock mode
-            trajectory=np.array(stage1['trajectory']) if stage1.get('trajectory') is not None else None,
-            maneuvers=stage2.get('maneuvers', []),
-            decisions=stage2.get('decisions', []),
-            intervention_diversity=intervention_diversity,
-            sequence_length=sequence_length,
-            speed_range=speed_range,
-        )
-        results['stages']['stage4'] = {
-            'status': 'success',
-            'n_compiled': len(stage4['compiled_interventions']),
-            'bias_strength': bias_strength,
-            'llm_planning_used': stage4.get('llm_planning_used', 0),
-        }
-        
-        # Stage 5: BMT generation (if checkpoint provided)
-        if bmt_checkpoint:
-            stage5 = stage_5_bmt_generation(
-                stage1, stage4, bmt_checkpoint, output_dir,
-                n_samples=n_samples, temperature=temperature
+        if dag_only:
+            logger.info("\n[Stopping after Stage 3: DAG-only mode]")
+            results['stages']['stage4'] = {'status': 'skipped', 'reason': 'dag_only'}
+            results['stages']['stage5'] = {'status': 'skipped', 'reason': 'dag_only'}
+        elif sample_dag and dag_cpt:
+            # ---- Bayesian DAG sampling path ----
+            logger.info("\n" + "=" * 60)
+            logger.info("STAGE 3b: Bayesian DAG Sampling")
+            logger.info("=" * 60)
+            logger.info(f"  Samples: {dag_samples}, Rare mode: {sample_rare}")
+
+            from counter_bmt.dag_sampler import DAGSampler, SampledInterventionBuilder
+
+            try:
+                sampler = DAGSampler(stage3['dag'])
+
+                if sample_rare:
+                    samples = sampler.sample_rare(n=dag_samples)
+                else:
+                    samples = sampler.sample_ancestral(n=dag_samples)
+
+                builder = SampledInterventionBuilder()
+                sampled_interventions = []
+                for i, s in enumerate(samples):
+                    intv_list = builder.build_interventions(s, stage3['dag'])
+                    logger.info(f"  Sample {i}: {s}")
+                    for intv in intv_list:
+                        logger.info(f"    -> {intv['variable']} = {intv['value']} (was {intv['original_value']})")
+                    sampled_interventions.append({
+                        "sample": s,
+                        "interventions": intv_list,
+                    })
+
+                # Save sampling results
+                import json as _json
+                sampling_path = scenario_output_dir / "dag_samples.json"
+                with open(sampling_path, "w") as f:
+                    _json.dump(sampled_interventions, f, indent=2, default=str)
+                logger.info(f"Saved {len(sampled_interventions)} DAG samples to {sampling_path}")
+
+                # Convert sampled interventions into the stage3 format so
+                # stage_4_compile_interventions can consume them
+                from counter_bmt.dag_constructor import Intervention
+                all_interventions = []
+                for si in sampled_interventions:
+                    for intv in si["interventions"]:
+                        all_interventions.append(Intervention(
+                            variable_id=intv["variable"],
+                            value=intv["value"],
+                            original_value=intv.get("original_value"),
+                            description=intv.get("description", ""),
+                            aggressiveness=intv.get("aggressiveness", "normal"),
+                            timestamp=intv.get("timestamp"),
+                        ))
+
+                # Override stage3 interventions with sampled ones
+                stage3['interventions'] = all_interventions
+
+                results['stages']['stage3b'] = {
+                    'status': 'success',
+                    'n_samples': len(samples),
+                    'n_interventions': len(all_interventions),
+                    'sample_rare': sample_rare,
+                }
+            except Exception as e:
+                logger.error(f"DAG sampling failed: {e}")
+                import traceback
+                traceback.print_exc()
+                results['stages']['stage3b'] = {
+                    'status': 'failed',
+                    'error': str(e),
+                }
+
+            # Stage 4: Compile the sampled interventions
+            stage4 = stage_4_compile_interventions(
+                stage3, max_interventions,
+                bias_strength=bias_strength,
+                output_dir=scenario_output_dir,
+                llm_client=vlm_client if not use_mock else None,
+                ego_state=ego_state,
+                use_llm_planning=not use_mock,
+                trajectory=np.array(stage1['trajectory']) if stage1.get('trajectory') is not None else None,
+                maneuvers=stage2.get('maneuvers', []),
+                decisions=stage2.get('decisions', []),
+                intervention_diversity=intervention_diversity,
+                sequence_length=sequence_length,
+                speed_range=speed_range,
             )
-            results['stages']['stage5'] = {
-                'status': stage5.get('status', 'success'),
-                'n_counterfactuals': len(stage5.get('counterfactual_results', [])),
-            }
-            results['generation_results'] = stage5
         else:
-            logger.info("\n[Skipping Stage 5: No BMT checkpoint provided]")
-            results['stages']['stage5'] = {'status': 'skipped', 'reason': 'no_checkpoint'}
+            # Stage 4: Compile interventions with LLM planning
+            # Pass the VLM client for LLM-guided intervention phase planning
+            # Also pass full trajectory and VLM extractions for rich context
+            stage4 = stage_4_compile_interventions(
+                stage3, max_interventions,
+                bias_strength=bias_strength,
+                output_dir=scenario_output_dir,
+                llm_client=vlm_client if not use_mock else None,  # Use real LLM for planning
+                ego_state=ego_state,
+                use_llm_planning=not use_mock,  # Disable LLM planning in mock mode
+                trajectory=np.array(stage1['trajectory']) if stage1.get('trajectory') is not None else None,
+                maneuvers=stage2.get('maneuvers', []),
+                decisions=stage2.get('decisions', []),
+                intervention_diversity=intervention_diversity,
+                sequence_length=sequence_length,
+                speed_range=speed_range,
+            )
+            results['stages']['stage4'] = {
+                'status': 'success',
+                'n_compiled': len(stage4['compiled_interventions']),
+                'bias_strength': bias_strength,
+                'llm_planning_used': stage4.get('llm_planning_used', 0),
+            }
+            
+            # Stage 5: BMT generation (if checkpoint provided)
+            if bmt_checkpoint:
+                stage5 = stage_5_bmt_generation(
+                    stage1, stage4, bmt_checkpoint, output_dir,
+                    n_samples=n_samples, temperature=temperature
+                )
+                results['stages']['stage5'] = {
+                    'status': stage5.get('status', 'success'),
+                    'n_counterfactuals': len(stage5.get('counterfactual_results', [])),
+                }
+                results['generation_results'] = stage5
+            else:
+                logger.info("\n[Skipping Stage 5: No BMT checkpoint provided]")
+                results['stages']['stage5'] = {'status': 'skipped', 'reason': 'no_checkpoint'}
         
         results['status'] = 'success'
         
@@ -2097,6 +2217,11 @@ def run_batch_pipeline(
     intervention_diversity: str = "medium",
     sequence_length: int = 0,
     speed_range: Optional[Tuple[float, float]] = None,
+    dag_only: bool = False,
+    dag_cpt: bool = False,
+    sample_dag: bool = False,
+    dag_samples: int = 5,
+    sample_rare: bool = False,
 ) -> int:
     """
     Run the CounterBMT pipeline on multiple scenarios in batch mode.
@@ -2204,10 +2329,15 @@ def run_batch_pipeline(
                 intervention_diversity=intervention_diversity,
                 sequence_length=sequence_length,
                 speed_range=speed_range,
+                dag_only=dag_only,
+                dag_cpt=dag_cpt,
+                sample_dag=sample_dag,
+                dag_samples=dag_samples,
+                sample_rare=sample_rare,
             )
             
             # Get generation results from stage 5
-            gen_results = result.get('generation_results', {})
+            gen_results = {} if dag_only else result.get('generation_results', {})
             
             scenario_summary = {
                 'index': scenario_idx,
@@ -2666,6 +2796,16 @@ def main():
                         help="Sampling temperature")
     parser.add_argument("--bias-strength", type=float, default=8.0,
                         help="Token bias strength for interventions (default: 8.0)")
+    parser.add_argument("--dag-only", action="store_true",
+                        help="Stop after DAG construction (no interventions/BMT)")
+    parser.add_argument("--dag-cpt", action="store_true",
+                        help="Infer CPTs for discrete nodes using LLM (PromptBN-style)")
+    parser.add_argument("--sample-dag", action="store_true",
+                        help="Sample interventions from the Bayesian DAG (requires --dag-cpt)")
+    parser.add_argument("--dag-samples", type=int, default=5,
+                        help="Number of intervention samples to draw from the DAG (default: 5)")
+    parser.add_argument("--sample-rare", action="store_true",
+                        help="Condition sampling on collision_possible (tail/rare scenarios)")
     
     # Intervention diversity and sequence arguments
     parser.add_argument("--intervention-diversity", type=str, default="medium",
@@ -2728,6 +2868,11 @@ def main():
             intervention_diversity=args.intervention_diversity,
             sequence_length=args.sequence_length,
             speed_range=parse_speed_range(args.speed_range),
+            dag_only=args.dag_only,
+            dag_cpt=args.dag_cpt,
+            sample_dag=args.sample_dag,
+            dag_samples=args.dag_samples,
+            sample_rare=args.sample_rare,
         )
     
     # Single scenario mode
@@ -2746,6 +2891,11 @@ def main():
         sequence_length=args.sequence_length,
         speed_range=parse_speed_range(args.speed_range),
         vlm_debug=args.vlm_debug,
+        dag_only=args.dag_only,
+        dag_cpt=args.dag_cpt,
+        sample_dag=args.sample_dag,
+        dag_samples=args.dag_samples,
+        sample_rare=args.sample_rare,
     )
     
     return 0 if results.get('status') == 'success' else 1
