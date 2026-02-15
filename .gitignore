@@ -10,6 +10,6 @@ wheels/
 *.egg-info
 .venv
 .venv-*
-data/
+/data/
 src/exp_converted/
 src/exp_waymo/
