@@ -471,6 +471,8 @@ def _evaluate(
     tokenizer: BidirectionalMotionTokenizer,
     default_token_id: int,
     rng: np.random.Generator,
+    output_dir: Path | None = None,
+    global_step: int = 0,
 ) -> Dict[str, float]:
     if len(val_indices) == 0:
         return {}
@@ -481,6 +483,8 @@ def _evaluate(
 
     metrics_list: List[Dict[str, float]] = []
     forward_metrics_list: List[Dict[str, float]] = []
+    forward_viz_saved = 0
+    viz_remaining = max(0, int(train_cfg.forward_eval.viz_max_scenarios))
     for idx_batch in val_batches:
         samples = [loader.load(int(i)) for i in idx_batch]
         prepared = _prepare_supervised_batch(
@@ -502,21 +506,27 @@ def _evaluate(
 
         if train_cfg.forward_eval.enabled:
             seed = int(rng.integers(low=0, high=2**31 - 1))
-            batch_forward_metrics = compute_forward_pass_metrics_for_batch(
+            batch_forward_metrics, batch_viz_saved = compute_forward_pass_metrics_for_batch(
                 model=model,
                 prepared_batch=prepared,
                 tokenizer=tokenizer,
                 skip_steps=train_cfg.skip_steps,
                 eval_cfg=train_cfg.forward_eval,
                 seed=seed,
+                output_dir=output_dir,
+                global_step=global_step,
+                max_visualizations=viz_remaining,
             )
             forward_metrics_list.extend(batch_forward_metrics)
+            forward_viz_saved += int(batch_viz_saved)
+            viz_remaining = max(0, viz_remaining - int(batch_viz_saved))
 
     merged = _mean_metrics(metrics_list)
     if forward_metrics_list:
         forward_avg = nanmean_metrics(forward_metrics_list)
         merged.update({f"forward/{k}": v for k, v in forward_avg.items()})
         merged["forward/scenario_count"] = float(len(forward_metrics_list))
+        merged["forward/visualizations_saved"] = float(forward_viz_saved)
 
     return merged
 
@@ -715,6 +725,8 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
                     tokenizer=tokenizer,
                     default_token_id=default_token_id,
                     rng=train_rng,
+                    output_dir=output_dir,
+                    global_step=global_step,
                 )
 
                 _write_jsonl(
@@ -778,6 +790,8 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         tokenizer=tokenizer,
         default_token_id=default_token_id,
         rng=train_rng,
+        output_dir=output_dir,
+        global_step=global_step,
     ) if len(val_indices) > 0 else {}
 
     final_ckpt = _save_checkpoint(

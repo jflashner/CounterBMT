@@ -428,7 +428,14 @@ if HAS_NNX:
                 # rel: [B,N,T,T,R] => [B*N,T,T,R]
                 rel_bn = rel.reshape(bsz * n_agents, t_steps, t_steps, rel.shape[-1])
                 rel_bias = self.a2t_rel_proj(rel_bn)
-            out = self.a2t_attn(q, q, rel_bias=rel_bias)
+
+            # Temporal causality mask:
+            # token at step t can only attend to [0..t]. This prevents future
+            # leakage during teacher-forcing and aligns training with rollout.
+            causal = jnp.tril(jnp.ones((t_steps, t_steps), dtype=bool))
+            causal = jnp.broadcast_to(causal[None, :, :], (bsz * n_agents, t_steps, t_steps))
+
+            out = self.a2t_attn(q, q, mask=causal, rel_bias=rel_bias)
             out = out.reshape(bsz, n_agents, t_steps, d_model)
             return jnp.transpose(out, (0, 2, 1, 3))
 

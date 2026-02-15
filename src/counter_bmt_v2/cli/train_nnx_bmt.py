@@ -87,6 +87,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forward-eval-temperature", type=float, default=1.0)
     parser.add_argument("--forward-eval-topp", type=float, default=0.95)
     parser.add_argument("--forward-eval-topk", type=int, default=5)
+    parser.add_argument(
+        "--no-forward-viz",
+        action="store_true",
+        help="disable saving rollout-vs-GT visualizations during eval",
+    )
+    parser.add_argument("--forward-viz-max-scenarios", type=int, default=2)
+    parser.add_argument("--forward-viz-max-agents", type=int, default=10)
 
     return parser.parse_args()
 
@@ -131,6 +138,9 @@ def main() -> int:
             temperature=float(args.forward_eval_temperature),
             topp=float(args.forward_eval_topp),
             topk=max(1, int(args.forward_eval_topk)),
+            save_visualizations=(not args.no_forward_viz),
+            viz_max_scenarios=max(0, int(args.forward_viz_max_scenarios)),
+            viz_max_agents=max(1, int(args.forward_viz_max_agents)),
         ),
     )
 

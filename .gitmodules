@@ -1,0 +1,6 @@
+[submodule "metadrive"]
+	path = metadrive
+	url = https://github.com/metadriverse/metadrive.git
+[submodule "scenarionet"]
+	path = scenarionet
+	url = https://github.com/metadriverse/scenarionet.git

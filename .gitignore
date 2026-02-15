@@ -1,4 +1,6 @@
 outputs/
+src/outputs/
+checkpoints/
 __pycache__/
 *.py[oc]
 .vscode/
@@ -7,6 +9,7 @@ dist/
 wheels/
 *.egg-info
 .venv
+.venv-*
 data/
 src/exp_converted/
 src/exp_waymo/

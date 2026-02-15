@@ -14,7 +14,8 @@ Paper alignment notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -60,11 +61,115 @@ class ForwardPassEvalConfig:
     # Circle approximation radius floor for collision checks.
     collision_radius_floor_m: float = 0.5
 
+    # Eval-time visualization controls.
+    save_visualizations: bool = True
+    viz_max_scenarios: int = 2
+    viz_max_agents: int = 10
+    viz_output_subdir: str = "forward_eval_viz"
+
 
 def _safe_mean(values: List[float]) -> float:
     if not values:
         return float("nan")
     return float(np.mean(np.asarray(values, dtype=np.float32)))
+
+
+def _sanitize_name(name: str) -> str:
+    safe = []
+    for ch in str(name):
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe).strip("_") or "scenario"
+
+
+def _save_rollout_vs_gt_plot(
+    *,
+    out_file: Path,
+    scenario_id: str,
+    gt_pos_tn2: np.ndarray,    # [T,N,2]
+    gt_valid_tn: np.ndarray,   # [T,N]
+    pred_pos_ktn2: np.ndarray, # [K,T,N,2]
+    max_agents: int,
+) -> bool:
+    """Save simple XY rollout-vs-GT plot for one scenario.
+
+    Uses best-SFDE mode among sampled trajectories.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return False
+
+    t_steps = gt_pos_tn2.shape[0]
+    n_agents = gt_pos_tn2.shape[1]
+    n_modes = pred_pos_ktn2.shape[0]
+    if n_modes <= 0 or t_steps <= 0 or n_agents <= 0:
+        return False
+
+    has_valid, _, last_idx = _first_last_valid_indices(gt_valid_tn)
+    valid_agents = np.where(has_valid)[0]
+    if valid_agents.size == 0:
+        return False
+
+    # Pick mode with minimum SFDE for this scenario.
+    fde_mode = []
+    for k in range(n_modes):
+        fde_vals = []
+        for n in valid_agents.tolist():
+            l = int(last_idx[n])
+            fde_vals.append(float(np.linalg.norm(pred_pos_ktn2[k, l, n] - gt_pos_tn2[l, n])))
+        fde_mode.append(_safe_mean(fde_vals))
+    best_mode = int(np.nanargmin(np.asarray(fde_mode, dtype=np.float32)))
+
+    # Keep SDC + most-observed agents.
+    valid_counts = np.sum(gt_valid_tn, axis=0)
+    rank = np.argsort(-valid_counts)
+    picked: List[int] = []
+    if n_agents > 0:
+        picked.append(0)
+    for idx in rank.tolist():
+        if idx in picked or not has_valid[idx]:
+            continue
+        picked.append(int(idx))
+        if len(picked) >= int(max_agents):
+            break
+
+    if not picked:
+        return False
+
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(1, 1, 1)
+    cmap = plt.get_cmap("tab20")
+
+    for i, n in enumerate(picked):
+        color = cmap(i % 20)
+        gt_mask = gt_valid_tn[:, n]
+        if np.any(gt_mask):
+            gt_xy = gt_pos_tn2[gt_mask, n, :]
+            label_gt = f"gt_sdc_{n}" if n == 0 else None
+            ax.plot(gt_xy[:, 0], gt_xy[:, 1], color=color, linewidth=1.8, alpha=0.9, label=label_gt)
+            ax.scatter(gt_xy[-1, 0], gt_xy[-1, 1], color=color, s=10, alpha=0.9)
+
+        pred_xy = pred_pos_ktn2[best_mode, :, n, :]
+        label_pred = f"pred_sdc_{n}" if n == 0 else None
+        ax.plot(pred_xy[:, 0], pred_xy[:, 1], linestyle="--", color=color, linewidth=1.4, alpha=0.85, label=label_pred)
+        ax.scatter(pred_xy[-1, 0], pred_xy[-1, 1], marker="x", color=color, s=14, alpha=0.9)
+
+    ax.set_title(f"Forward Eval Rollout vs GT | {scenario_id} | best_mode={best_mode}")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.grid(True, alpha=0.25)
+    ax.axis("equal")
+    if any("sdc" in (h.get_label() or "") for h in ax.get_lines()):
+        ax.legend(loc="best", fontsize=8)
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_file, dpi=130)
+    plt.close(fig)
+    return True
 
 
 def nanmean_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
@@ -470,12 +575,18 @@ def _compute_scenario_metrics(
     dt_chunk_s: float,
     sdc_index: int,
     cfg: ForwardPassEvalConfig,
+    rollout_start_valid_n: np.ndarray | None = None,  # [N] bool
 ) -> Dict[str, float]:
     """Compute Adv-BMT-style forward-pass metrics for one scenario."""
     n_mode, t_steps, n_agents, _ = pred_pos_ktn2.shape
 
     has_valid, first_idx, last_idx = _first_last_valid_indices(gt_valid_tn)
-    valid_agents = np.where(has_valid)[0]
+    all_valid_agents = np.where(has_valid)[0]
+    if rollout_start_valid_n is not None:
+        eval_mask = has_valid & np.asarray(rollout_start_valid_n, dtype=bool)
+    else:
+        eval_mask = has_valid
+    valid_agents = np.where(eval_mask)[0]
 
     error_ktn = np.linalg.norm(pred_pos_ktn2 - gt_pos_tn2[None, ...], axis=-1)  # [K,T,N]
 
@@ -502,6 +613,15 @@ def _compute_scenario_metrics(
         sfde_modes.append(_safe_mean(fde_vals))
         ssde_modes.append(_safe_mean(sde_vals))
         sade_modes.append(_safe_mean(ade_vals))
+
+    # Debug/diagnostic variant over all agents that have any valid transition.
+    sfde_all_modes: List[float] = []
+    for k in range(n_mode):
+        vals: List[float] = []
+        for n in all_valid_agents.tolist():
+            l = int(last_idx[n])
+            vals.append(float(error_ktn[k, l, n]))
+        sfde_all_modes.append(_safe_mean(vals))
 
     # Diversity metrics from Adv-BMT evaluator (FDD/ADD/SDD).
     fdd_vals: List[float] = []
@@ -562,6 +682,8 @@ def _compute_scenario_metrics(
     out = {
         "sfde_min": float(np.min(sfde_modes)) if sfde_modes else float("nan"),
         "sfde_avg": _safe_mean(sfde_modes),
+        "sfde_all_min": float(np.min(sfde_all_modes)) if sfde_all_modes else float("nan"),
+        "sfde_all_avg": _safe_mean(sfde_all_modes),
         "sade_min": float(np.min(sade_modes)) if sade_modes else float("nan"),
         "sade_avg": _safe_mean(sade_modes),
         "ssde_min": float(np.min(ssde_modes)) if ssde_modes else float("nan"),
@@ -590,6 +712,8 @@ def _compute_scenario_metrics(
             max_val=float(cfg.ttc_hist_max),
             num_bins=int(cfg.ttc_hist_bins),
         ),
+        "num_eval_agents": float(valid_agents.shape[0]),
+        "num_all_valid_agents": float(all_valid_agents.shape[0]),
     }
 
     out.update(
@@ -613,7 +737,10 @@ def compute_forward_pass_metrics_for_batch(
     skip_steps: int,
     eval_cfg: ForwardPassEvalConfig,
     seed: int,
-) -> List[Dict[str, float]]:
+    output_dir: Path | None = None,
+    global_step: int | None = None,
+    max_visualizations: int = 0,
+) -> Tuple[List[Dict[str, float]], int]:
     """Compute scenario-level forward-pass metrics for one validation batch.
 
     The rollout path is intentionally aligned with Adv-BMT evaluation intent:
@@ -621,7 +748,7 @@ def compute_forward_pass_metrics_for_batch(
     aggregation against the same scenario's ground-truth future trajectory.
     """
     if not eval_cfg.enabled:
-        return []
+        return [], 0
 
     model_inputs = prepared_batch["model_inputs"]
     raw = prepared_batch["raw_batch"]
@@ -634,7 +761,7 @@ def compute_forward_pass_metrics_for_batch(
     horizon = int(gt_action_valid_btn.shape[1])
 
     if horizon <= 0:
-        return []
+        return [], 0
 
     # Adv-BMT forward-pass eval samples K trajectory modes.
     n_mode = max(1, int(eval_cfg.num_modes))
@@ -706,22 +833,48 @@ def compute_forward_pass_metrics_for_batch(
     # Model does not currently predict valid-mask logits; use GT transition validity.
     pred_valid_kbtn = np.broadcast_to(gt_valid_btn[None, :, :, :], pred_speed_kbtn.shape)
 
+    scenario_ids = raw.get("scenario_ids", [f"scenario_{i}" for i in range(bsz)])
+    viz_saved = 0
+    viz_dir: Path | None = None
+    if (
+        eval_cfg.save_visualizations
+        and output_dir is not None
+        and global_step is not None
+        and max_visualizations > 0
+    ):
+        viz_dir = Path(output_dir) / str(eval_cfg.viz_output_subdir) / f"step_{int(global_step):07d}"
+
     per_scenario_metrics: List[Dict[str, float]] = []
     for b in range(bsz):
-        per_scenario_metrics.append(
-            _compute_scenario_metrics(
-                pred_pos_ktn2=pred_pos_kbtn2[:, b],
-                pred_vel_ktn2=pred_vel_kbtn2[:, b],
-                pred_speed_ktn=pred_speed_kbtn[:, b],
-                pred_valid_ktn=pred_valid_kbtn[:, b],
-                gt_pos_tn2=gt_pos_btn2[b],
-                gt_vel_tn2=gt_vel_btn2[b],
-                gt_valid_tn=gt_valid_btn[b],
-                agent_shape_n3=agent_shape_bn3[b],
-                dt_chunk_s=float(max(dt_chunk_b[b], 1e-6)),
-                sdc_index=0,
-                cfg=eval_cfg,
-            )
+        rollout_start_valid_n = agent_valid_btn[b, init_t]
+        scenario_metrics = _compute_scenario_metrics(
+            pred_pos_ktn2=pred_pos_kbtn2[:, b],
+            pred_vel_ktn2=pred_vel_kbtn2[:, b],
+            pred_speed_ktn=pred_speed_kbtn[:, b],
+            pred_valid_ktn=pred_valid_kbtn[:, b],
+            gt_pos_tn2=gt_pos_btn2[b],
+            gt_vel_tn2=gt_vel_btn2[b],
+            gt_valid_tn=gt_valid_btn[b],
+            agent_shape_n3=agent_shape_bn3[b],
+            dt_chunk_s=float(max(dt_chunk_b[b], 1e-6)),
+            sdc_index=0,
+            cfg=eval_cfg,
+            rollout_start_valid_n=rollout_start_valid_n,
         )
+        per_scenario_metrics.append(scenario_metrics)
 
-    return per_scenario_metrics
+        if viz_dir is not None and viz_saved < int(max_visualizations):
+            sid = str(scenario_ids[b]) if b < len(scenario_ids) else f"scenario_{b}"
+            file_name = f"{_sanitize_name(sid)}.png"
+            saved = _save_rollout_vs_gt_plot(
+                out_file=viz_dir / file_name,
+                scenario_id=sid,
+                gt_pos_tn2=gt_pos_btn2[b],
+                gt_valid_tn=gt_valid_btn[b],
+                pred_pos_ktn2=pred_pos_kbtn2[:, b],
+                max_agents=int(max(1, eval_cfg.viz_max_agents)),
+            )
+            if saved:
+                viz_saved += 1
+
+    return per_scenario_metrics, viz_saved
