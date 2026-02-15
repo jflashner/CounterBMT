@@ -5,6 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
+
+# Allow `python src/counter_bmt_v2/cli/train_nnx_bmt.py ...` without requiring
+# editable install; this keeps local no-admin workflows simple.
+if __package__ is None or __package__ == "":
+    src_root = Path(__file__).resolve().parents[2]
+    src_root_str = str(src_root)
+    if src_root_str not in sys.path:
+        sys.path.insert(0, src_root_str)
 
 from counter_bmt_v2.training import ForwardPassEvalConfig, SupervisedTrainConfig, train_supervised
 

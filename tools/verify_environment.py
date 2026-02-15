@@ -30,6 +30,8 @@ REQ_FILES = {
 
 CRITICAL_IMPORTS = {
     "v2": [
+        "counter_bmt_v2",
+        "counter_bmt_v2.data",
         "numpy",
         "jax",
         "flax",
