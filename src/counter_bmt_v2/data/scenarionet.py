@@ -562,6 +562,10 @@ def collate_nnx_scene_samples(
 
     This collate is intentionally explicit and framework-agnostic. Conversion to
     JAX arrays happens in the training step, not in data loading.
+
+    If a sample has more timesteps than ``max_time_steps``, we truncate to the
+    leading ``max_time_steps`` frames. This keeps full-length WOMD (20s) scenes
+    compatible with Adv-BMT-style 91-step training runs.
     """
 
     if not samples:
@@ -611,26 +615,34 @@ def collate_nnx_scene_samples(
         dt_s[b] = float(s.dt_s)
 
         n = s.agent_position_xy.shape[1]
-        t = s.agent_position_xy.shape[0]
+        t_raw = s.agent_position_xy.shape[0]
         m = s.map_feature.shape[0]
         v = s.map_feature.shape[1] if s.map_feature.ndim == 3 else 0
         l = s.traffic_light_feature.shape[1]
 
-        if n > n_max or t > t_max or m > m_max or v > v_max or l > l_max:
+        if n > n_max or m > m_max or v > v_max or l > l_max:
             raise ValueError(
                 "Sample exceeds requested collate shape: "
-                f"sample(T={t},N={n},M={m},V={v},L={l}) vs "
+                f"sample(T={t_raw},N={n},M={m},V={v},L={l}) vs "
                 f"collate(T={t_max},N={n_max},M={m_max},V={v_max},L={l_max})"
             )
+
+        # Truncate long time horizons (e.g., 198-199 steps from full WOMD 20s
+        # conversion) to keep fixed-shape batches for Adv-BMT-style training.
+        t = min(t_raw, t_max)
+        if t == 0:
+            current_time_index[b] = 0
+        else:
+            current_time_index[b] = min(int(s.current_time_index), t - 1)
 
         agent_ids[b, :n] = s.agent_ids
         agent_type_ids[b, :n] = s.agent_type_ids
         agent_shape[b, :n] = s.agent_shape
 
-        agent_pos[b, :t, :n] = s.agent_position_xy
-        agent_heading[b, :t, :n] = s.agent_heading
-        agent_vel[b, :t, :n] = s.agent_velocity_xy
-        agent_valid[b, :t, :n] = s.agent_valid_mask
+        agent_pos[b, :t, :n] = s.agent_position_xy[:t]
+        agent_heading[b, :t, :n] = s.agent_heading[:t]
+        agent_vel[b, :t, :n] = s.agent_velocity_xy[:t]
+        agent_valid[b, :t, :n] = s.agent_valid_mask[:t]
 
         if m > 0 and v > 0:
             map_feature[b, :m, :v] = s.map_feature
@@ -638,8 +650,8 @@ def collate_nnx_scene_samples(
             map_pos[b, :m] = s.map_position
 
         if l > 0:
-            tl_feature[b, :t, :l] = s.traffic_light_feature
-            tl_valid[b, :t, :l] = s.traffic_light_valid_mask
+            tl_feature[b, :t, :l] = s.traffic_light_feature[:t]
+            tl_valid[b, :t, :l] = s.traffic_light_valid_mask[:t]
             tl_pos[b, :l] = s.traffic_light_position
 
     return {
