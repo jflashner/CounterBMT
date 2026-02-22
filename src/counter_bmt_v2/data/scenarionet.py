@@ -100,8 +100,10 @@ class ScenarioNetNNXLoader:
         files = list(data_dir.glob("sd_*.pkl"))
         files += list(data_dir.glob("_*/*.pkl"))
         files = [p for p in files if p.name.startswith("sd_") and p.suffix == ".pkl"]
-        # Deterministic ordering for reproducible train/val splits.
-        return sorted(set(files), key=lambda p: p.name)
+        # Deterministic ordering for reproducible train/val splits/manifests.
+        # Sort by stable path relative to the dataset root, not basename only.
+        unique = sorted(set(files), key=lambda p: p.as_posix())
+        return sorted(unique, key=lambda p: p.relative_to(data_dir).as_posix())
 
     def __len__(self) -> int:
         return len(self._files)

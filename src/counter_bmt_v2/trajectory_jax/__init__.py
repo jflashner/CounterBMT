@@ -2,6 +2,8 @@ from .model import JaxTrajectoryGenerator, TrajectoryGenerator
 from .nnx_bmt import (
     BMTTokenSpaceConfig,
     NNXBMTConfig,
+    NNXDecoderParityConfig,
+    NNXRelationParityConfig,
     NNXSceneEncoderConfig,
     BidirectionalMotionTokenizer,
     HAS_NNX,
@@ -13,7 +15,19 @@ from .nnx_bmt import (
     masked_token_accuracy,
     sample_motion_tokens,
 )
-from .presets import paper_like_full_config, paper_like_small_config
+from .tokenizer_parity import AdvBMTParityTokenizer, ParityTokenBatch, ParityTokenizerConfig
+from .presets import midgpt_parity_config, paper_like_full_config, paper_like_small_config
+from .relation_parity import (
+    RelationBundleConfig,
+    build_relation_bundle,
+    build_scene_token_relation_inputs_np,
+    cal_polygon_contour,
+    compute_relation_parity,
+    compute_relation_simple_parity,
+    pairwise_mask,
+    pairwise_relative_diff,
+    rotate_local,
+)
 from .unified_stub import UnifiedBackboneOutput, UnifiedLLMTrajectoryBackboneStub
 
 __all__ = [
@@ -21,6 +35,8 @@ __all__ = [
     "TrajectoryGenerator",
     "BMTTokenSpaceConfig",
     "NNXBMTConfig",
+    "NNXDecoderParityConfig",
+    "NNXRelationParityConfig",
     "NNXSceneEncoderConfig",
     "BidirectionalMotionTokenizer",
     "HAS_NNX",
@@ -31,8 +47,21 @@ __all__ = [
     "masked_token_accuracy",
     "sample_motion_tokens",
     "autoregressive_token_rollout",
+    "AdvBMTParityTokenizer",
+    "ParityTokenBatch",
+    "ParityTokenizerConfig",
     "paper_like_small_config",
     "paper_like_full_config",
+    "midgpt_parity_config",
+    "RelationBundleConfig",
+    "pairwise_mask",
+    "pairwise_relative_diff",
+    "rotate_local",
+    "cal_polygon_contour",
+    "compute_relation_simple_parity",
+    "compute_relation_parity",
+    "build_scene_token_relation_inputs_np",
+    "build_relation_bundle",
     "UnifiedBackboneOutput",
     "UnifiedLLMTrajectoryBackboneStub",
 ]

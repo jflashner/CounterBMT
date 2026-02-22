@@ -21,14 +21,21 @@ from counter_bmt_v2.training import ForwardPassEvalConfig, SupervisedTrainConfig
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train NNX Bidirectional Motion Transformer (CounterBMT v2)")
 
-    parser.add_argument("--data-dir", type=str, required=True, help="ScenarioNet dataset directory")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="",
+        help="Fallback ScenarioNet dataset directory (used when explicit split dirs are not provided)",
+    )
+    parser.add_argument("--train-data-dir", type=str, default="", help="Explicit ScenarioNet train dataset directory")
+    parser.add_argument("--val-data-dir", type=str, default="", help="Explicit ScenarioNet val dataset directory")
     parser.add_argument("--output-dir", type=str, default="outputs/counter_bmt_v2_training")
 
     parser.add_argument(
         "--model-preset",
         type=str,
         default="paper_like_small",
-        choices=["paper_like_small", "paper_like_full"],
+        choices=["paper_like_small", "paper_like_full", "midgpt_parity"],
         help="model preset",
     )
 
@@ -52,10 +59,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--reverse-prob", type=float, default=0.5)
     parser.add_argument("--skip-steps", type=int, default=5)
+    parser.add_argument(
+        "--tokenizer-mode",
+        type=str,
+        default="paper_simple",
+        choices=["paper_simple", "adv_bmt_parity"],
+        help="tokenizer implementation mode",
+    )
 
     parser.add_argument("--train-fraction", type=float, default=0.95)
+    parser.add_argument("--sample-interval-training", type=int, default=1)
+    parser.add_argument("--sample-interval-test", type=int, default=1)
     parser.add_argument("--num-train-scenarios", type=int, default=-1)
     parser.add_argument("--num-val-scenarios", type=int, default=-1)
+    parser.add_argument(
+        "--strict-91-steps",
+        action="store_true",
+        help="fail fast if any selected scenario horizon is not exactly 91 steps",
+    )
 
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--eval-batches", type=int, default=10)
@@ -80,6 +101,24 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="checkpoint .pkl path or checkpoint directory containing last.pkl",
     )
+    parser.add_argument(
+        "--relation-debug-dump-dir",
+        type=str,
+        default="",
+        help="optional directory for parity relation debug dumps",
+    )
+    parser.add_argument(
+        "--relation-debug-dump-every",
+        type=int,
+        default=0,
+        help="save relation debug bundle every N train steps (0 disables)",
+    )
+    parser.add_argument(
+        "--relation-debug-max-batches",
+        type=int,
+        default=1,
+        help="max number of relation debug bundles to save",
+    )
 
     parser.add_argument(
         "--no-forward-eval",
@@ -103,6 +142,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--forward-viz-max-scenarios", type=int, default=2)
     parser.add_argument("--forward-viz-max-agents", type=int, default=10)
+    parser.add_argument(
+        "--forward-export-artifacts",
+        dest="forward_export_artifacts",
+        action="store_true",
+        help="export per-scenario forward-eval artifacts for offline strict parity checks",
+    )
+    parser.add_argument(
+        "--no-forward-export-artifacts",
+        dest="forward_export_artifacts",
+        action="store_false",
+        help="disable forward-eval artifact export",
+    )
+    parser.set_defaults(forward_export_artifacts=True)
+    parser.add_argument(
+        "--forward-artifact-max-scenarios",
+        type=int,
+        default=32,
+        help="maximum number of scenarios to export per eval call",
+    )
+    parser.add_argument(
+        "--forward-artifact-subdir",
+        type=str,
+        default="forward_eval_artifacts",
+        help="output subdirectory for forward-eval artifact exports",
+    )
 
     return parser.parse_args()
 
@@ -110,8 +174,26 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    train_data_dir = str(args.train_data_dir).strip()
+    val_data_dir = str(args.val_data_dir).strip()
+    data_dir = str(args.data_dir).strip()
+
+    has_explicit_split = bool(train_data_dir or val_data_dir)
+    if has_explicit_split:
+        if not train_data_dir or not val_data_dir:
+            raise ValueError("Both --train-data-dir and --val-data-dir must be provided when using explicit split dirs")
+    elif not data_dir:
+        raise ValueError("Provide --data-dir (fallback) or both --train-data-dir and --val-data-dir")
+
+    if int(args.sample_interval_training) < 1:
+        raise ValueError(f"--sample-interval-training must be >= 1, got {args.sample_interval_training}")
+    if int(args.sample_interval_test) < 1:
+        raise ValueError(f"--sample-interval-test must be >= 1, got {args.sample_interval_test}")
+
     cfg = SupervisedTrainConfig(
-        data_dir=args.data_dir,
+        data_dir=data_dir,
+        train_data_dir=train_data_dir,
+        val_data_dir=val_data_dir,
         output_dir=args.output_dir,
         model_preset=args.model_preset,
         seed=args.seed,
@@ -126,9 +208,13 @@ def main() -> int:
         mode=args.mode,
         reverse_probability=args.reverse_prob,
         skip_steps=args.skip_steps,
+        tokenizer_mode=args.tokenizer_mode,
         train_fraction=args.train_fraction,
+        sample_interval_training=int(args.sample_interval_training),
+        sample_interval_test=int(args.sample_interval_test),
         num_train_scenarios=(None if args.num_train_scenarios <= 0 else args.num_train_scenarios),
         num_val_scenarios=(None if args.num_val_scenarios <= 0 else args.num_val_scenarios),
+        strict_91_steps=bool(args.strict_91_steps),
         eval_every_steps=args.eval_every,
         eval_batches=args.eval_batches,
         log_every_steps=args.log_every,
@@ -140,6 +226,9 @@ def main() -> int:
         max_traffic_lights=args.max_traffic_lights,
         center_to_map=(not args.no_center_to_map),
         resume_checkpoint=args.resume_checkpoint,
+        relation_debug_dump_dir=args.relation_debug_dump_dir,
+        relation_debug_dump_every_steps=max(0, int(args.relation_debug_dump_every)),
+        relation_debug_max_batches=max(0, int(args.relation_debug_max_batches)),
         forward_eval=ForwardPassEvalConfig(
             enabled=(not args.no_forward_eval),
             num_modes=max(1, int(args.forward_eval_modes)),
@@ -147,6 +236,10 @@ def main() -> int:
             temperature=float(args.forward_eval_temperature),
             topp=float(args.forward_eval_topp),
             topk=max(1, int(args.forward_eval_topk)),
+            metric_scope="core_realism",
+            export_artifacts=bool(args.forward_export_artifacts),
+            artifact_output_subdir=str(args.forward_artifact_subdir),
+            artifact_max_scenarios_per_eval=max(0, int(args.forward_artifact_max_scenarios)),
             save_visualizations=(not args.no_forward_viz),
             viz_max_scenarios=max(0, int(args.forward_viz_max_scenarios)),
             viz_max_agents=max(1, int(args.forward_viz_max_agents)),

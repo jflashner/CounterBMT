@@ -15,6 +15,7 @@ import json
 import math
 import pickle
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
@@ -33,10 +34,16 @@ from .forward_metrics import (
     nanmean_metrics,
 )
 from counter_bmt_v2.trajectory_jax import (
+    AdvBMTParityTokenizer,
     BidirectionalMotionTokenizer,
     NNXBMTConfig,
     NNXBidirectionalMotionTransformer,
+    ParityTokenizerConfig,
+    RelationBundleConfig,
+    build_relation_bundle,
+    build_scene_token_relation_inputs_np,
     cross_entropy_token_loss,
+    midgpt_parity_config,
     masked_token_accuracy,
     paper_like_full_config,
     paper_like_small_config,
@@ -44,14 +51,17 @@ from counter_bmt_v2.trajectory_jax import (
 
 
 ModeType = Literal["forward", "reverse", "mixed"]
-PresetType = Literal["paper_like_small", "paper_like_full"]
+PresetType = Literal["paper_like_small", "paper_like_full", "midgpt_parity"]
+TokenizerModeType = Literal["paper_simple", "adv_bmt_parity"]
 
 
 @dataclass
 class SupervisedTrainConfig:
     """Configuration for NNX supervised motion-token training."""
 
-    data_dir: str
+    data_dir: str = ""
+    train_data_dir: str = ""
+    val_data_dir: str = ""
     output_dir: str = "outputs/counter_bmt_v2_training"
 
     model_preset: PresetType = "paper_like_small"
@@ -69,14 +79,18 @@ class SupervisedTrainConfig:
 
     mode: ModeType = "mixed"
     reverse_probability: float = 0.5
+    tokenizer_mode: TokenizerModeType = "paper_simple"
 
     # Raw ScenarioNet is typically 10Hz. Adv-BMT token chunks are 0.5s by default.
     # Using skip_steps=5 approximates the same temporal chunking.
     skip_steps: int = 5
 
     train_fraction: float = 0.95
+    sample_interval_training: int = 1
+    sample_interval_test: int = 1
     num_train_scenarios: Optional[int] = None
     num_val_scenarios: Optional[int] = None
+    strict_91_steps: bool = False
 
     eval_every_steps: int = 100
     eval_batches: int = 10
@@ -92,12 +106,17 @@ class SupervisedTrainConfig:
 
     center_to_map: bool = True
     resume_checkpoint: str = ""
+    relation_debug_dump_dir: str = ""
+    relation_debug_dump_every_steps: int = 0
+    relation_debug_max_batches: int = 1
 
     # Scenario-level forward-pass evaluator (Adv-BMT-style metrics).
     forward_eval: ForwardPassEvalConfig = field(default_factory=ForwardPassEvalConfig)
 
 
 def _resolve_model_preset(name: PresetType) -> NNXBMTConfig:
+    if name == "midgpt_parity":
+        return midgpt_parity_config()
     if name == "paper_like_full":
         return paper_like_full_config()
     return paper_like_small_config()
@@ -123,7 +142,37 @@ def _compute_reverse_indicator(mode: ModeType, batch_size: int, rng: np.random.G
     return (rng.random(batch_size) < p).astype(np.int32)
 
 
-def _tokenize_motion_targets(
+def _prepare_modeled_agent_ids(
+    *,
+    agent_ids: np.ndarray,
+    max_agent_id: int,
+    randomize: bool,
+    is_training: bool,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Legacy-like modeled-agent ID preprocessing for embedding lookup."""
+    ids = np.asarray(agent_ids, dtype=np.int32).copy()
+    max_id = max(2, int(max_agent_id))
+
+    # Clip invalid/out-of-range IDs to final bucket.
+    invalid = (ids < 0) | (ids >= max_id)
+    ids[invalid] = max_id - 1
+
+    if not randomize or not is_training:
+        return ids
+
+    bsz, n_agents = ids.shape
+    out = np.full_like(ids, fill_value=max_id - 1, dtype=np.int32)
+    num_samples = min(n_agents, max_id)
+    for b in range(bsz):
+        perm = rng.choice(max_id, size=num_samples, replace=False).astype(np.int32)
+        out[b, :num_samples] = perm
+
+    out[invalid] = max_id - 1
+    return out
+
+
+def _tokenize_motion_targets_simple(
     batch: Dict[str, Any],
     *,
     tokenizer: BidirectionalMotionTokenizer,
@@ -210,12 +259,126 @@ def _tokenize_motion_targets(
     }
 
 
+def _slice_batch_dict(batch: Dict[str, Any], indices: np.ndarray) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in batch.items():
+        if isinstance(v, np.ndarray) and v.shape[:1] == (batch["agent_ids"].shape[0],):
+            out[k] = v[indices]
+        elif isinstance(v, list) and len(v) == batch["agent_ids"].shape[0]:
+            out[k] = [v[int(i)] for i in indices.tolist()]
+        else:
+            out[k] = v
+    return out
+
+
+def _tokenize_motion_targets_parity(
+    batch: Dict[str, Any],
+    *,
+    tokenizer: AdvBMTParityTokenizer,
+    mode: ModeType,
+    reverse_probability: float,
+    rng: np.random.Generator,
+) -> Dict[str, np.ndarray]:
+    bsz = int(np.asarray(batch["agent_ids"]).shape[0])
+    reverse_indicator = _compute_reverse_indicator(
+        mode=mode,
+        batch_size=bsz,
+        rng=rng,
+        reverse_prob=reverse_probability,
+    ).astype(np.int32)
+
+    if bsz == 0:
+        raise ValueError("Empty batch in parity tokenization")
+
+    seq_len = max(1, int(np.ceil(batch["agent_position_xy"].shape[1] / float(tokenizer.parity_cfg.num_skipped_steps))))
+    n_agents = int(batch["agent_position_xy"].shape[2])
+    sample_steps = np.arange(
+        0,
+        int(batch["agent_position_xy"].shape[1]),
+        int(tokenizer.parity_cfg.num_skipped_steps),
+        dtype=np.int32,
+    )
+
+    prev = np.full((bsz, seq_len, n_agents), tokenizer.PAD_MODEL_ID, dtype=np.int32)
+    targets = np.full((bsz, seq_len, n_agents), tokenizer.default_token_id, dtype=np.int32)
+    target_mask = np.zeros((bsz, seq_len, n_agents), dtype=np.float32)
+    motion = np.zeros((bsz, seq_len, n_agents, 2), dtype=np.float32)
+    input_mask = np.zeros((bsz, seq_len, n_agents), dtype=bool)
+    modeled_agent_delta = np.zeros((bsz, seq_len, n_agents, 2), dtype=np.float32)
+
+    forward_idx = np.where(reverse_indicator == 0)[0]
+    reverse_idx = np.where(reverse_indicator == 1)[0]
+
+    def _assign(indices: np.ndarray, backward: bool) -> None:
+        nonlocal sample_steps
+        if indices.size == 0:
+            return
+        sub = _slice_batch_dict(batch, indices)
+        tok = tokenizer.tokenize_batch(sub, backward_prediction=backward)
+        sample_steps = tok.sample_steps
+        seq = tok.prev_token_ids.shape[1]
+        prev[indices, :seq] = tok.prev_token_ids
+        targets[indices, :seq] = tok.targets
+        target_mask[indices, :seq] = tok.target_mask
+        motion[indices, :seq] = tok.continuous_motion
+        input_mask[indices, :seq] = tok.input_mask
+        modeled_agent_delta[indices, :seq] = tok.modeled_agent_delta
+
+    _assign(forward_idx, backward=False)
+    _assign(reverse_idx, backward=True)
+
+    return {
+        "prev_token_ids": prev.astype(np.int32),
+        "targets": targets.astype(np.int32),
+        "target_mask": target_mask.astype(np.float32),
+        "continuous_motion": motion.astype(np.float32),
+        "input_mask": input_mask.astype(bool),
+        "modeled_agent_delta": modeled_agent_delta.astype(np.float32),
+        "reverse_indicator": reverse_indicator.astype(np.int32),
+        "sample_steps": sample_steps.astype(np.int32),
+    }
+
+
+def _tokenize_motion_targets(
+    batch: Dict[str, Any],
+    *,
+    tokenizer: Any,
+    tokenizer_mode: TokenizerModeType,
+    skip_steps: int,
+    mode: ModeType,
+    reverse_probability: float,
+    rng: np.random.Generator,
+) -> Dict[str, np.ndarray]:
+    if tokenizer_mode == "adv_bmt_parity":
+        if not isinstance(tokenizer, AdvBMTParityTokenizer):
+            raise TypeError("adv_bmt_parity mode requires AdvBMTParityTokenizer")
+        return _tokenize_motion_targets_parity(
+            batch,
+            tokenizer=tokenizer,
+            mode=mode,
+            reverse_probability=reverse_probability,
+            rng=rng,
+        )
+    if not isinstance(tokenizer, BidirectionalMotionTokenizer):
+        raise TypeError("paper_simple mode requires BidirectionalMotionTokenizer")
+    return _tokenize_motion_targets_simple(
+        batch,
+        tokenizer=tokenizer,
+        skip_steps=skip_steps,
+        mode=mode,
+        reverse_probability=reverse_probability,
+        rng=rng,
+    )
+
+
 def _prepare_supervised_batch(
     samples: Sequence[NNXBMTSceneSample],
     *,
     train_cfg: SupervisedTrainConfig,
-    tokenizer: BidirectionalMotionTokenizer,
+    model_cfg: NNXBMTConfig,
+    tokenizer: Any,
     rng: np.random.Generator,
+    is_training: bool,
 ) -> Dict[str, Any]:
     batch = collate_nnx_scene_samples(
         samples,
@@ -229,9 +392,18 @@ def _prepare_supervised_batch(
     token_batch = _tokenize_motion_targets(
         batch,
         tokenizer=tokenizer,
+        tokenizer_mode=train_cfg.tokenizer_mode,
         skip_steps=train_cfg.skip_steps,
         mode=train_cfg.mode,
         reverse_probability=train_cfg.reverse_probability,
+        rng=rng,
+    )
+
+    modeled_agent_ids = _prepare_modeled_agent_ids(
+        agent_ids=np.asarray(batch["agent_ids"], dtype=np.int32),
+        max_agent_id=int(model_cfg.max_agent_id),
+        randomize=bool(model_cfg.decoder.randomize_agent_id),
+        is_training=bool(is_training),
         rng=rng,
     )
 
@@ -239,7 +411,7 @@ def _prepare_supervised_batch(
         "prev_token_ids": jnp.asarray(token_batch["prev_token_ids"], dtype=jnp.int32),
         "agent_type_ids": jnp.asarray(batch["agent_type_ids"], dtype=jnp.int32),
         "agent_shape": jnp.asarray(batch["agent_shape"], dtype=jnp.float32),
-        "agent_ids": jnp.asarray(batch["agent_ids"], dtype=jnp.int32),
+        "agent_ids": jnp.asarray(modeled_agent_ids, dtype=jnp.int32),
         "continuous_motion": jnp.asarray(token_batch["continuous_motion"], dtype=jnp.float32),
         "reverse_indicator": jnp.asarray(token_batch["reverse_indicator"], dtype=jnp.int32),
         "scene_map_feature": jnp.asarray(batch["map_feature"], dtype=jnp.float32),
@@ -249,6 +421,58 @@ def _prepare_supervised_batch(
         "scene_tl_valid_mask": jnp.asarray(batch["traffic_light_valid_mask"], dtype=bool),
         "scene_tl_position": jnp.asarray(batch["traffic_light_position"], dtype=jnp.float32),
     }
+    if "input_mask" in token_batch:
+        model_inputs["input_action_valid_mask"] = jnp.asarray(token_batch["input_mask"], dtype=bool)
+    if "modeled_agent_delta" in token_batch:
+        model_inputs["modeled_agent_delta"] = jnp.asarray(token_batch["modeled_agent_delta"], dtype=jnp.float32)
+
+    if bool(model_cfg.decoder.enabled):
+        scene_inputs = build_scene_token_relation_inputs_np(
+            map_feature=np.asarray(batch["map_feature"], dtype=np.float32),
+            map_feature_valid_mask=np.asarray(batch["map_feature_valid_mask"], dtype=bool),
+            map_position=np.asarray(batch["map_position"], dtype=np.float32),
+            traffic_light_feature=np.asarray(batch["traffic_light_feature"], dtype=np.float32),
+            traffic_light_valid_mask=np.asarray(batch["traffic_light_valid_mask"], dtype=bool),
+            traffic_light_position=np.asarray(batch["traffic_light_position"], dtype=np.float32),
+            remove_traffic_light_state=bool(model_cfg.relation.remove_traffic_light_state),
+            heading_placeholder=float(model_cfg.relation.heading_placeholder),
+        )
+        relation_cfg = RelationBundleConfig(
+            simple_relation=bool(model_cfg.relation.simple_relation),
+            per_contour_point_relation=bool(model_cfg.relation.per_contour_point_relation),
+            include_contour=True,
+            heading_placeholder=float(model_cfg.relation.heading_placeholder),
+            s2s_knn=model_cfg.relation.s2s_knn,
+            s2s_distance=model_cfg.relation.s2s_distance,
+            a2s_knn=model_cfg.relation.a2s_knn,
+            a2s_distance=model_cfg.relation.a2s_distance,
+            a2a_knn=model_cfg.relation.a2a_knn,
+            a2a_distance=model_cfg.relation.a2a_distance,
+            remove_traffic_light_state=bool(model_cfg.relation.remove_traffic_light_state),
+            strict_non_agent_relation=False,
+        )
+        relation_bundle = build_relation_bundle(
+            agent_position_xy=np.asarray(batch["agent_position_xy"], dtype=np.float32),
+            agent_heading=np.asarray(batch["agent_heading"], dtype=np.float32),
+            agent_valid_mask=np.asarray(batch["agent_valid_mask"], dtype=bool),
+            decoder_valid_mask=np.asarray(token_batch["input_mask"], dtype=bool),
+            agent_shape=np.asarray(batch["agent_shape"], dtype=np.float32),
+            sample_steps=np.asarray(token_batch["sample_steps"], dtype=np.int32),
+            scene_position=scene_inputs["scene_position"],
+            scene_heading=scene_inputs["scene_heading"],
+            scene_valid_mask=scene_inputs["scene_valid_mask"],
+            cfg=relation_cfg,
+        )
+        model_inputs.update(
+            {
+                "a2a_rel": jnp.asarray(relation_bundle["a2a_rel_feat"], dtype=jnp.float32),
+                "a2t_rel": jnp.asarray(relation_bundle["a2t_rel_feat"], dtype=jnp.float32),
+                "a2s_rel": jnp.asarray(relation_bundle["a2s_rel_feat"], dtype=jnp.float32),
+                "a2a_mask": jnp.asarray(relation_bundle["a2a_mask"], dtype=bool),
+                "a2t_mask": jnp.asarray(relation_bundle["a2t_mask"], dtype=bool),
+                "a2s_mask": jnp.asarray(relation_bundle["a2s_mask"], dtype=bool),
+            }
+        )
 
     targets = jnp.asarray(token_batch["targets"], dtype=jnp.int32)
     target_mask = jnp.asarray(token_batch["target_mask"], dtype=jnp.float32)
@@ -263,6 +487,92 @@ def _prepare_supervised_batch(
         "raw_batch": batch,
         "sample_steps": token_batch["sample_steps"],
     }
+
+
+def _maybe_dump_relation_debug(
+    *,
+    prepared: Dict[str, Any],
+    train_cfg: SupervisedTrainConfig,
+    model_cfg: NNXBMTConfig,
+    step: int,
+    phase: str,
+    dump_counter: int,
+) -> int:
+    dump_dir_cfg = str(train_cfg.relation_debug_dump_dir or "").strip()
+    dump_every = int(train_cfg.relation_debug_dump_every_steps)
+    dump_max = max(0, int(train_cfg.relation_debug_max_batches))
+    if not dump_dir_cfg or dump_every <= 0 or dump_max <= 0:
+        return dump_counter
+    if dump_counter >= dump_max:
+        return dump_counter
+    if int(step) % dump_every != 0:
+        return dump_counter
+
+    raw = prepared["raw_batch"]
+    scene_inputs = build_scene_token_relation_inputs_np(
+        map_feature=np.asarray(raw["map_feature"], dtype=np.float32),
+        map_feature_valid_mask=np.asarray(raw["map_feature_valid_mask"], dtype=bool),
+        map_position=np.asarray(raw["map_position"], dtype=np.float32),
+        traffic_light_feature=np.asarray(raw["traffic_light_feature"], dtype=np.float32),
+        traffic_light_valid_mask=np.asarray(raw["traffic_light_valid_mask"], dtype=bool),
+        traffic_light_position=np.asarray(raw["traffic_light_position"], dtype=np.float32),
+        remove_traffic_light_state=bool(model_cfg.relation.remove_traffic_light_state),
+        heading_placeholder=float(model_cfg.relation.heading_placeholder),
+    )
+
+    bundle_cfg = RelationBundleConfig(
+        simple_relation=bool(model_cfg.relation.simple_relation),
+        per_contour_point_relation=bool(model_cfg.relation.per_contour_point_relation),
+        include_contour=True,
+        heading_placeholder=float(model_cfg.relation.heading_placeholder),
+        s2s_knn=model_cfg.relation.s2s_knn,
+        s2s_distance=model_cfg.relation.s2s_distance,
+        a2s_knn=model_cfg.relation.a2s_knn,
+        a2s_distance=model_cfg.relation.a2s_distance,
+        a2a_knn=model_cfg.relation.a2a_knn,
+        a2a_distance=model_cfg.relation.a2a_distance,
+        remove_traffic_light_state=bool(model_cfg.relation.remove_traffic_light_state),
+    )
+
+    bundle = build_relation_bundle(
+        agent_position_xy=np.asarray(raw["agent_position_xy"], dtype=np.float32),
+        agent_heading=np.asarray(raw["agent_heading"], dtype=np.float32),
+        agent_valid_mask=np.asarray(raw["agent_valid_mask"], dtype=bool),
+        decoder_valid_mask=np.asarray(prepared["model_inputs"]["input_action_valid_mask"], dtype=bool),
+        agent_shape=np.asarray(raw["agent_shape"], dtype=np.float32),
+        sample_steps=np.asarray(prepared["sample_steps"], dtype=np.int32),
+        scene_position=scene_inputs["scene_position"],
+        scene_heading=scene_inputs["scene_heading"],
+        scene_valid_mask=scene_inputs["scene_valid_mask"],
+        cfg=bundle_cfg,
+    )
+
+    dump_dir = Path(dump_dir_cfg)
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{phase}_step_{int(step):07d}_dump_{int(dump_counter):03d}"
+    npz_path = dump_dir / f"{stem}.npz"
+    json_path = dump_dir / f"{stem}.json"
+
+    np.savez_compressed(
+        npz_path,
+        scenario_ids=np.asarray(raw["scenario_ids"], dtype=object),
+        sample_steps=np.asarray(prepared["sample_steps"], dtype=np.int32),
+        scene_position=scene_inputs["scene_position"],
+        scene_heading=scene_inputs["scene_heading"],
+        scene_valid_mask=scene_inputs["scene_valid_mask"],
+        **bundle,
+    )
+    meta = {
+        "phase": str(phase),
+        "step": int(step),
+        "scenario_ids": [str(s) for s in raw["scenario_ids"]],
+        "tokenizer_mode": str(train_cfg.tokenizer_mode),
+        "model_preset": str(train_cfg.model_preset),
+        "paths": {"npz": str(npz_path)},
+    }
+    json_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"Saved relation debug dump: {npz_path}")
+    return dump_counter + 1
 
 
 def _compute_metric_dict(
@@ -411,6 +721,204 @@ def _iter_minibatches(indices: np.ndarray, batch_size: int) -> Sequence[np.ndarr
     return batches
 
 
+def _apply_interval(indices: np.ndarray, interval: int) -> np.ndarray:
+    interval = int(interval)
+    if interval < 1:
+        raise ValueError(f"interval must be >= 1, got: {interval}")
+    return np.asarray(indices, dtype=np.int32)[::interval]
+
+
+def _resolve_data_sources(
+    train_cfg: SupervisedTrainConfig,
+) -> Tuple[str, ScenarioNetNNXLoader, np.ndarray, ScenarioNetNNXLoader, np.ndarray, Dict[str, str]]:
+    common_loader_kwargs = dict(
+        max_agents=train_cfg.max_agents,
+        max_map_features=train_cfg.max_map_features,
+        max_vectors_per_map_feature=train_cfg.max_vectors_per_map_feature,
+        max_traffic_lights=train_cfg.max_traffic_lights,
+        center_to_map=train_cfg.center_to_map,
+    )
+
+    train_data_dir = str(train_cfg.train_data_dir).strip()
+    val_data_dir = str(train_cfg.val_data_dir).strip()
+    data_dir = str(train_cfg.data_dir).strip()
+
+    use_explicit_split = bool(train_data_dir or val_data_dir)
+    if use_explicit_split:
+        if not train_data_dir or not val_data_dir:
+            raise ValueError("Both train_data_dir and val_data_dir must be set when using explicit split mode")
+        train_loader = ScenarioNetNNXLoader(data_dir=train_data_dir, **common_loader_kwargs)
+        val_loader = ScenarioNetNNXLoader(data_dir=val_data_dir, **common_loader_kwargs)
+        train_indices = np.arange(len(train_loader), dtype=np.int32)
+        val_indices = np.arange(len(val_loader), dtype=np.int32)
+        split_mode = "explicit_split"
+    else:
+        if not data_dir:
+            raise ValueError("Provide data_dir (fallback split) or both train_data_dir and val_data_dir")
+        loader = ScenarioNetNNXLoader(data_dir=data_dir, **common_loader_kwargs)
+        all_indices = np.arange(len(loader), dtype=np.int32)
+
+        split_rng = np.random.default_rng(train_cfg.seed)
+        split_rng.shuffle(all_indices)
+
+        split = int(round(len(all_indices) * float(np.clip(train_cfg.train_fraction, 0.0, 1.0))))
+        split = max(1, min(split, len(all_indices)))
+        train_indices = all_indices[:split]
+        val_indices = all_indices[split:]
+
+        train_loader = loader
+        val_loader = loader
+        split_mode = "fallback_split"
+
+    train_indices = _apply_interval(train_indices, int(train_cfg.sample_interval_training))
+    val_indices = _apply_interval(val_indices, int(train_cfg.sample_interval_test))
+
+    if train_cfg.num_train_scenarios is not None:
+        train_indices = train_indices[: int(train_cfg.num_train_scenarios)]
+    if train_cfg.num_val_scenarios is not None:
+        val_indices = val_indices[: int(train_cfg.num_val_scenarios)]
+
+    resolved_dirs = {
+        "train_data_dir": str(train_loader.data_dir),
+        "val_data_dir": str(val_loader.data_dir),
+        "fallback_data_dir": data_dir,
+    }
+    return split_mode, train_loader, train_indices, val_loader, val_indices, resolved_dirs
+
+
+def _safe_relative_path(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except Exception:
+        return path.as_posix()
+
+
+def _prescan_indices(
+    *,
+    loader: ScenarioNetNNXLoader,
+    indices: np.ndarray,
+    split_name: str,
+    strict_91_steps: bool,
+    max_time_steps: int,
+) -> Tuple[np.ndarray, List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    kept: List[int] = []
+    manifests: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    trunc_candidates: List[Dict[str, Any]] = []
+
+    root = Path(loader.data_dir)
+    for idx in np.asarray(indices, dtype=np.int32):
+        i = int(idx)
+        file_path = loader.files[i]
+        file_name = file_path.name
+        rel_path = _safe_relative_path(file_path, root)
+        base_record = {
+            "split": split_name,
+            "loader_index": i,
+            "file_name": file_name,
+            "relative_path": rel_path,
+        }
+
+        try:
+            sample = loader.load(i)
+        except Exception as exc:
+            rec = dict(base_record)
+            rec["scenario_id"] = ""
+            rec["raw_time_steps"] = -1
+            rec["reason"] = "load_error"
+            rec["error"] = str(exc)
+            skipped.append(rec)
+            continue
+
+        scenario_id = str(sample.scenario_id)
+        raw_t = int(sample.agent_position_xy.shape[0])
+        has_map = (
+            sample.map_feature.shape[0] > 0
+            and sample.map_feature_valid_mask.size > 0
+            and bool(np.any(sample.map_feature_valid_mask))
+        )
+
+        if not has_map:
+            rec = dict(base_record)
+            rec["scenario_id"] = scenario_id
+            rec["raw_time_steps"] = raw_t
+            rec["reason"] = "no_map_feature"
+            skipped.append(rec)
+            continue
+
+        if strict_91_steps and raw_t != 91:
+            rec = dict(base_record)
+            rec["scenario_id"] = scenario_id
+            rec["raw_time_steps"] = raw_t
+            rec["reason"] = "strict_91_mismatch"
+            rec["expected_time_steps"] = 91
+            skipped.append(rec)
+            continue
+
+        kept.append(i)
+        manifests.append(
+            {
+                "rank": len(kept) - 1,
+                "loader_index": i,
+                "scenario_id": scenario_id,
+                "file_name": file_name,
+                "relative_path": rel_path,
+                "raw_time_steps": raw_t,
+            }
+        )
+
+        if raw_t > int(max_time_steps):
+            trunc_candidates.append(
+                {
+                    "split": split_name,
+                    "loader_index": i,
+                    "scenario_id": scenario_id,
+                    "file_name": file_name,
+                    "relative_path": rel_path,
+                    "raw_time_steps": raw_t,
+                    "max_time_steps": int(max_time_steps),
+                }
+            )
+
+    return np.asarray(kept, dtype=np.int32), manifests, skipped, trunc_candidates
+
+
+def _write_split_artifacts(
+    *,
+    output_dir: Path,
+    train_manifest: Sequence[Dict[str, Any]],
+    val_manifest: Sequence[Dict[str, Any]],
+    skipped_records: Sequence[Dict[str, Any]],
+    truncation_report: Dict[str, Any],
+) -> Dict[str, str]:
+    manifest_dir = output_dir / "manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+
+    train_manifest_path = manifest_dir / "train_manifest.json"
+    val_manifest_path = manifest_dir / "val_manifest.json"
+    train_ids_path = manifest_dir / "train_ids.txt"
+    val_ids_path = manifest_dir / "val_ids.txt"
+    skipped_path = manifest_dir / "skipped_scenarios.json"
+    trunc_path = manifest_dir / "truncation_report.json"
+
+    train_manifest_path.write_text(json.dumps(list(train_manifest), indent=2), encoding="utf-8")
+    val_manifest_path.write_text(json.dumps(list(val_manifest), indent=2), encoding="utf-8")
+    train_ids_path.write_text("\n".join(str(x["scenario_id"]) for x in train_manifest) + ("\n" if train_manifest else ""), encoding="utf-8")
+    val_ids_path.write_text("\n".join(str(x["scenario_id"]) for x in val_manifest) + ("\n" if val_manifest else ""), encoding="utf-8")
+    skipped_path.write_text(json.dumps(list(skipped_records), indent=2), encoding="utf-8")
+    trunc_path.write_text(json.dumps(truncation_report, indent=2), encoding="utf-8")
+
+    return {
+        "manifest_dir": str(manifest_dir),
+        "train_manifest": str(train_manifest_path),
+        "val_manifest": str(val_manifest_path),
+        "train_ids": str(train_ids_path),
+        "val_ids": str(val_ids_path),
+        "skipped_scenarios": str(skipped_path),
+        "truncation_report": str(trunc_path),
+    }
+
+
 def _save_checkpoint(
     *,
     output_dir: Path,
@@ -465,10 +973,11 @@ def _load_checkpoint(
 def _evaluate(
     *,
     model: NNXBidirectionalMotionTransformer,
+    model_cfg: NNXBMTConfig,
     loader: ScenarioNetNNXLoader,
     val_indices: np.ndarray,
     train_cfg: SupervisedTrainConfig,
-    tokenizer: BidirectionalMotionTokenizer,
+    tokenizer: Any,
     default_token_id: int,
     rng: np.random.Generator,
     output_dir: Path | None = None,
@@ -484,14 +993,18 @@ def _evaluate(
     metrics_list: List[Dict[str, float]] = []
     forward_metrics_list: List[Dict[str, float]] = []
     forward_viz_saved = 0
+    forward_artifact_saved = 0
     viz_remaining = max(0, int(train_cfg.forward_eval.viz_max_scenarios))
+    artifact_remaining = max(0, int(train_cfg.forward_eval.artifact_max_scenarios_per_eval))
     for idx_batch in val_batches:
         samples = [loader.load(int(i)) for i in idx_batch]
         prepared = _prepare_supervised_batch(
             samples,
             train_cfg=train_cfg,
+            model_cfg=model_cfg,
             tokenizer=tokenizer,
             rng=rng,
+            is_training=False,
         )
 
         metrics = _eval_step(
@@ -506,7 +1019,7 @@ def _evaluate(
 
         if train_cfg.forward_eval.enabled:
             seed = int(rng.integers(low=0, high=2**31 - 1))
-            batch_forward_metrics, batch_viz_saved = compute_forward_pass_metrics_for_batch(
+            batch_forward_metrics, batch_viz_saved, batch_artifact_saved = compute_forward_pass_metrics_for_batch(
                 model=model,
                 prepared_batch=prepared,
                 tokenizer=tokenizer,
@@ -516,17 +1029,21 @@ def _evaluate(
                 output_dir=output_dir,
                 global_step=global_step,
                 max_visualizations=viz_remaining,
+                max_artifacts=artifact_remaining,
             )
             forward_metrics_list.extend(batch_forward_metrics)
             forward_viz_saved += int(batch_viz_saved)
+            forward_artifact_saved += int(batch_artifact_saved)
             viz_remaining = max(0, viz_remaining - int(batch_viz_saved))
+            artifact_remaining = max(0, artifact_remaining - int(batch_artifact_saved))
 
     merged = _mean_metrics(metrics_list)
     if forward_metrics_list:
         forward_avg = nanmean_metrics(forward_metrics_list)
-        merged.update({f"forward/{k}": v for k, v in forward_avg.items()})
-        merged["forward/scenario_count"] = float(len(forward_metrics_list))
-        merged["forward/visualizations_saved"] = float(forward_viz_saved)
+        merged.update({f"forward_approx/{k}": v for k, v in forward_avg.items()})
+        merged["forward_approx/scenario_count"] = float(len(forward_metrics_list))
+        merged["forward_approx/visualizations_saved"] = float(forward_viz_saved)
+        merged["forward_approx/artifacts_saved"] = float(forward_artifact_saved)
 
     return merged
 
@@ -538,9 +1055,9 @@ def _write_jsonl(path: Path, record: Dict[str, Any]) -> None:
 
 
 def _print_metrics(prefix: str, step: int, metrics: Dict[str, float], lr: float, elapsed_s: float) -> None:
-    forward_sfde = metrics.get("forward/sfde_min", float("nan"))
-    forward_fdd = metrics.get("forward/fdd", float("nan"))
-    forward_vel_jsd = metrics.get("forward/vel_jsd", float("nan"))
+    forward_sfde = metrics.get("forward_approx/sfde_min", float("nan"))
+    forward_fdd = metrics.get("forward_approx/fdd", float("nan"))
+    forward_vel_jsd = metrics.get("forward_approx/vel_jsd", float("nan"))
     msg = (
         f"{prefix} step={step} "
         f"loss={metrics.get('total_loss', float('nan')):.4f} "
@@ -564,37 +1081,76 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
     """
     if train_cfg.mode not in ("forward", "reverse", "mixed"):
         raise ValueError(f"Unsupported mode: {train_cfg.mode}")
+    if train_cfg.tokenizer_mode not in ("paper_simple", "adv_bmt_parity"):
+        raise ValueError(f"Unsupported tokenizer_mode: {train_cfg.tokenizer_mode}")
 
     output_dir = Path(train_cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model_cfg = _resolve_model_preset(train_cfg.model_preset)
-    tokenizer = BidirectionalMotionTokenizer(model_cfg.token_space)
-    default_token_id = int(tokenizer.action_to_token(0.0, 0.0))
+    if int(train_cfg.sample_interval_training) < 1:
+        raise ValueError(f"sample_interval_training must be >= 1, got {train_cfg.sample_interval_training}")
+    if int(train_cfg.sample_interval_test) < 1:
+        raise ValueError(f"sample_interval_test must be >= 1, got {train_cfg.sample_interval_test}")
 
-    loader = ScenarioNetNNXLoader(
-        data_dir=train_cfg.data_dir,
-        max_agents=train_cfg.max_agents,
-        max_map_features=train_cfg.max_map_features,
-        max_vectors_per_map_feature=train_cfg.max_vectors_per_map_feature,
-        max_traffic_lights=train_cfg.max_traffic_lights,
-        center_to_map=train_cfg.center_to_map,
+    model_cfg = _resolve_model_preset(train_cfg.model_preset)
+    if train_cfg.tokenizer_mode == "adv_bmt_parity":
+        tokenizer = AdvBMTParityTokenizer(
+            ParityTokenizerConfig(num_skipped_steps=int(train_cfg.skip_steps))
+        )
+        default_token_id = int(tokenizer.default_token_id)
+    else:
+        tokenizer = BidirectionalMotionTokenizer(model_cfg.token_space)
+        default_token_id = int(tokenizer.action_to_token(0.0, 0.0))
+
+    split_mode, train_loader, train_indices, val_loader, val_indices, resolved_dirs = _resolve_data_sources(train_cfg)
+    train_size_pre_filter = int(len(train_indices))
+    val_size_pre_filter = int(len(val_indices))
+
+    train_indices, train_manifest, train_skipped, train_trunc_candidates = _prescan_indices(
+        loader=train_loader,
+        indices=train_indices,
+        split_name="train",
+        strict_91_steps=bool(train_cfg.strict_91_steps),
+        max_time_steps=int(train_cfg.max_time_steps),
+    )
+    val_indices, val_manifest, val_skipped, val_trunc_candidates = _prescan_indices(
+        loader=val_loader,
+        indices=val_indices,
+        split_name="val",
+        strict_91_steps=bool(train_cfg.strict_91_steps),
+        max_time_steps=int(train_cfg.max_time_steps),
     )
 
-    all_indices = np.arange(len(loader), dtype=np.int32)
-    split_rng = np.random.default_rng(train_cfg.seed)
-    split_rng.shuffle(all_indices)
+    skipped_records = [*train_skipped, *val_skipped]
+    strict_violations = [x for x in skipped_records if str(x.get("reason")) == "strict_91_mismatch"]
+    skip_reason_counts = dict(Counter(str(x.get("reason", "unknown")) for x in skipped_records))
 
-    split = int(round(len(all_indices) * float(np.clip(train_cfg.train_fraction, 0.0, 1.0))))
-    split = max(1, min(split, len(all_indices)))
+    truncation_report = {
+        "strict_91_steps": bool(train_cfg.strict_91_steps),
+        "max_time_steps": int(train_cfg.max_time_steps),
+        "train_selected_pre_filter": train_size_pre_filter,
+        "val_selected_pre_filter": val_size_pre_filter,
+        "train_selected_post_filter": int(len(train_indices)),
+        "val_selected_post_filter": int(len(val_indices)),
+        "num_skipped_total": int(len(skipped_records)),
+        "skip_reason_counts": skip_reason_counts,
+        "num_strict_91_mismatch": int(len(strict_violations)),
+        "num_truncated_candidates": int(len(train_trunc_candidates) + len(val_trunc_candidates)),
+        "truncated_candidates_examples": [*train_trunc_candidates, *val_trunc_candidates][:100],
+    }
+    artifact_paths = _write_split_artifacts(
+        output_dir=output_dir,
+        train_manifest=train_manifest,
+        val_manifest=val_manifest,
+        skipped_records=skipped_records,
+        truncation_report=truncation_report,
+    )
 
-    train_indices = all_indices[:split]
-    val_indices = all_indices[split:]
-
-    if train_cfg.num_train_scenarios is not None:
-        train_indices = train_indices[: int(train_cfg.num_train_scenarios)]
-    if train_cfg.num_val_scenarios is not None:
-        val_indices = val_indices[: int(train_cfg.num_val_scenarios)]
+    if bool(train_cfg.strict_91_steps) and strict_violations:
+        raise ValueError(
+            "strict_91_steps enabled but non-91 scenarios were found. "
+            f"See report: {artifact_paths['truncation_report']}"
+        )
 
     if len(train_indices) == 0:
         raise ValueError("No training scenarios available after split/config filtering")
@@ -646,11 +1202,32 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
     run_meta = {
         "train_cfg": asdict(train_cfg),
         "model_cfg": asdict(model_cfg),
+        "data_source_mode": split_mode,
+        "resolved_data_dirs": resolved_dirs,
+        "split_settings": {
+            "train_fraction": float(train_cfg.train_fraction),
+            "sample_interval_training": int(train_cfg.sample_interval_training),
+            "sample_interval_test": int(train_cfg.sample_interval_test),
+            "strict_91_steps": bool(train_cfg.strict_91_steps),
+        },
         "train_size": int(len(train_indices)),
         "val_size": int(len(val_indices)),
+        "train_size_pre_filter": train_size_pre_filter,
+        "val_size_pre_filter": val_size_pre_filter,
         "steps_per_epoch": int(steps_per_epoch),
         "total_steps_target": int(total_steps_target),
         "start_step": int(start_step),
+        "artifacts": artifact_paths,
+        "skip_reason_counts": skip_reason_counts,
+        "num_strict_91_mismatch": int(len(strict_violations)),
+        "num_truncated_candidates": int(len(train_trunc_candidates) + len(val_trunc_candidates)),
+        "forward_metric_namespaces": ["forward_approx"],
+        "forward_artifact_export": {
+            "enabled": bool(train_cfg.forward_eval.export_artifacts),
+            "subdir": str(train_cfg.forward_eval.artifact_output_subdir),
+            "max_scenarios_per_eval": int(train_cfg.forward_eval.artifact_max_scenarios_per_eval),
+            "metric_scope": str(train_cfg.forward_eval.metric_scope),
+        },
         "created_at": int(time.time()),
     }
 
@@ -664,6 +1241,7 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
 
     best_eval_loss = float("inf")
     best_eval_step = -1
+    relation_dump_counter = 0
 
     t0 = time.time()
     stop = False
@@ -674,12 +1252,22 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         train_rng.shuffle(epoch_indices)
 
         for idx_batch in _iter_minibatches(epoch_indices, train_cfg.batch_size):
-            samples = [loader.load(int(i)) for i in idx_batch]
+            samples = [train_loader.load(int(i)) for i in idx_batch]
             prepared = _prepare_supervised_batch(
                 samples,
                 train_cfg=train_cfg,
+                model_cfg=model_cfg,
                 tokenizer=tokenizer,
                 rng=train_rng,
+                is_training=True,
+            )
+            relation_dump_counter = _maybe_dump_relation_debug(
+                prepared=prepared,
+                train_cfg=train_cfg,
+                model_cfg=model_cfg,
+                step=global_step + 1,
+                phase="train",
+                dump_counter=relation_dump_counter,
             )
 
             metrics = _train_step(
@@ -719,7 +1307,8 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
             if len(val_indices) > 0 and global_step % max(1, train_cfg.eval_every_steps) == 0:
                 eval_metrics = _evaluate(
                     model=model,
-                    loader=loader,
+                    model_cfg=model_cfg,
+                    loader=val_loader,
                     val_indices=val_indices,
                     train_cfg=train_cfg,
                     tokenizer=tokenizer,
@@ -784,7 +1373,8 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
     # Final checkpoint and summary.
     final_metrics = _evaluate(
         model=model,
-        loader=loader,
+        model_cfg=model_cfg,
+        loader=val_loader,
         val_indices=val_indices,
         train_cfg=train_cfg,
         tokenizer=tokenizer,
@@ -808,9 +1398,13 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         "output_dir": str(output_dir),
         "final_checkpoint": str(final_ckpt),
         "total_steps": int(global_step),
+        "data_source_mode": split_mode,
+        "train_size": int(len(train_indices)),
+        "val_size": int(len(val_indices)),
         "best_eval_loss": float(best_eval_loss),
         "best_eval_step": int(best_eval_step),
         "final_eval_metrics": final_metrics,
+        "artifacts": artifact_paths,
         "elapsed_seconds": float(time.time() - t0),
     }
 

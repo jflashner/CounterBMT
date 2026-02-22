@@ -13,9 +13,10 @@ Paper alignment notes:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Literal, Tuple
 
 import numpy as np
 
@@ -61,11 +62,35 @@ class ForwardPassEvalConfig:
     # Circle approximation radius floor for collision checks.
     collision_radius_floor_m: float = 0.5
 
+    # P4 scope lock: only the core + realism metric family is tracked for parity.
+    metric_scope: Literal["core_realism"] = "core_realism"
+
+    # Export per-scenario eval artifacts for strict offline parity checks.
+    export_artifacts: bool = True
+    artifact_output_subdir: str = "forward_eval_artifacts"
+    artifact_max_scenarios_per_eval: int = 32
+
     # Eval-time visualization controls.
     save_visualizations: bool = True
     viz_max_scenarios: int = 2
     viz_max_agents: int = 10
     viz_output_subdir: str = "forward_eval_viz"
+
+
+CORE_REALISM_METRIC_KEYS: Tuple[str, ...] = (
+    "sfde_min",
+    "sfde_avg",
+    "sade_min",
+    "sade_avg",
+    "ssde_min",
+    "ssde_avg",
+    "fdd",
+    "add",
+    "sdd",
+    "vel_jsd",
+    "acc_jsd",
+    "ttc_jsd",
+)
 
 
 def _safe_mean(values: List[float]) -> float:
@@ -186,6 +211,69 @@ def nanmean_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
         else:
             out[k] = float(np.nanmean(vals))
     return out
+
+
+def _filter_core_realism_metrics(metrics: Dict[str, float]) -> Dict[str, float]:
+    return {k: float(metrics[k]) for k in CORE_REALISM_METRIC_KEYS if k in metrics}
+
+
+def _append_step_manifest(
+    *,
+    manifest_path: Path,
+    seed: int,
+    n_mode: int,
+    skip_steps: int,
+    cfg: ForwardPassEvalConfig,
+    scenario_records: List[Dict[str, Any]],
+) -> None:
+    payload: Dict[str, Any]
+    if manifest_path.is_file():
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+    else:
+        payload = {}
+
+    if not payload:
+        payload = {
+            "version": "p4_core_realism_v1",
+            "metric_scope": str(cfg.metric_scope),
+            "seed": int(seed),
+            "num_modes": int(n_mode),
+            "skip_steps": int(skip_steps),
+            "histogram_config": {
+                "vel": {
+                    "min": float(cfg.vel_hist_min),
+                    "max": float(cfg.vel_hist_max),
+                    "bins": int(cfg.vel_hist_bins),
+                },
+                "acc": {
+                    "min": float(cfg.acc_hist_min),
+                    "max": float(cfg.acc_hist_max),
+                    "bins": int(cfg.acc_hist_bins),
+                },
+                "ttc": {
+                    "min": float(cfg.ttc_hist_min),
+                    "max": float(cfg.ttc_hist_max),
+                    "bins": int(cfg.ttc_hist_bins),
+                },
+            },
+            "core_realism_metric_keys": list(CORE_REALISM_METRIC_KEYS),
+            "scenarios": [],
+        }
+
+    existing = {str(r.get("artifact_file", "")) for r in payload.get("scenarios", [])}
+    for rec in scenario_records:
+        af = str(rec.get("artifact_file", ""))
+        if af and af in existing:
+            continue
+        payload.setdefault("scenarios", []).append(rec)
+        if af:
+            existing.add(af)
+
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _histogram_jsd(
@@ -406,6 +494,13 @@ def _rollout_tokens_fixed_horizon(
     scene_tl_feature: jnp.ndarray | None = None,
     scene_tl_valid_mask: jnp.ndarray | None = None,
     scene_tl_position: jnp.ndarray | None = None,
+    a2a_rel: jnp.ndarray | None = None,
+    a2t_rel: jnp.ndarray | None = None,
+    a2s_rel: jnp.ndarray | None = None,
+    a2a_mask: jnp.ndarray | None = None,
+    a2t_mask: jnp.ndarray | None = None,
+    a2s_mask: jnp.ndarray | None = None,
+    modeled_agent_delta_init: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """Static-shape rollout for JIT-friendly forward-pass validation.
 
@@ -415,6 +510,13 @@ def _rollout_tokens_fixed_horizon(
     bsz, n_agents = agent_type_ids.shape
     token_seq = jnp.full((bsz, horizon_steps, n_agents), int(start_token_id), dtype=jnp.int32)
     motion_seq = jnp.zeros((bsz, horizon_steps, n_agents, 2), dtype=jnp.float32)
+    if modeled_agent_delta_init is None:
+        modeled_delta_seq = jnp.zeros((bsz, horizon_steps, n_agents, 2), dtype=jnp.float32)
+    else:
+        md = jnp.asarray(modeled_agent_delta_init, dtype=jnp.float32)
+        modeled_delta_seq = jnp.zeros((bsz, horizon_steps, n_agents, 2), dtype=jnp.float32)
+        take = int(min(horizon_steps, md.shape[1]))
+        modeled_delta_seq = modeled_delta_seq.at[:, :take, :, :].set(md[:, :take, :, :])
 
     model_kwargs = {
         "agent_type_ids": agent_type_ids,
@@ -434,8 +536,29 @@ def _rollout_tokens_fixed_horizon(
         model_kwargs["scene_tl_valid_mask"] = scene_tl_valid_mask
     if scene_tl_position is not None:
         model_kwargs["scene_tl_position"] = scene_tl_position
+    if a2a_rel is not None:
+        model_kwargs["a2a_rel"] = a2a_rel
+    if a2t_rel is not None:
+        model_kwargs["a2t_rel"] = a2t_rel
+    if a2s_rel is not None:
+        model_kwargs["a2s_rel"] = a2s_rel
 
     for t in range(horizon_steps):
+        prefix_t = (jnp.arange(horizon_steps, dtype=jnp.int32) <= int(t))[None, :, None]
+        model_kwargs["input_action_valid_mask"] = jnp.broadcast_to(prefix_t, (bsz, horizon_steps, n_agents))
+        model_kwargs["modeled_agent_delta"] = modeled_delta_seq
+
+        if a2a_mask is not None:
+            prefix_a2a = model_kwargs["input_action_valid_mask"][:, :, :, None]
+            model_kwargs["a2a_mask"] = jnp.logical_and(a2a_mask, prefix_a2a)
+        if a2s_mask is not None:
+            prefix_a2s = model_kwargs["input_action_valid_mask"][:, :, :, None]
+            model_kwargs["a2s_mask"] = jnp.logical_and(a2s_mask, prefix_a2s)
+        if a2t_mask is not None:
+            tmask = (jnp.arange(horizon_steps, dtype=jnp.int32) <= int(t))
+            causal_t = jnp.logical_and(tmask[None, None, :, None], tmask[None, None, None, :])
+            model_kwargs["a2t_mask"] = jnp.logical_and(a2t_mask, causal_t)
+
         logits = model(
             prev_token_ids=token_seq,
             continuous_motion=motion_seq,
@@ -454,6 +577,7 @@ def _rollout_tokens_fixed_horizon(
         token_seq = token_seq.at[:, t, :].set(next_tok)
         next_motion = jnp.take(action_table, next_tok, axis=0)  # [B,N,2]
         motion_seq = motion_seq.at[:, t, :, :].set(next_motion)
+        modeled_delta_seq = modeled_delta_seq.at[:, t, :, :].set(next_motion)
 
     return token_seq
 
@@ -576,6 +700,7 @@ def _compute_scenario_metrics(
     sdc_index: int,
     cfg: ForwardPassEvalConfig,
     rollout_start_valid_n: np.ndarray | None = None,  # [N] bool
+    include_collision_metrics: bool = True,
 ) -> Dict[str, float]:
     """Compute Adv-BMT-style forward-pass metrics for one scenario."""
     n_mode, t_steps, n_agents, _ = pred_pos_ktn2.shape
@@ -716,16 +841,17 @@ def _compute_scenario_metrics(
         "num_all_valid_agents": float(all_valid_agents.shape[0]),
     }
 
-    out.update(
-        _compute_collision_and_comfort_metrics(
-            pred_pos_ktn2=pred_pos_ktn2,
-            pred_speed_ktn=pred_speed_ktn,
-            pred_valid_ktn=pred_valid_ktn,
-            radii_n=radius,
-            sdc_index=int(sdc_index),
-            dt_chunk_s=float(dt_chunk_s),
+    if include_collision_metrics:
+        out.update(
+            _compute_collision_and_comfort_metrics(
+                pred_pos_ktn2=pred_pos_ktn2,
+                pred_speed_ktn=pred_speed_ktn,
+                pred_valid_ktn=pred_valid_ktn,
+                radii_n=radius,
+                sdc_index=int(sdc_index),
+                dt_chunk_s=float(dt_chunk_s),
+            )
         )
-    )
     return out
 
 
@@ -740,7 +866,8 @@ def compute_forward_pass_metrics_for_batch(
     output_dir: Path | None = None,
     global_step: int | None = None,
     max_visualizations: int = 0,
-) -> Tuple[List[Dict[str, float]], int]:
+    max_artifacts: int = 0,
+) -> Tuple[List[Dict[str, float]], int, int]:
     """Compute scenario-level forward-pass metrics for one validation batch.
 
     The rollout path is intentionally aligned with Adv-BMT evaluation intent:
@@ -748,7 +875,7 @@ def compute_forward_pass_metrics_for_batch(
     aggregation against the same scenario's ground-truth future trajectory.
     """
     if not eval_cfg.enabled:
-        return [], 0
+        return [], 0, 0
 
     model_inputs = prepared_batch["model_inputs"]
     raw = prepared_batch["raw_batch"]
@@ -758,10 +885,11 @@ def compute_forward_pass_metrics_for_batch(
 
     bsz = int(raw["agent_position_xy"].shape[0])
     n_agents = int(raw["agent_position_xy"].shape[2])
-    horizon = int(gt_action_valid_btn.shape[1])
-
-    if horizon <= 0:
-        return [], 0
+    horizon_from_mask = int(gt_action_valid_btn.shape[1])
+    horizon_from_steps = int(max(0, sample_steps.shape[0] - 1))
+    horizon_eval = int(min(horizon_from_mask, horizon_from_steps))
+    if horizon_eval <= 0:
+        return [], 0, 0
 
     # Adv-BMT forward-pass eval samples K trajectory modes.
     n_mode = max(1, int(eval_cfg.num_modes))
@@ -771,6 +899,16 @@ def compute_forward_pass_metrics_for_batch(
     pred_tokens: List[np.ndarray] = []
 
     action_table_jnp = jnp.asarray(tokenizer.action_table_np())
+    a2a_rel_eval = None if model_inputs.get("a2a_rel") is None else model_inputs["a2a_rel"][:, :horizon_eval, ...]
+    a2t_rel_eval = None if model_inputs.get("a2t_rel") is None else model_inputs["a2t_rel"][:, :, :horizon_eval, :horizon_eval, ...]
+    a2s_rel_eval = None if model_inputs.get("a2s_rel") is None else model_inputs["a2s_rel"][:, :horizon_eval, ...]
+    a2a_mask_eval = None if model_inputs.get("a2a_mask") is None else model_inputs["a2a_mask"][:, :horizon_eval, ...]
+    a2t_mask_eval = None if model_inputs.get("a2t_mask") is None else model_inputs["a2t_mask"][:, :, :horizon_eval, :horizon_eval]
+    a2s_mask_eval = None if model_inputs.get("a2s_mask") is None else model_inputs["a2s_mask"][:, :horizon_eval, ...]
+    modeled_delta_eval = (
+        None if model_inputs.get("modeled_agent_delta") is None else model_inputs["modeled_agent_delta"][:, :horizon_eval, ...]
+    )
+
     for _ in range(n_mode):
         key, sub = jax.random.split(key)
         sampled_tok = _rollout_tokens_fixed_horizon(
@@ -779,7 +917,7 @@ def compute_forward_pass_metrics_for_batch(
             agent_shape=model_inputs["agent_shape"],
             agent_ids=model_inputs["agent_ids"],
             reverse_indicator=jnp.zeros_like(prepared_batch["reverse_indicator"], dtype=jnp.int32),
-            horizon_steps=int(horizon),
+            horizon_steps=int(horizon_eval),
             start_token_id=start_token_id,
             action_table=action_table_jnp,
             scene_map_feature=model_inputs.get("scene_map_feature"),
@@ -788,6 +926,13 @@ def compute_forward_pass_metrics_for_batch(
             scene_tl_feature=model_inputs.get("scene_tl_feature"),
             scene_tl_valid_mask=model_inputs.get("scene_tl_valid_mask"),
             scene_tl_position=model_inputs.get("scene_tl_position"),
+            a2a_rel=a2a_rel_eval,
+            a2t_rel=a2t_rel_eval,
+            a2s_rel=a2s_rel_eval,
+            a2a_mask=a2a_mask_eval,
+            a2t_mask=a2t_mask_eval,
+            a2s_mask=a2s_mask_eval,
+            modeled_agent_delta_init=modeled_delta_eval,
             sampling_method=eval_cfg.sampling_method,
             temperature=float(eval_cfg.temperature),
             topp=float(eval_cfg.topp),
@@ -805,7 +950,7 @@ def compute_forward_pass_metrics_for_batch(
     agent_shape_bn3 = np.asarray(raw["agent_shape"], dtype=np.float32)
 
     init_t = int(sample_steps[0])
-    eval_steps = sample_steps[1:]
+    eval_steps = sample_steps[1:1 + horizon_eval]
 
     init_pos_bn2 = agent_pos_btn2[:, init_t, :, :]
     init_heading_bn = agent_heading_btn[:, init_t, :]
@@ -814,7 +959,7 @@ def compute_forward_pass_metrics_for_batch(
     dt_chunk_b = np.asarray(raw["dt_s"], dtype=np.float32) * float(skip_steps)
     action_table = tokenizer.action_table_np()
 
-    pred_pos_kbtn2, pred_vel_kbtn2, _, pred_speed_kbtn = _reconstruct_rollout_states(
+    pred_pos_kbtn2, pred_vel_kbtn2, pred_heading_kbtn, pred_speed_kbtn = _reconstruct_rollout_states(
         predicted_tokens_kbtn=pred_tokens_kbtn,
         action_table=action_table,
         init_pos_bn2=init_pos_bn2,
@@ -825,9 +970,10 @@ def compute_forward_pass_metrics_for_batch(
 
     gt_pos_btn2 = agent_pos_btn2[:, eval_steps, :, :]
     gt_vel_btn2 = agent_vel_btn2[:, eval_steps, :, :]
+    gt_heading_btn = agent_heading_btn[:, eval_steps, :]
 
     # Validity is action-transition validity (both endpoints valid).
-    valid_sampled_btn = agent_valid_btn[:, sample_steps, :]
+    valid_sampled_btn = agent_valid_btn[:, sample_steps[: horizon_eval + 1], :]
     gt_valid_btn = valid_sampled_btn[:, 1:, :] & valid_sampled_btn[:, :-1, :]
 
     # Model does not currently predict valid-mask logits; use GT transition validity.
@@ -843,6 +989,18 @@ def compute_forward_pass_metrics_for_batch(
         and max_visualizations > 0
     ):
         viz_dir = Path(output_dir) / str(eval_cfg.viz_output_subdir) / f"step_{int(global_step):07d}"
+
+    artifact_saved = 0
+    artifact_step_dir: Path | None = None
+    artifact_records: List[Dict[str, Any]] = []
+    if (
+        bool(eval_cfg.export_artifacts)
+        and output_dir is not None
+        and global_step is not None
+        and max_artifacts > 0
+    ):
+        artifact_step_dir = Path(output_dir) / str(eval_cfg.artifact_output_subdir) / f"step_{int(global_step):07d}"
+        artifact_step_dir.mkdir(parents=True, exist_ok=True)
 
     per_scenario_metrics: List[Dict[str, float]] = []
     for b in range(bsz):
@@ -860,7 +1018,9 @@ def compute_forward_pass_metrics_for_batch(
             sdc_index=0,
             cfg=eval_cfg,
             rollout_start_valid_n=rollout_start_valid_n,
+            include_collision_metrics=False,
         )
+        scenario_metrics = _filter_core_realism_metrics(scenario_metrics)
         per_scenario_metrics.append(scenario_metrics)
 
         if viz_dir is not None and viz_saved < int(max_visualizations):
@@ -877,4 +1037,49 @@ def compute_forward_pass_metrics_for_batch(
             if saved:
                 viz_saved += 1
 
-    return per_scenario_metrics, viz_saved
+        if artifact_step_dir is not None and artifact_saved < int(max_artifacts):
+            sid = str(scenario_ids[b]) if b < len(scenario_ids) else f"scenario_{b}"
+            artifact_file = f"{_sanitize_name(sid)}.npz"
+            artifact_path = artifact_step_dir / artifact_file
+            metric_keys = np.asarray(list(scenario_metrics.keys()), dtype=object)
+            metric_vals = np.asarray([float(scenario_metrics[k]) for k in metric_keys.tolist()], dtype=np.float32)
+            np.savez_compressed(
+                artifact_path,
+                pred_pos_ktn2=np.asarray(pred_pos_kbtn2[:, b], dtype=np.float32),
+                pred_vel_ktn2=np.asarray(pred_vel_kbtn2[:, b], dtype=np.float32),
+                pred_speed_ktn=np.asarray(pred_speed_kbtn[:, b], dtype=np.float32),
+                pred_valid_ktn=np.asarray(pred_valid_kbtn[:, b], dtype=bool),
+                pred_heading_ktn=np.asarray(pred_heading_kbtn[:, b], dtype=np.float32),
+                gt_pos_tn2=np.asarray(gt_pos_btn2[b], dtype=np.float32),
+                gt_vel_tn2=np.asarray(gt_vel_btn2[b], dtype=np.float32),
+                gt_valid_tn=np.asarray(gt_valid_btn[b], dtype=bool),
+                gt_heading_tn=np.asarray(gt_heading_btn[b], dtype=np.float32),
+                rollout_start_valid_n=np.asarray(rollout_start_valid_n, dtype=bool),
+                agent_shape_n3=np.asarray(agent_shape_bn3[b], dtype=np.float32),
+                dt_chunk_s=np.asarray(float(max(dt_chunk_b[b], 1e-6)), dtype=np.float32),
+                sdc_index=np.asarray(0, dtype=np.int32),
+                scenario_id=np.asarray(sid, dtype=object),
+                forward_approx_metric_keys=metric_keys,
+                forward_approx_metric_values=metric_vals,
+            )
+            artifact_records.append(
+                {
+                    "scenario_id": sid,
+                    "artifact_file": artifact_file,
+                    "artifact_path": str(artifact_path),
+                    "forward_approx_metrics": {k: float(v) for k, v in scenario_metrics.items()},
+                }
+            )
+            artifact_saved += 1
+
+    if artifact_step_dir is not None and artifact_records:
+        _append_step_manifest(
+            manifest_path=artifact_step_dir / "manifest.json",
+            seed=int(seed),
+            n_mode=int(n_mode),
+            skip_steps=int(skip_steps),
+            cfg=eval_cfg,
+            scenario_records=artifact_records,
+        )
+
+    return per_scenario_metrics, viz_saved, artifact_saved
