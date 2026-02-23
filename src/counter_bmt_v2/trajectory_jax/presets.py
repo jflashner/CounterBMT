@@ -6,6 +6,9 @@ known architecture target instead of ad-hoc command-line overrides.
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
+from typing import Dict
+
 from counter_bmt_v2.trajectory_jax.nnx_bmt import (
     BMTTokenSpaceConfig,
     NNXBMTConfig,
@@ -13,6 +16,54 @@ from counter_bmt_v2.trajectory_jax.nnx_bmt import (
     NNXRelationParityConfig,
     NNXSceneEncoderConfig,
 )
+
+
+@dataclass(frozen=True)
+class RuntimeTrainPreset:
+    """Training/runtime knobs paired with a model preset."""
+
+    model_preset: str
+    tokenizer_mode: str
+    learning_rate: float
+    warmup_steps: int
+    weight_decay: float
+    grad_clip_norm: float
+    skip_steps: int
+    lr_schedule_mode: str
+
+
+def runtime_preset_none() -> RuntimeTrainPreset:
+    """No-op runtime preset; keeps CLI defaults."""
+    return RuntimeTrainPreset(
+        model_preset="paper_like_small",
+        tokenizer_mode="paper_simple",
+        learning_rate=3e-4,
+        warmup_steps=200,
+        weight_decay=0.0,
+        grad_clip_norm=1.0,
+        skip_steps=5,
+        lr_schedule_mode="v2_cosine_minlr",
+    )
+
+
+def adv_bmt_runtime_parity_preset() -> RuntimeTrainPreset:
+    """Runtime preset aligned to supervised Adv-BMT parity defaults."""
+    return RuntimeTrainPreset(
+        model_preset="midgpt_parity",
+        tokenizer_mode="adv_bmt_parity",
+        learning_rate=3e-4,
+        warmup_steps=2000,
+        weight_decay=0.0,
+        grad_clip_norm=1.0,
+        skip_steps=5,
+        lr_schedule_mode="legacy_cosine_zero",
+    )
+
+
+def get_runtime_preset(name: str) -> Dict[str, object]:
+    if name == "adv_bmt_runtime_parity":
+        return asdict(adv_bmt_runtime_parity_preset())
+    return asdict(runtime_preset_none())
 
 
 def paper_like_small_config() -> NNXBMTConfig:

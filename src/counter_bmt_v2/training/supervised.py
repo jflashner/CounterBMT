@@ -12,6 +12,7 @@ Paper alignment notes:
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import pickle
 import time
@@ -53,6 +54,9 @@ from counter_bmt_v2.trajectory_jax import (
 ModeType = Literal["forward", "reverse", "mixed"]
 PresetType = Literal["paper_like_small", "paper_like_full", "midgpt_parity"]
 TokenizerModeType = Literal["paper_simple", "adv_bmt_parity"]
+DistributedBackendType = Literal["none", "pmap"]
+PrecisionType = Literal["fp32", "bf16-mixed"]
+LRScheduleModeType = Literal["v2_cosine_minlr", "legacy_cosine_zero"]
 
 
 @dataclass
@@ -76,6 +80,11 @@ class SupervisedTrainConfig:
     warmup_steps: int = 200
     weight_decay: float = 0.0
     grad_clip_norm: float = 1.0
+    lr_schedule_mode: LRScheduleModeType = "v2_cosine_minlr"
+    distributed_backend: DistributedBackendType = "none"
+    precision: PrecisionType = "fp32"
+    save_rng_state: bool = True
+    resume_strict_determinism: bool = True
 
     mode: ModeType = "mixed"
     reverse_probability: float = 0.5
@@ -109,6 +118,8 @@ class SupervisedTrainConfig:
     relation_debug_dump_dir: str = ""
     relation_debug_dump_every_steps: int = 0
     relation_debug_max_batches: int = 1
+    runtime_preset: str = "none"
+    runtime_resolved_overrides: Dict[str, Any] = field(default_factory=dict)
 
     # Scenario-level forward-pass evaluator (Adv-BMT-style metrics).
     forward_eval: ForwardPassEvalConfig = field(default_factory=ForwardPassEvalConfig)
@@ -474,6 +485,7 @@ def _prepare_supervised_batch(
             }
         )
 
+    model_inputs = _cast_tree_precision(model_inputs, precision=train_cfg.precision)
     targets = jnp.asarray(token_batch["targets"], dtype=jnp.int32)
     target_mask = jnp.asarray(token_batch["target_mask"], dtype=jnp.float32)
     reverse_indicator = model_inputs["reverse_indicator"]
@@ -663,7 +675,7 @@ def _train_step(
     default_token_id: int,
 ) -> Dict[str, jnp.ndarray]:
     def loss_fn(m: NNXBidirectionalMotionTransformer) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-        logits = m(**model_inputs)
+        logits = m(**model_inputs).astype(jnp.float32)
         metrics = _compute_metric_dict(
             logits=logits,
             targets=targets,
@@ -687,7 +699,7 @@ def _eval_step(
     reverse_indicator: jnp.ndarray,
     default_token_id: int,
 ) -> Dict[str, jnp.ndarray]:
-    logits = model(**model_inputs)
+    logits = model(**model_inputs).astype(jnp.float32)
     return _compute_metric_dict(
         logits=logits,
         targets=targets,
@@ -697,10 +709,58 @@ def _eval_step(
     )
 
 
+@nnx.pmap(axis_name="data", in_axes=(None, None, 0, 0, 0, 0, None), out_axes=0)
+def _train_step_pmap(
+    model: NNXBidirectionalMotionTransformer,
+    optimizer: nnx.Optimizer,
+    model_inputs: Dict[str, jnp.ndarray],
+    targets: jnp.ndarray,
+    target_mask: jnp.ndarray,
+    reverse_indicator: jnp.ndarray,
+    default_token_id: int,
+) -> Dict[str, jnp.ndarray]:
+    def loss_fn(m: NNXBidirectionalMotionTransformer) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+        logits = m(**model_inputs).astype(jnp.float32)
+        metrics = _compute_metric_dict(
+            logits=logits,
+            targets=targets,
+            target_mask=target_mask,
+            reverse_indicator=reverse_indicator,
+            default_token_id=default_token_id,
+        )
+        return metrics["total_loss"], metrics
+
+    (_, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    grads = jax.lax.pmean(grads, axis_name="data")
+    optimizer.update(grads)
+    return jax.tree.map(lambda x: jax.lax.pmean(x, axis_name="data"), metrics)
+
+
+@nnx.pmap(axis_name="data", in_axes=(None, 0, 0, 0, 0, None), out_axes=0)
+def _eval_step_pmap(
+    model: NNXBidirectionalMotionTransformer,
+    model_inputs: Dict[str, jnp.ndarray],
+    targets: jnp.ndarray,
+    target_mask: jnp.ndarray,
+    reverse_indicator: jnp.ndarray,
+    default_token_id: int,
+) -> Dict[str, jnp.ndarray]:
+    logits = model(**model_inputs).astype(jnp.float32)
+    metrics = _compute_metric_dict(
+        logits=logits,
+        targets=targets,
+        target_mask=target_mask,
+        reverse_indicator=reverse_indicator,
+        default_token_id=default_token_id,
+    )
+    return jax.tree.map(lambda x: jax.lax.pmean(x, axis_name="data"), metrics)
+
+
 def _as_float_metrics(metrics: Dict[str, jnp.ndarray]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for k, v in metrics.items():
-        out[k] = float(np.asarray(jax.device_get(v)))
+        arr = np.asarray(jax.device_get(v))
+        out[k] = float(np.mean(arr))
     return out
 
 
@@ -712,6 +772,106 @@ def _mean_metrics(list_of_metrics: Sequence[Dict[str, float]]) -> Dict[str, floa
     for k in keys:
         out[k] = float(np.mean([m[k] for m in list_of_metrics]))
     return out
+
+
+def _legacy_cosine_zero_multiplier(
+    step: jnp.ndarray | int,
+    *,
+    warmup_steps: int,
+    total_steps: int,
+) -> jnp.ndarray:
+    step_f = jnp.asarray(step, dtype=jnp.float32)
+    warmup = float(max(1, int(warmup_steps)))
+    total = float(max(int(total_steps), int(warmup_steps) + 1))
+    warmup_mult = step_f / warmup
+    progress = (step_f - warmup) / max(1.0, total - warmup)
+    progress = jnp.clip(progress, 0.0, 1.0)
+    cosine_mult = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+    return jnp.where(step_f < warmup, warmup_mult, cosine_mult)
+
+
+def _build_lr_schedule(
+    train_cfg: SupervisedTrainConfig,
+    total_steps_target: int,
+) -> Tuple[Any, Dict[str, Any]]:
+    mode = str(train_cfg.lr_schedule_mode)
+    if mode == "legacy_cosine_zero":
+        warmup_steps = max(1, int(train_cfg.warmup_steps))
+        total_steps = max(int(total_steps_target), warmup_steps + 1)
+
+        def _schedule(step: jnp.ndarray | int) -> jnp.ndarray:
+            mult = _legacy_cosine_zero_multiplier(
+                step,
+                warmup_steps=warmup_steps,
+                total_steps=total_steps,
+            )
+            return jnp.asarray(float(train_cfg.learning_rate), dtype=jnp.float32) * mult
+
+        meta = {
+            "mode": "legacy_cosine_zero",
+            "learning_rate": float(train_cfg.learning_rate),
+            "warmup_steps": int(warmup_steps),
+            "total_steps": int(total_steps),
+            "min_learning_rate": 0.0,
+        }
+        return _schedule, meta
+
+    decay_steps = int(max(int(total_steps_target), int(train_cfg.warmup_steps) + 1))
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=float(train_cfg.learning_rate),
+        warmup_steps=int(max(1, train_cfg.warmup_steps)),
+        decay_steps=decay_steps,
+        end_value=float(train_cfg.min_learning_rate),
+    )
+    meta = {
+        "mode": "v2_cosine_minlr",
+        "learning_rate": float(train_cfg.learning_rate),
+        "warmup_steps": int(max(1, train_cfg.warmup_steps)),
+        "total_steps": int(decay_steps),
+        "min_learning_rate": float(train_cfg.min_learning_rate),
+    }
+    return schedule, meta
+
+
+def _cast_tree_precision(tree: Any, *, precision: PrecisionType) -> Any:
+    if precision != "bf16-mixed":
+        return tree
+
+    def _cast_leaf(x: Any) -> Any:
+        if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
+            return x.astype(jnp.bfloat16)
+        return x
+
+    return jax.tree.map(_cast_leaf, tree)
+
+
+def _shard_tree_for_pmap(tree: Any, *, num_devices: int) -> Any:
+    def _reshape_leaf(x: Any) -> Any:
+        if not isinstance(x, jnp.ndarray):
+            return x
+        if x.ndim == 0:
+            raise ValueError("Cannot shard scalar input for pmap")
+        batch = int(x.shape[0])
+        if batch % int(num_devices) != 0:
+            raise ValueError(
+                f"Batch dimension {batch} must be divisible by num_devices={num_devices} for pmap training"
+            )
+        per_device = batch // int(num_devices)
+        return x.reshape((int(num_devices), per_device) + x.shape[1:])
+
+    return jax.tree.map(_reshape_leaf, tree)
+
+
+def _hash_indices(indices: np.ndarray) -> str:
+    arr = np.asarray(indices, dtype=np.int64)
+    return hashlib.sha256(arr.tobytes()).hexdigest()
+
+
+def _assert_finite_metrics(metrics: Dict[str, float], *, phase: str, step: int) -> None:
+    bad = [k for k, v in metrics.items() if not np.isfinite(float(v))]
+    if bad:
+        raise FloatingPointError(f"Non-finite metrics in {phase} step={step}: {bad}")
 
 
 def _iter_minibatches(indices: np.ndarray, batch_size: int) -> Sequence[np.ndarray]:
@@ -928,6 +1088,7 @@ def _save_checkpoint(
     train_cfg: SupervisedTrainConfig,
     model_cfg: NNXBMTConfig,
     latest_metrics: Dict[str, float],
+    runtime_state: Optional[Dict[str, Any]] = None,
 ) -> Path:
     ckpt_dir = output_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -940,6 +1101,7 @@ def _save_checkpoint(
         "train_cfg": asdict(train_cfg),
         "model_cfg": asdict(model_cfg),
         "latest_metrics": latest_metrics,
+        "runtime_state": runtime_state or {},
     }
 
     step_path = ckpt_dir / f"step_{train_step:07d}.pkl"
@@ -959,7 +1121,7 @@ def _load_checkpoint(
     checkpoint_path: Path,
     model: NNXBidirectionalMotionTransformer,
     optimizer: nnx.Optimizer,
-) -> int:
+) -> Tuple[int, Dict[str, Any], Dict[str, Any]]:
     with checkpoint_path.open("rb") as f:
         payload = pickle.load(f)
 
@@ -967,7 +1129,10 @@ def _load_checkpoint(
     optimizer.opt_state = payload["opt_state"]
     optimizer.step.value = jnp.asarray(payload["optimizer_step"], dtype=optimizer.step.value.dtype)
 
-    return int(payload["train_step"])
+    runtime_state = payload.get("runtime_state", {})
+    if not isinstance(runtime_state, dict):
+        runtime_state = {}
+    return int(payload["train_step"]), runtime_state, payload
 
 
 def _evaluate(
@@ -1068,6 +1233,8 @@ def _print_metrics(prefix: str, step: int, metrics: Dict[str, float], lr: float,
         f"fdd={forward_fdd:.3f} "
         f"vel_jsd={forward_vel_jsd:.3f} "
         f"tokens={metrics.get('num_trained_tokens', 0.0):.1f} "
+        f"sps={metrics.get('train/steps_per_sec', float('nan')):.2f} "
+        f"tps={metrics.get('train/tokens_per_sec', float('nan')):.1f} "
         f"lr={lr:.6f} "
         f"t={elapsed_s:.2f}s"
     )
@@ -1083,6 +1250,12 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         raise ValueError(f"Unsupported mode: {train_cfg.mode}")
     if train_cfg.tokenizer_mode not in ("paper_simple", "adv_bmt_parity"):
         raise ValueError(f"Unsupported tokenizer_mode: {train_cfg.tokenizer_mode}")
+    if train_cfg.distributed_backend not in ("none", "pmap"):
+        raise ValueError(f"Unsupported distributed_backend: {train_cfg.distributed_backend}")
+    if train_cfg.precision not in ("fp32", "bf16-mixed"):
+        raise ValueError(f"Unsupported precision: {train_cfg.precision}")
+    if train_cfg.lr_schedule_mode not in ("v2_cosine_minlr", "legacy_cosine_zero"):
+        raise ValueError(f"Unsupported lr_schedule_mode: {train_cfg.lr_schedule_mode}")
 
     output_dir = Path(train_cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1155,6 +1328,18 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
     if len(train_indices) == 0:
         raise ValueError("No training scenarios available after split/config filtering")
 
+    split_hashes = {
+        "train": _hash_indices(train_indices),
+        "val": _hash_indices(val_indices),
+    }
+
+    num_devices = max(1, len(jax.local_devices()))
+    if train_cfg.distributed_backend == "pmap":
+        if train_cfg.batch_size % num_devices != 0:
+            raise ValueError(
+                f"batch_size ({train_cfg.batch_size}) must be divisible by num_devices ({num_devices}) for pmap"
+            )
+
     steps_per_epoch = int(math.ceil(len(train_indices) / float(train_cfg.batch_size)))
     total_steps_target = (
         int(train_cfg.max_steps)
@@ -1163,47 +1348,70 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
     )
     total_steps_target = max(1, total_steps_target)
 
-    decay_steps = int(max(total_steps_target, train_cfg.warmup_steps + 1))
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=float(train_cfg.learning_rate),
-        warmup_steps=int(max(1, train_cfg.warmup_steps)),
-        decay_steps=decay_steps,
-        end_value=float(train_cfg.min_learning_rate),
-    )
+    lr_schedule, lr_schedule_meta = _build_lr_schedule(train_cfg, total_steps_target)
+
+    adamw_kwargs: Dict[str, Any] = {
+        "learning_rate": lr_schedule,
+        "weight_decay": float(train_cfg.weight_decay),
+        "b1": 0.9,
+        "b2": 0.95,
+        "eps": 1e-5,
+    }
+    if train_cfg.precision == "bf16-mixed":
+        adamw_kwargs["mu_dtype"] = jnp.float32
 
     tx = optax.chain(
         optax.clip_by_global_norm(float(train_cfg.grad_clip_norm)),
-        optax.adamw(
-            learning_rate=lr_schedule,
-            weight_decay=float(train_cfg.weight_decay),
-            b1=0.9,
-            b2=0.95,
-            eps=1e-5,
-        ),
+        optax.adamw(**adamw_kwargs),
     )
 
     model = NNXBidirectionalMotionTransformer(model_cfg, rngs=nnx.Rngs(train_cfg.seed))
     optimizer = nnx.Optimizer(model, tx)
 
     start_step = 0
+    resume_runtime_state: Dict[str, Any] = {}
+    resume_payload: Dict[str, Any] = {}
     if train_cfg.resume_checkpoint:
         ckpt_path = Path(train_cfg.resume_checkpoint)
         if ckpt_path.is_dir():
             ckpt_path = ckpt_path / "last.pkl"
         if ckpt_path.is_file():
-            start_step = _load_checkpoint(
+            start_step, resume_runtime_state, resume_payload = _load_checkpoint(
                 checkpoint_path=ckpt_path,
                 model=model,
                 optimizer=optimizer,
             )
             print(f"Resumed checkpoint: {ckpt_path} (step={start_step})")
 
+            if bool(train_cfg.resume_strict_determinism):
+                ckpt_split_hashes = resume_runtime_state.get("split_hashes", {})
+                if ckpt_split_hashes and ckpt_split_hashes != split_hashes:
+                    raise ValueError(
+                        "Resume strict determinism failed: split hashes differ between checkpoint and current run "
+                        f"({ckpt_split_hashes} vs {split_hashes})"
+                    )
+                ckpt_train_cfg = resume_payload.get("train_cfg", {})
+                for k in ("model_preset", "tokenizer_mode", "skip_steps"):
+                    if k in ckpt_train_cfg and ckpt_train_cfg[k] != getattr(train_cfg, k):
+                        raise ValueError(
+                            f"Resume strict determinism failed: train_cfg[{k}] mismatch "
+                            f"({ckpt_train_cfg[k]} vs {getattr(train_cfg, k)})"
+                        )
+
     run_meta = {
         "train_cfg": asdict(train_cfg),
         "model_cfg": asdict(model_cfg),
+        "runtime_preset": str(train_cfg.runtime_preset),
+        "runtime_resolved_overrides": dict(train_cfg.runtime_resolved_overrides),
         "data_source_mode": split_mode,
         "resolved_data_dirs": resolved_dirs,
+        "split_hashes": split_hashes,
+        "distributed": {
+            "backend": str(train_cfg.distributed_backend),
+            "num_devices": int(num_devices),
+        },
+        "precision": str(train_cfg.precision),
+        "lr_schedule": lr_schedule_meta,
         "split_settings": {
             "train_fraction": float(train_cfg.train_fraction),
             "sample_interval_training": int(train_cfg.sample_interval_training),
@@ -1238,38 +1446,89 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
 
     global_step = int(start_step)
     train_rng = np.random.default_rng(train_cfg.seed + 1)
+    if bool(train_cfg.save_rng_state) and resume_runtime_state.get("train_rng_state") is not None:
+        train_rng.bit_generator.state = resume_runtime_state["train_rng_state"]
 
     best_eval_loss = float("inf")
     best_eval_step = -1
     relation_dump_counter = 0
+    epoch = int(resume_runtime_state.get("epoch", 0))
+    batch_cursor = int(resume_runtime_state.get("batch_cursor_in_epoch", 0))
+    epoch_indices_saved = resume_runtime_state.get("epoch_indices", None)
+    epoch_indices: Optional[np.ndarray]
+    if epoch_indices_saved is None:
+        epoch_indices = None
+    else:
+        epoch_indices = np.asarray(epoch_indices_saved, dtype=np.int32)
+        if len(epoch_indices) != len(train_indices):
+            if bool(train_cfg.resume_strict_determinism):
+                raise ValueError(
+                    "Resume strict determinism failed: checkpoint epoch_indices length does not match current train split"
+                )
+            epoch_indices = None
+            batch_cursor = 0
 
     t0 = time.time()
-    stop = False
+    def _runtime_state() -> Dict[str, Any]:
+        return {
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "batch_cursor_in_epoch": int(batch_cursor),
+            "epoch_indices": None if epoch_indices is None else np.asarray(epoch_indices, dtype=np.int32).tolist(),
+            "train_rng_state": train_rng.bit_generator.state if bool(train_cfg.save_rng_state) else None,
+            "split_hashes": dict(split_hashes),
+            "split_sizes": {"train": int(len(train_indices)), "val": int(len(val_indices))},
+            "distributed_backend": str(train_cfg.distributed_backend),
+            "precision": str(train_cfg.precision),
+            "lr_schedule_mode": str(train_cfg.lr_schedule_mode),
+            "runtime_preset": str(train_cfg.runtime_preset),
+        }
 
-    for epoch in range(train_cfg.num_epochs):
-        # Deterministic but epoch-varying shuffle.
-        epoch_indices = train_indices.copy()
-        train_rng.shuffle(epoch_indices)
+    while epoch < int(train_cfg.num_epochs) and global_step < total_steps_target:
+        if epoch_indices is None:
+            epoch_indices = train_indices.copy()
+            train_rng.shuffle(epoch_indices)
+            batch_cursor = 0
 
-        for idx_batch in _iter_minibatches(epoch_indices, train_cfg.batch_size):
-            samples = [train_loader.load(int(i)) for i in idx_batch]
-            prepared = _prepare_supervised_batch(
-                samples,
-                train_cfg=train_cfg,
-                model_cfg=model_cfg,
-                tokenizer=tokenizer,
-                rng=train_rng,
-                is_training=True,
+        if batch_cursor >= len(epoch_indices):
+            epoch += 1
+            epoch_indices = None
+            batch_cursor = 0
+            continue
+
+        idx_batch = epoch_indices[batch_cursor: batch_cursor + int(train_cfg.batch_size)]
+        batch_cursor += int(len(idx_batch))
+
+        samples = [train_loader.load(int(i)) for i in idx_batch]
+        prepared = _prepare_supervised_batch(
+            samples,
+            train_cfg=train_cfg,
+            model_cfg=model_cfg,
+            tokenizer=tokenizer,
+            rng=train_rng,
+            is_training=True,
+        )
+        relation_dump_counter = _maybe_dump_relation_debug(
+            prepared=prepared,
+            train_cfg=train_cfg,
+            model_cfg=model_cfg,
+            step=global_step + 1,
+            phase="train",
+            dump_counter=relation_dump_counter,
+        )
+
+        step_start = time.time()
+        if train_cfg.distributed_backend == "pmap":
+            metrics = _train_step_pmap(
+                model,
+                optimizer,
+                _shard_tree_for_pmap(prepared["model_inputs"], num_devices=num_devices),
+                _shard_tree_for_pmap(prepared["targets"], num_devices=num_devices),
+                _shard_tree_for_pmap(prepared["target_mask"], num_devices=num_devices),
+                _shard_tree_for_pmap(prepared["reverse_indicator"], num_devices=num_devices),
+                default_token_id,
             )
-            relation_dump_counter = _maybe_dump_relation_debug(
-                prepared=prepared,
-                train_cfg=train_cfg,
-                model_cfg=model_cfg,
-                step=global_step + 1,
-                phase="train",
-                dump_counter=relation_dump_counter,
-            )
-
+        else:
             metrics = _train_step(
                 model,
                 optimizer,
@@ -1280,95 +1539,101 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
                 default_token_id,
             )
 
-            global_step += 1
-            lr_now = float(np.asarray(jax.device_get(lr_schedule(global_step))))
-            metrics_f = _as_float_metrics(metrics)
+        global_step += 1
+        lr_now = float(np.asarray(jax.device_get(lr_schedule(global_step))))
+        metrics_f = _as_float_metrics(metrics)
+        if train_cfg.distributed_backend == "pmap":
+            metrics_f["num_trained_tokens"] = float(metrics_f.get("num_trained_tokens", 0.0) * num_devices)
+        step_dt = max(1e-6, float(time.time() - step_start))
+        metrics_f["train/steps_per_sec"] = float(1.0 / step_dt)
+        metrics_f["train/tokens_per_sec"] = float(metrics_f.get("num_trained_tokens", 0.0) / step_dt)
+        metrics_f["train/global_batch_size"] = float(train_cfg.batch_size)
+        metrics_f["train/num_devices"] = float(num_devices)
+        _assert_finite_metrics(metrics_f, phase="train", step=global_step)
+
+        _write_jsonl(
+            metrics_log_path,
+            {
+                "phase": "train",
+                "step": global_step,
+                "epoch": epoch,
+                "batch_cursor_in_epoch": int(batch_cursor),
+                "lr": lr_now,
+                "metrics": metrics_f,
+            },
+        )
+
+        if global_step % max(1, train_cfg.log_every_steps) == 0:
+            _print_metrics(
+                prefix="train",
+                step=global_step,
+                metrics=metrics_f,
+                lr=lr_now,
+                elapsed_s=time.time() - t0,
+            )
+
+        if len(val_indices) > 0 and global_step % max(1, train_cfg.eval_every_steps) == 0:
+            eval_metrics = _evaluate(
+                model=model,
+                model_cfg=model_cfg,
+                loader=val_loader,
+                val_indices=val_indices,
+                train_cfg=train_cfg,
+                tokenizer=tokenizer,
+                default_token_id=default_token_id,
+                rng=train_rng,
+                output_dir=output_dir,
+                global_step=global_step,
+            )
+            _assert_finite_metrics(eval_metrics, phase="eval", step=global_step)
 
             _write_jsonl(
                 metrics_log_path,
                 {
-                    "phase": "train",
+                    "phase": "eval",
                     "step": global_step,
                     "epoch": epoch,
+                    "batch_cursor_in_epoch": int(batch_cursor),
                     "lr": lr_now,
-                    "metrics": metrics_f,
+                    "metrics": eval_metrics,
                 },
             )
+            _print_metrics(
+                prefix="eval ",
+                step=global_step,
+                metrics=eval_metrics,
+                lr=lr_now,
+                elapsed_s=time.time() - t0,
+            )
 
-            if global_step % max(1, train_cfg.log_every_steps) == 0:
-                _print_metrics(
-                    prefix="train",
-                    step=global_step,
-                    metrics=metrics_f,
-                    lr=lr_now,
-                    elapsed_s=time.time() - t0,
-                )
-
-            if len(val_indices) > 0 and global_step % max(1, train_cfg.eval_every_steps) == 0:
-                eval_metrics = _evaluate(
-                    model=model,
-                    model_cfg=model_cfg,
-                    loader=val_loader,
-                    val_indices=val_indices,
-                    train_cfg=train_cfg,
-                    tokenizer=tokenizer,
-                    default_token_id=default_token_id,
-                    rng=train_rng,
-                    output_dir=output_dir,
-                    global_step=global_step,
-                )
-
-                _write_jsonl(
-                    metrics_log_path,
-                    {
-                        "phase": "eval",
-                        "step": global_step,
-                        "epoch": epoch,
-                        "lr": lr_now,
-                        "metrics": eval_metrics,
-                    },
-                )
-                _print_metrics(
-                    prefix="eval ",
-                    step=global_step,
-                    metrics=eval_metrics,
-                    lr=lr_now,
-                    elapsed_s=time.time() - t0,
-                )
-
-                eval_loss = float(eval_metrics.get("total_loss", float("inf")))
-                if eval_loss < best_eval_loss:
-                    best_eval_loss = eval_loss
-                    best_eval_step = global_step
-                    best_path = _save_checkpoint(
-                        output_dir=output_dir,
-                        train_step=global_step,
-                        model=model,
-                        optimizer=optimizer,
-                        train_cfg=train_cfg,
-                        model_cfg=model_cfg,
-                        latest_metrics=eval_metrics,
-                    )
-                    print(f"Saved improved checkpoint: {best_path}")
-
-            if global_step % max(1, train_cfg.checkpoint_every_steps) == 0:
-                ckpt_path = _save_checkpoint(
+            eval_loss = float(eval_metrics.get("total_loss", float("inf")))
+            if eval_loss < best_eval_loss:
+                best_eval_loss = eval_loss
+                best_eval_step = global_step
+                best_path = _save_checkpoint(
                     output_dir=output_dir,
                     train_step=global_step,
                     model=model,
                     optimizer=optimizer,
                     train_cfg=train_cfg,
                     model_cfg=model_cfg,
-                    latest_metrics=metrics_f,
+                    latest_metrics=eval_metrics,
+                    runtime_state=_runtime_state(),
                 )
-                print(f"Saved checkpoint: {ckpt_path}")
+                print(f"Saved improved checkpoint: {best_path}")
 
-            if global_step >= total_steps_target:
-                stop = True
-                break
-
-        if stop:
-            break
+        if global_step % max(1, train_cfg.checkpoint_every_steps) == 0:
+            ckpt_path = _save_checkpoint(
+                output_dir=output_dir,
+                train_step=global_step,
+                model=model,
+                optimizer=optimizer,
+                train_cfg=train_cfg,
+                model_cfg=model_cfg,
+                latest_metrics=metrics_f,
+                runtime_state=_runtime_state(),
+            )
+            print(f"Saved checkpoint: {ckpt_path}")
 
     # Final checkpoint and summary.
     final_metrics = _evaluate(
@@ -1383,6 +1648,7 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         output_dir=output_dir,
         global_step=global_step,
     ) if len(val_indices) > 0 else {}
+    _assert_finite_metrics(final_metrics, phase="final_eval", step=global_step)
 
     final_ckpt = _save_checkpoint(
         output_dir=output_dir,
@@ -1392,12 +1658,17 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         train_cfg=train_cfg,
         model_cfg=model_cfg,
         latest_metrics=final_metrics,
+        runtime_state=_runtime_state(),
     )
 
     summary = {
         "output_dir": str(output_dir),
         "final_checkpoint": str(final_ckpt),
         "total_steps": int(global_step),
+        "distributed_backend": str(train_cfg.distributed_backend),
+        "num_devices": int(num_devices),
+        "precision": str(train_cfg.precision),
+        "lr_schedule_mode": str(train_cfg.lr_schedule_mode),
         "data_source_mode": split_mode,
         "train_size": int(len(train_indices)),
         "val_size": int(len(val_indices)),

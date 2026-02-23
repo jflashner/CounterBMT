@@ -121,14 +121,19 @@ Acceptance tests:
 
 ## P5. Training Runtime + Config Parity
 
-Status: [ ]
+Status: [x] Implemented (validation in progress)
 
 Code tasks:
-- [ ] Add a parity preset in `src/counter_bmt_v2/trajectory_jax/presets.py` that maps directly to Adv-BMT defaults (`LR`, `warmup`, heads/layers/d_model, skip steps).
-- [ ] Add distributed training path for multi-GPU H200 nodes in `src/counter_bmt_v2/training/supervised.py` (data parallel JAX path).
-- [ ] Add bf16 mixed precision toggle for parity with production-scale training throughput.
-- [ ] Add exact learning-rate schedule parity checks against legacy schedule formulas.
-- [ ] Ensure checkpoint resume reproduces optimizer step/LR state exactly.
+- [x] Add a parity runtime preset in `src/counter_bmt_v2/trajectory_jax/presets.py` that maps directly to Adv-BMT-supervised defaults (`LR`, `warmup`, heads/layers/d_model, skip steps).
+- [x] Add distributed training path for single-host multi-GPU nodes in `src/counter_bmt_v2/training/supervised.py` (`pmap` data parallel path).
+- [x] Add bf16 mixed precision toggle for parity with production-scale training throughput.
+- [x] Add exact learning-rate schedule parity checks against legacy schedule formulas.
+- [x] Ensure checkpoint resume persists deterministic runtime state (epoch cursor, epoch permutation, RNG state, split hash) and enforces strict resume checks.
+- [x] Add parity scripts:
+  - `src/scripts/parity/check_lr_schedule.py`
+  - `src/scripts/parity/check_resume_determinism.py`
+  - `src/scripts/parity/benchmark_throughput.py`
+- [x] Add P5 workflow docs in `docs/parity_p5.md`.
 
 Acceptance tests:
 - [ ] `python src/scripts/parity/check_lr_schedule.py --steps 0,1,100,2000,10000` matches legacy LR values to <= 1e-9 absolute error.

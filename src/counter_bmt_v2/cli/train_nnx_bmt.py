@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from typing import Dict, Set
 
 # Allow `python src/counter_bmt_v2/cli/train_nnx_bmt.py ...` without requiring
 # editable install; this keeps local no-admin workflows simple.
@@ -16,6 +17,7 @@ if __package__ is None or __package__ == "":
         sys.path.insert(0, src_root_str)
 
 from counter_bmt_v2.training import ForwardPassEvalConfig, SupervisedTrainConfig, train_supervised
+from counter_bmt_v2.trajectory_jax import get_runtime_preset
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,9 +36,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-preset",
         type=str,
-        default="paper_like_small",
+        default=None,
         choices=["paper_like_small", "paper_like_full", "midgpt_parity"],
         help="model preset",
+    )
+    parser.add_argument(
+        "--runtime-preset",
+        type=str,
+        default="none",
+        choices=["none", "adv_bmt_runtime_parity"],
+        help="training/runtime defaults; explicit CLI flags override these values",
     )
 
     parser.add_argument("--seed", type=int, default=0)
@@ -44,11 +53,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=-1)
 
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--min-lr", type=float, default=1e-6)
-    parser.add_argument("--warmup-steps", type=int, default=200)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--grad-clip", type=float, default=None)
+    parser.add_argument(
+        "--lr-schedule-mode",
+        type=str,
+        default=None,
+        choices=["v2_cosine_minlr", "legacy_cosine_zero"],
+        help="learning-rate schedule mode",
+    )
+    parser.add_argument(
+        "--distributed-backend",
+        type=str,
+        default="none",
+        choices=["none", "pmap"],
+        help="single-host distributed backend",
+    )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="fp32",
+        choices=["fp32", "bf16-mixed"],
+        help="training precision mode",
+    )
 
     parser.add_argument(
         "--mode",
@@ -58,11 +88,11 @@ def parse_args() -> argparse.Namespace:
         help="token sequence direction mode",
     )
     parser.add_argument("--reverse-prob", type=float, default=0.5)
-    parser.add_argument("--skip-steps", type=int, default=5)
+    parser.add_argument("--skip-steps", type=int, default=None)
     parser.add_argument(
         "--tokenizer-mode",
         type=str,
-        default="paper_simple",
+        default=None,
         choices=["paper_simple", "adv_bmt_parity"],
         help="tokenizer implementation mode",
     )
@@ -171,8 +201,55 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _collect_provided_flags(argv: list[str]) -> Set[str]:
+    provided: Set[str] = set()
+    for tok in argv:
+        if not tok.startswith("--"):
+            continue
+        if "=" in tok:
+            provided.add(tok.split("=", 1)[0])
+        else:
+            provided.add(tok)
+    return provided
+
+
+def _resolve_runtime_defaults(args: argparse.Namespace, provided_flags: Set[str]) -> Dict[str, object]:
+    base_defaults: Dict[str, object] = {
+        "model_preset": "paper_like_small",
+        "tokenizer_mode": "paper_simple",
+        "learning_rate": 3e-4,
+        "warmup_steps": 200,
+        "weight_decay": 0.0,
+        "grad_clip_norm": 1.0,
+        "skip_steps": 5,
+        "lr_schedule_mode": "v2_cosine_minlr",
+    }
+    runtime_defaults = get_runtime_preset(str(args.runtime_preset))
+    resolved: Dict[str, object] = dict(base_defaults)
+    resolved.update(runtime_defaults)
+
+    explicit_map = {
+        "--model-preset": ("model_preset", args.model_preset),
+        "--tokenizer-mode": ("tokenizer_mode", args.tokenizer_mode),
+        "--lr": ("learning_rate", args.lr),
+        "--warmup-steps": ("warmup_steps", args.warmup_steps),
+        "--weight-decay": ("weight_decay", args.weight_decay),
+        "--grad-clip": ("grad_clip_norm", args.grad_clip),
+        "--skip-steps": ("skip_steps", args.skip_steps),
+        "--lr-schedule-mode": ("lr_schedule_mode", args.lr_schedule_mode),
+    }
+    for flag, (key, value) in explicit_map.items():
+        if flag in provided_flags and value is not None:
+            resolved[key] = value
+
+    return resolved
+
+
 def main() -> int:
+    argv = sys.argv[1:]
     args = parse_args()
+    provided_flags = _collect_provided_flags(argv)
+    resolved_runtime = _resolve_runtime_defaults(args, provided_flags)
 
     train_data_dir = str(args.train_data_dir).strip()
     val_data_dir = str(args.val_data_dir).strip()
@@ -195,20 +272,23 @@ def main() -> int:
         train_data_dir=train_data_dir,
         val_data_dir=val_data_dir,
         output_dir=args.output_dir,
-        model_preset=args.model_preset,
+        model_preset=str(resolved_runtime["model_preset"]),
         seed=args.seed,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         max_steps=(None if args.max_steps <= 0 else args.max_steps),
-        learning_rate=args.lr,
+        learning_rate=float(resolved_runtime["learning_rate"]),
         min_learning_rate=args.min_lr,
-        warmup_steps=args.warmup_steps,
-        weight_decay=args.weight_decay,
-        grad_clip_norm=args.grad_clip,
+        warmup_steps=int(resolved_runtime["warmup_steps"]),
+        weight_decay=float(resolved_runtime["weight_decay"]),
+        grad_clip_norm=float(resolved_runtime["grad_clip_norm"]),
+        lr_schedule_mode=str(resolved_runtime["lr_schedule_mode"]),
+        distributed_backend=str(args.distributed_backend),
+        precision=str(args.precision),
         mode=args.mode,
         reverse_probability=args.reverse_prob,
-        skip_steps=args.skip_steps,
-        tokenizer_mode=args.tokenizer_mode,
+        skip_steps=int(resolved_runtime["skip_steps"]),
+        tokenizer_mode=str(resolved_runtime["tokenizer_mode"]),
         train_fraction=args.train_fraction,
         sample_interval_training=int(args.sample_interval_training),
         sample_interval_test=int(args.sample_interval_test),
@@ -229,6 +309,8 @@ def main() -> int:
         relation_debug_dump_dir=args.relation_debug_dump_dir,
         relation_debug_dump_every_steps=max(0, int(args.relation_debug_dump_every)),
         relation_debug_max_batches=max(0, int(args.relation_debug_max_batches)),
+        runtime_preset=str(args.runtime_preset),
+        runtime_resolved_overrides={k: v for k, v in resolved_runtime.items()},
         forward_eval=ForwardPassEvalConfig(
             enabled=(not args.no_forward_eval),
             num_modes=max(1, int(args.forward_eval_modes)),

@@ -16,7 +16,15 @@ from .nnx_bmt import (
     sample_motion_tokens,
 )
 from .tokenizer_parity import AdvBMTParityTokenizer, ParityTokenBatch, ParityTokenizerConfig
-from .presets import midgpt_parity_config, paper_like_full_config, paper_like_small_config
+from .presets import (
+    RuntimeTrainPreset,
+    adv_bmt_runtime_parity_preset,
+    get_runtime_preset,
+    midgpt_parity_config,
+    paper_like_full_config,
+    paper_like_small_config,
+    runtime_preset_none,
+)
 from .relation_parity import (
     RelationBundleConfig,
     build_relation_bundle,
@@ -50,9 +58,13 @@ __all__ = [
     "AdvBMTParityTokenizer",
     "ParityTokenBatch",
     "ParityTokenizerConfig",
+    "RuntimeTrainPreset",
     "paper_like_small_config",
     "paper_like_full_config",
     "midgpt_parity_config",
+    "runtime_preset_none",
+    "adv_bmt_runtime_parity_preset",
+    "get_runtime_preset",
     "RelationBundleConfig",
     "pairwise_mask",
     "pairwise_relative_diff",
