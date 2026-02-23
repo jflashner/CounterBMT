@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
@@ -55,6 +56,7 @@ def main() -> int:
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--mode", type=str, default="legacy_cosine_zero", choices=["legacy_cosine_zero", "v2_cosine_minlr"])
     parser.add_argument("--max-abs-error", type=float, default=1e-9)
+    parser.add_argument("--output-json", type=str, default="")
     args = parser.parse_args()
 
     steps = _parse_steps(args.steps)
@@ -112,6 +114,11 @@ def main() -> int:
         "passed": bool(max_abs_error <= float(args.max_abs_error)),
     }
     print(json.dumps(report, indent=2))
+    if args.output_json:
+        out_path = Path(args.output_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"Wrote: {out_path}")
     if max_abs_error > float(args.max_abs_error):
         print("FAILED: LR schedule parity check failed")
         return 1
@@ -121,4 +128,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--skip-steps", type=int, default=5)
     p.add_argument("--min-match", type=float, default=1.0)
+    p.add_argument("--output-json", type=str, default="")
     return p.parse_args()
 
 
@@ -143,6 +144,11 @@ def main() -> int:
         "metrics": metrics,
     }
     print(json.dumps(payload, indent=2))
+    if args.output_json:
+        out_path = Path(args.output_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Wrote: {out_path}")
 
     ok = True
     if np.isfinite(metrics["a2t_causal_valid_match_rate"]) and metrics["a2t_causal_valid_match_rate"] < float(args.min_match):

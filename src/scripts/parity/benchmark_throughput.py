@@ -44,6 +44,7 @@ def main() -> int:
     parser.add_argument("--tokenizer-mode", type=str, default="adv_bmt_parity")
     parser.add_argument("--precision", type=str, default="fp32", choices=["fp32", "bf16-mixed"])
     parser.add_argument("--runtime-preset", type=str, default="adv_bmt_runtime_parity", choices=["none", "adv_bmt_runtime_parity"])
+    parser.add_argument("--num-train-scenarios", type=int, default=-1)
     parser.add_argument("--json-out", type=str, default="")
     args = parser.parse_args()
 
@@ -81,6 +82,8 @@ def main() -> int:
         "--checkpoint-every",
         str(max(int(args.max_steps), 1)),
     ]
+    if int(args.num_train_scenarios) > 0:
+        cmd.extend(["--num-train-scenarios", str(int(args.num_train_scenarios))])
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", "src")
@@ -111,6 +114,7 @@ def main() -> int:
             "tokenizer_mode": str(args.tokenizer_mode),
             "precision": str(args.precision),
             "runtime_preset": str(args.runtime_preset),
+            "num_train_scenarios": int(args.num_train_scenarios),
         },
         "summary": {
             "num_train_rows": int(len(metrics_rows)),
@@ -131,4 +135,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

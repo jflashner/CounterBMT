@@ -112,6 +112,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--legacy-root", type=str, default="src/Adv-BMT")
     p.add_argument("--max-embedding-diff", type=float, default=2e-4)
     p.add_argument("--min-mask-match", type=float, default=1.0)
+    p.add_argument("--output-json", type=str, default="")
     p.add_argument("--dump-artifacts", action="store_true")
     p.add_argument("--out-dir", type=str, default="outputs/parity")
     return p.parse_args()
@@ -314,6 +315,11 @@ def main() -> int:
         "metrics": stats.to_metrics(),
     }
     print(json.dumps(payload, indent=2))
+    if args.output_json:
+        out_path = Path(args.output_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Wrote: {out_path}")
 
     ok = True
     metrics = payload["metrics"]

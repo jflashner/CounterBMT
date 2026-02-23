@@ -90,6 +90,7 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-mad", type=float, default=1e-6)
+    parser.add_argument("--output-json", type=str, default="")
     args = parser.parse_args()
 
     if int(args.split_step) <= 0 or int(args.steps_total) <= int(args.split_step):
@@ -168,6 +169,11 @@ def main() -> int:
         "passed": bool(np.isfinite(mad) and mad <= float(args.max_mad)),
     }
     print(json.dumps(report, indent=2))
+    if args.output_json:
+        out_path = Path(args.output_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"Wrote: {out_path}")
     if not np.isfinite(mad) or mad > float(args.max_mad):
         print("FAILED: resume determinism check failed")
         return 1
