@@ -104,6 +104,7 @@ class SupervisedTrainConfig:
     strict_91_steps: bool = False
     prescan_log_every: int = 5000
     prescan_workers: int = 0
+    use_prescan_cache: bool = True
 
     eval_every_steps: int = 100
     eval_batches: int = 10
@@ -872,6 +873,70 @@ def _hash_indices(indices: np.ndarray) -> str:
     return hashlib.sha256(arr.tobytes()).hexdigest()
 
 
+def _prescan_cache_path(output_dir: Path) -> Path:
+    return output_dir / "manifests" / "prescan_cache.pkl"
+
+
+def _build_prescan_cache_key(
+    *,
+    split_mode: str,
+    resolved_dirs: Dict[str, str],
+    train_indices_pre: np.ndarray,
+    val_indices_pre: np.ndarray,
+    strict_91_steps: bool,
+    max_time_steps: int,
+) -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "split_mode": str(split_mode),
+        "resolved_dirs": dict(resolved_dirs),
+        "train_indices_pre_hash": _hash_indices(np.asarray(train_indices_pre, dtype=np.int32)),
+        "val_indices_pre_hash": _hash_indices(np.asarray(val_indices_pre, dtype=np.int32)),
+        "train_indices_pre_len": int(len(train_indices_pre)),
+        "val_indices_pre_len": int(len(val_indices_pre)),
+        "strict_91_steps": bool(strict_91_steps),
+        "max_time_steps": int(max_time_steps),
+    }
+
+
+def _load_prescan_cache(*, output_dir: Path, cache_key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    cache_path = _prescan_cache_path(output_dir)
+    if not cache_path.is_file():
+        return None
+    try:
+        with cache_path.open("rb") as f:
+            payload = pickle.load(f)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("cache_key") != cache_key:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    required = (
+        "train_indices",
+        "val_indices",
+        "train_manifest",
+        "val_manifest",
+        "skipped_records",
+        "train_trunc_candidates",
+        "val_trunc_candidates",
+    )
+    if any(k not in data for k in required):
+        return None
+    return data
+
+
+def _save_prescan_cache(*, output_dir: Path, cache_key: Dict[str, Any], data: Dict[str, Any]) -> None:
+    cache_path = _prescan_cache_path(output_dir)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"cache_key": cache_key, "data": data}
+    with cache_path.open("wb") as f:
+        pickle.dump(payload, f)
+
+
 def _assert_finite_metrics(metrics: Dict[str, float], *, phase: str, step: int) -> None:
     bad = [k for k, v in metrics.items() if not np.isfinite(float(v))]
     if bad:
@@ -1446,27 +1511,73 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
     split_mode, train_loader, train_indices, val_loader, val_indices, resolved_dirs = _resolve_data_sources(train_cfg)
     train_size_pre_filter = int(len(train_indices))
     val_size_pre_filter = int(len(val_indices))
-
-    train_indices, train_manifest, train_skipped, train_trunc_candidates = _prescan_indices(
-        loader=train_loader,
-        indices=train_indices,
-        split_name="train",
+    train_indices_pre = np.asarray(train_indices, dtype=np.int32).copy()
+    val_indices_pre = np.asarray(val_indices, dtype=np.int32).copy()
+    prescan_cache_key = _build_prescan_cache_key(
+        split_mode=split_mode,
+        resolved_dirs=resolved_dirs,
+        train_indices_pre=train_indices_pre,
+        val_indices_pre=val_indices_pre,
         strict_91_steps=bool(train_cfg.strict_91_steps),
         max_time_steps=int(train_cfg.max_time_steps),
-        log_every=int(train_cfg.prescan_log_every),
-        workers=int(train_cfg.prescan_workers),
-    )
-    val_indices, val_manifest, val_skipped, val_trunc_candidates = _prescan_indices(
-        loader=val_loader,
-        indices=val_indices,
-        split_name="val",
-        strict_91_steps=bool(train_cfg.strict_91_steps),
-        max_time_steps=int(train_cfg.max_time_steps),
-        log_every=int(train_cfg.prescan_log_every),
-        workers=int(train_cfg.prescan_workers),
     )
 
-    skipped_records = [*train_skipped, *val_skipped]
+    cached_prescan = None
+    if bool(train_cfg.use_prescan_cache):
+        cached_prescan = _load_prescan_cache(output_dir=output_dir, cache_key=prescan_cache_key)
+
+    if cached_prescan is not None:
+        train_indices = np.asarray(cached_prescan["train_indices"], dtype=np.int32)
+        val_indices = np.asarray(cached_prescan["val_indices"], dtype=np.int32)
+        train_manifest = list(cached_prescan["train_manifest"])
+        val_manifest = list(cached_prescan["val_manifest"])
+        skipped_records = list(cached_prescan["skipped_records"])
+        train_trunc_candidates = list(cached_prescan["train_trunc_candidates"])
+        val_trunc_candidates = list(cached_prescan["val_trunc_candidates"])
+        print(
+            "[prescan] loaded cache "
+            f"train={len(train_indices)} val={len(val_indices)} skipped={len(skipped_records)}"
+        )
+    else:
+        train_indices, train_manifest, train_skipped, train_trunc_candidates = _prescan_indices(
+            loader=train_loader,
+            indices=train_indices,
+            split_name="train",
+            strict_91_steps=bool(train_cfg.strict_91_steps),
+            max_time_steps=int(train_cfg.max_time_steps),
+            log_every=int(train_cfg.prescan_log_every),
+            workers=int(train_cfg.prescan_workers),
+        )
+        val_indices, val_manifest, val_skipped, val_trunc_candidates = _prescan_indices(
+            loader=val_loader,
+            indices=val_indices,
+            split_name="val",
+            strict_91_steps=bool(train_cfg.strict_91_steps),
+            max_time_steps=int(train_cfg.max_time_steps),
+            log_every=int(train_cfg.prescan_log_every),
+            workers=int(train_cfg.prescan_workers),
+        )
+        skipped_records = [*train_skipped, *val_skipped]
+
+        if bool(train_cfg.use_prescan_cache):
+            _save_prescan_cache(
+                output_dir=output_dir,
+                cache_key=prescan_cache_key,
+                data={
+                    "train_indices": np.asarray(train_indices, dtype=np.int32).tolist(),
+                    "val_indices": np.asarray(val_indices, dtype=np.int32).tolist(),
+                    "train_manifest": list(train_manifest),
+                    "val_manifest": list(val_manifest),
+                    "skipped_records": list(skipped_records),
+                    "train_trunc_candidates": list(train_trunc_candidates),
+                    "val_trunc_candidates": list(val_trunc_candidates),
+                },
+            )
+            print(
+                "[prescan] saved cache "
+                f"train={len(train_indices)} val={len(val_indices)} skipped={len(skipped_records)}"
+            )
+
     strict_violations = [x for x in skipped_records if str(x.get("reason")) == "strict_91_mismatch"]
     skip_reason_counts = dict(Counter(str(x.get("reason", "unknown")) for x in skipped_records))
 
@@ -1593,6 +1704,15 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
             "sample_interval_training": int(train_cfg.sample_interval_training),
             "sample_interval_test": int(train_cfg.sample_interval_test),
             "strict_91_steps": bool(train_cfg.strict_91_steps),
+            "prescan_log_every": int(train_cfg.prescan_log_every),
+            "prescan_workers": int(train_cfg.prescan_workers),
+            "use_prescan_cache": bool(train_cfg.use_prescan_cache),
+        },
+        "prescan_cache": {
+            "enabled": bool(train_cfg.use_prescan_cache),
+            "cache_hit": bool(cached_prescan is not None),
+            "cache_path": str(_prescan_cache_path(output_dir)),
+            "cache_key": prescan_cache_key,
         },
         "train_size": int(len(train_indices)),
         "val_size": int(len(val_indices)),
