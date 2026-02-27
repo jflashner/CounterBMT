@@ -100,6 +100,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-fraction", type=float, default=0.95)
     parser.add_argument("--sample-interval-training", type=int, default=1)
     parser.add_argument("--sample-interval-test", type=int, default=1)
+    parser.add_argument(
+        "--prescan-log-every",
+        type=int,
+        default=5000,
+        help="print dataset prescan progress every N scenarios (0 disables)",
+    )
+    parser.add_argument(
+        "--prescan-workers",
+        type=int,
+        default=0,
+        help="number of worker threads for startup prescan (0/1 = sequential)",
+    )
     parser.add_argument("--num-train-scenarios", type=int, default=-1)
     parser.add_argument("--num-val-scenarios", type=int, default=-1)
     parser.add_argument(
@@ -305,6 +317,8 @@ def main() -> int:
         train_fraction=args.train_fraction,
         sample_interval_training=int(args.sample_interval_training),
         sample_interval_test=int(args.sample_interval_test),
+        prescan_log_every=max(0, int(args.prescan_log_every)),
+        prescan_workers=max(0, int(args.prescan_workers)),
         num_train_scenarios=(None if args.num_train_scenarios <= 0 else args.num_train_scenarios),
         num_val_scenarios=(None if args.num_val_scenarios <= 0 else args.num_val_scenarios),
         strict_91_steps=bool(args.strict_91_steps),

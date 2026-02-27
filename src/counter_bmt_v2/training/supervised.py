@@ -11,10 +11,12 @@ Paper alignment notes:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import hashlib
 import math
 import pickle
+import sys
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -100,6 +102,8 @@ class SupervisedTrainConfig:
     num_train_scenarios: Optional[int] = None
     num_val_scenarios: Optional[int] = None
     strict_91_steps: bool = False
+    prescan_log_every: int = 5000
+    prescan_workers: int = 0
 
     eval_every_steps: int = 100
     eval_batches: int = 10
@@ -953,6 +957,64 @@ def _safe_relative_path(path: Path, root: Path) -> str:
         return path.as_posix()
 
 
+class _PrescanProgressBar:
+    """Animated terminal progress for slow dataset prescan stages."""
+
+    _SPINNER = "|/-\\"
+
+    def __init__(self, *, split_name: str, total: int, enabled: bool, min_interval_s: float = 0.2) -> None:
+        self.split_name = str(split_name)
+        self.total = max(1, int(total))
+        self.enabled = bool(enabled)
+        self.min_interval_s = max(0.05, float(min_interval_s))
+        self._is_tty = bool(sys.stdout.isatty())
+        self._start_t = time.time()
+        self._last_render_t = 0.0
+        self._frame = 0
+        self._last_len = 0
+
+    def update(self, *, done: int, kept: int, skipped: int, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = time.time()
+        if not force and (now - self._last_render_t) < self.min_interval_s:
+            return
+
+        self._last_render_t = now
+        elapsed = max(1e-6, float(now - self._start_t))
+        done_i = min(max(0, int(done)), self.total)
+        pct = 100.0 * float(done_i) / float(self.total)
+        rate = float(done_i) / elapsed
+        eta_s = (self.total - done_i) / max(1e-6, rate)
+
+        bar_w = 28
+        fill = int(bar_w * done_i / float(self.total))
+        if fill <= 0:
+            bar = ">" + "." * (bar_w - 1)
+        elif fill >= bar_w:
+            bar = "=" * bar_w
+        else:
+            bar = "=" * (fill - 1) + ">" + "." * (bar_w - fill)
+
+        spin = self._SPINNER[self._frame % len(self._SPINNER)]
+        self._frame += 1
+        msg = (
+            f"[prescan:{self.split_name}] {spin} [{bar}] {done_i}/{self.total} ({pct:5.1f}%) "
+            f"kept={int(kept)} skipped={int(skipped)} "
+            f"rate={rate:6.1f}/s eta={eta_s:7.1f}s"
+        )
+        if self._is_tty:
+            padded = msg.ljust(self._last_len)
+            self._last_len = len(padded)
+            print(f"\r{padded}", end="", flush=True)
+        elif force or done_i >= self.total:
+            print(msg, flush=True)
+
+    def close(self) -> None:
+        if self.enabled and self._is_tty:
+            print("", flush=True)
+
+
 def _prescan_indices(
     *,
     loader: ScenarioNetNNXLoader,
@@ -960,6 +1022,8 @@ def _prescan_indices(
     split_name: str,
     strict_91_steps: bool,
     max_time_steps: int,
+    log_every: int = 0,
+    workers: int = 0,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     kept: List[int] = []
     manifests: List[Dict[str, Any]] = []
@@ -967,8 +1031,22 @@ def _prescan_indices(
     trunc_candidates: List[Dict[str, Any]] = []
 
     root = Path(loader.data_dir)
-    for idx in np.asarray(indices, dtype=np.int32):
-        i = int(idx)
+    total = int(len(indices))
+    log_interval = max(0, int(log_every))
+    n_workers = max(0, int(workers))
+    if total == 0:
+        return np.asarray(kept, dtype=np.int32), manifests, skipped, trunc_candidates
+
+    progress = _PrescanProgressBar(
+        split_name=split_name,
+        total=total,
+        enabled=(log_interval > 0),
+    )
+    if log_interval > 0:
+        print(f"[prescan:{split_name}] start total={total} workers={max(1, n_workers)}", flush=True)
+
+    def _inspect_index(i: int) -> Dict[str, Any]:
+        i = int(i)
         file_path = loader.files[i]
         file_name = file_path.name
         rel_path = _safe_relative_path(file_path, root)
@@ -982,13 +1060,15 @@ def _prescan_indices(
         try:
             sample = loader.load(i)
         except Exception as exc:
-            rec = dict(base_record)
-            rec["scenario_id"] = ""
-            rec["raw_time_steps"] = -1
-            rec["reason"] = "load_error"
-            rec["error"] = str(exc)
-            skipped.append(rec)
-            continue
+            return {
+                "loader_index": i,
+                "base": base_record,
+                "ok": False,
+                "scenario_id": "",
+                "raw_time_steps": -1,
+                "reason": "load_error",
+                "error": str(exc),
+            }
 
         scenario_id = str(sample.scenario_id)
         raw_t = int(sample.agent_position_xy.shape[0])
@@ -997,48 +1077,136 @@ def _prescan_indices(
             and sample.map_feature_valid_mask.size > 0
             and bool(np.any(sample.map_feature_valid_mask))
         )
+        return {
+            "loader_index": i,
+            "base": base_record,
+            "ok": True,
+            "scenario_id": scenario_id,
+            "raw_time_steps": raw_t,
+            "has_map": bool(has_map),
+        }
 
-        if not has_map:
-            rec = dict(base_record)
-            rec["scenario_id"] = scenario_id
-            rec["raw_time_steps"] = raw_t
-            rec["reason"] = "no_map_feature"
-            skipped.append(rec)
-            continue
+    indices_arr = np.asarray(indices, dtype=np.int32)
+    if n_workers > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            probe_iter = pool.map(_inspect_index, indices_arr.tolist())
+            for n_done, probe in enumerate(probe_iter, start=1):
+                base_record = dict(probe["base"])
+                scenario_id = str(probe.get("scenario_id", ""))
+                raw_t = int(probe.get("raw_time_steps", -1))
+                i = int(probe.get("loader_index", -1))
 
-        if strict_91_steps and raw_t != 91:
-            rec = dict(base_record)
-            rec["scenario_id"] = scenario_id
-            rec["raw_time_steps"] = raw_t
-            rec["reason"] = "strict_91_mismatch"
-            rec["expected_time_steps"] = 91
-            skipped.append(rec)
-            continue
+                if not bool(probe.get("ok", False)):
+                    rec = dict(base_record)
+                    rec["scenario_id"] = scenario_id
+                    rec["raw_time_steps"] = raw_t
+                    rec["reason"] = str(probe.get("reason", "load_error"))
+                    if "error" in probe:
+                        rec["error"] = str(probe.get("error"))
+                    skipped.append(rec)
+                elif not bool(probe.get("has_map", False)):
+                    rec = dict(base_record)
+                    rec["scenario_id"] = scenario_id
+                    rec["raw_time_steps"] = raw_t
+                    rec["reason"] = "no_map_feature"
+                    skipped.append(rec)
+                elif strict_91_steps and raw_t != 91:
+                    rec = dict(base_record)
+                    rec["scenario_id"] = scenario_id
+                    rec["raw_time_steps"] = raw_t
+                    rec["reason"] = "strict_91_mismatch"
+                    rec["expected_time_steps"] = 91
+                    skipped.append(rec)
+                else:
+                    kept.append(i)
+                    manifests.append(
+                        {
+                            "rank": len(kept) - 1,
+                            "loader_index": i,
+                            "scenario_id": scenario_id,
+                            "file_name": str(base_record["file_name"]),
+                            "relative_path": str(base_record["relative_path"]),
+                            "raw_time_steps": raw_t,
+                        }
+                    )
+                    if raw_t > int(max_time_steps):
+                        trunc_candidates.append(
+                            {
+                                "split": split_name,
+                                "loader_index": i,
+                                "scenario_id": scenario_id,
+                                "file_name": str(base_record["file_name"]),
+                                "relative_path": str(base_record["relative_path"]),
+                                "raw_time_steps": raw_t,
+                                "max_time_steps": int(max_time_steps),
+                            }
+                        )
+                progress.update(
+                    done=n_done,
+                    kept=len(kept),
+                    skipped=len(skipped),
+                    force=(n_done % max(1, log_interval) == 0 or n_done == total),
+                )
+    else:
+        for n_done, i in enumerate(indices_arr.tolist(), start=1):
+            probe = _inspect_index(int(i))
+            base_record = dict(probe["base"])
+            scenario_id = str(probe.get("scenario_id", ""))
+            raw_t = int(probe.get("raw_time_steps", -1))
 
-        kept.append(i)
-        manifests.append(
-            {
-                "rank": len(kept) - 1,
-                "loader_index": i,
-                "scenario_id": scenario_id,
-                "file_name": file_name,
-                "relative_path": rel_path,
-                "raw_time_steps": raw_t,
-            }
-        )
-
-        if raw_t > int(max_time_steps):
-            trunc_candidates.append(
-                {
-                    "split": split_name,
-                    "loader_index": i,
-                    "scenario_id": scenario_id,
-                    "file_name": file_name,
-                    "relative_path": rel_path,
-                    "raw_time_steps": raw_t,
-                    "max_time_steps": int(max_time_steps),
-                }
+            if not bool(probe.get("ok", False)):
+                rec = dict(base_record)
+                rec["scenario_id"] = scenario_id
+                rec["raw_time_steps"] = raw_t
+                rec["reason"] = str(probe.get("reason", "load_error"))
+                if "error" in probe:
+                    rec["error"] = str(probe.get("error"))
+                skipped.append(rec)
+            elif not bool(probe.get("has_map", False)):
+                rec = dict(base_record)
+                rec["scenario_id"] = scenario_id
+                rec["raw_time_steps"] = raw_t
+                rec["reason"] = "no_map_feature"
+                skipped.append(rec)
+            elif strict_91_steps and raw_t != 91:
+                rec = dict(base_record)
+                rec["scenario_id"] = scenario_id
+                rec["raw_time_steps"] = raw_t
+                rec["reason"] = "strict_91_mismatch"
+                rec["expected_time_steps"] = 91
+                skipped.append(rec)
+            else:
+                kept.append(int(i))
+                manifests.append(
+                    {
+                        "rank": len(kept) - 1,
+                        "loader_index": int(i),
+                        "scenario_id": scenario_id,
+                        "file_name": str(base_record["file_name"]),
+                        "relative_path": str(base_record["relative_path"]),
+                        "raw_time_steps": raw_t,
+                    }
+                )
+                if raw_t > int(max_time_steps):
+                    trunc_candidates.append(
+                        {
+                            "split": split_name,
+                            "loader_index": int(i),
+                            "scenario_id": scenario_id,
+                            "file_name": str(base_record["file_name"]),
+                            "relative_path": str(base_record["relative_path"]),
+                            "raw_time_steps": raw_t,
+                            "max_time_steps": int(max_time_steps),
+                        }
+                    )
+            progress.update(
+                done=n_done,
+                kept=len(kept),
+                skipped=len(skipped),
+                force=(n_done % max(1, log_interval) == 0 or n_done == total),
             )
+
+    progress.close()
 
     return np.asarray(kept, dtype=np.int32), manifests, skipped, trunc_candidates
 
@@ -1285,6 +1453,8 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         split_name="train",
         strict_91_steps=bool(train_cfg.strict_91_steps),
         max_time_steps=int(train_cfg.max_time_steps),
+        log_every=int(train_cfg.prescan_log_every),
+        workers=int(train_cfg.prescan_workers),
     )
     val_indices, val_manifest, val_skipped, val_trunc_candidates = _prescan_indices(
         loader=val_loader,
@@ -1292,6 +1462,8 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         split_name="val",
         strict_91_steps=bool(train_cfg.strict_91_steps),
         max_time_steps=int(train_cfg.max_time_steps),
+        log_every=int(train_cfg.prescan_log_every),
+        workers=int(train_cfg.prescan_workers),
     )
 
     skipped_records = [*train_skipped, *val_skipped]
