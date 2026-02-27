@@ -30,14 +30,25 @@ def compose_reward(judge: JudgeResult, rollout: TrajectoryRollout, cfg: RewardCo
     alignment = float(np.clip(judge.reward, 0.0, 1.0))
     safety = _estimate_safety(rollout)
     realism = _estimate_realism(rollout)
-    total = (
+    total_env = (
         cfg.w_alignment * alignment
         + cfg.w_safety * safety
         + cfg.w_realism * realism
+    )
+    novelty = float(rollout.metadata.get("novelty_score", 0.0))
+    consensus = float(rollout.metadata.get("consensus_score", 0.0))
+    total_augmented = float(
+        total_env
+        + cfg.w_novelty * novelty
+        + cfg.w_consensus * consensus
     )
     return RewardBreakdown(
         alignment=alignment,
         safety=safety,
         realism=realism,
-        total=float(total),
+        total=float(total_augmented),
+        novelty=novelty,
+        consensus=consensus,
+        total_env=float(total_env),
+        total_augmented=float(total_augmented),
     )

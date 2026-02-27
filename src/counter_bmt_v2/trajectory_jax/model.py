@@ -133,6 +133,13 @@ class JaxTrajectoryGenerator(TrajectoryGenerator):
                     metadata={
                         "backend": "jax" if self._jax is not None else "numpy_fallback",
                         "horizon_steps": self.config.horizon_steps,
+                        # RL/manifold placeholders: these are overwritten by RL loop
+                        # once behavior embeddings and novelty/cluster terms are computed.
+                        "risk_features": {},
+                        "behavior_embedding": [],
+                        "novelty_score": 0.0,
+                        "cluster_id": -1,
+                        "consensus_score": 0.0,
                     },
                 )
             )

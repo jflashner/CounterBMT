@@ -2,6 +2,8 @@ from .model import JaxTrajectoryGenerator, TrajectoryGenerator
 from .nnx_bmt import (
     BMTTokenSpaceConfig,
     NNXBMTConfig,
+    NNXDAGConditioningConfig,
+    NNXDAGEncoderConfig,
     NNXDecoderParityConfig,
     NNXRelationParityConfig,
     NNXSceneEncoderConfig,
@@ -15,11 +17,13 @@ from .nnx_bmt import (
     masked_token_accuracy,
     sample_motion_tokens,
 )
+from .dag_gnn_nnx import NNXDAGGraphEncoder
 from .tokenizer_parity import AdvBMTParityTokenizer, ParityTokenBatch, ParityTokenizerConfig
 from .presets import (
     RuntimeTrainPreset,
     adv_bmt_runtime_parity_preset,
     get_runtime_preset,
+    midgpt_dag_latent_config,
     midgpt_parity_config,
     paper_like_full_config,
     paper_like_small_config,
@@ -43,6 +47,8 @@ __all__ = [
     "TrajectoryGenerator",
     "BMTTokenSpaceConfig",
     "NNXBMTConfig",
+    "NNXDAGEncoderConfig",
+    "NNXDAGConditioningConfig",
     "NNXDecoderParityConfig",
     "NNXRelationParityConfig",
     "NNXSceneEncoderConfig",
@@ -55,6 +61,7 @@ __all__ = [
     "masked_token_accuracy",
     "sample_motion_tokens",
     "autoregressive_token_rollout",
+    "NNXDAGGraphEncoder",
     "AdvBMTParityTokenizer",
     "ParityTokenBatch",
     "ParityTokenizerConfig",
@@ -62,6 +69,7 @@ __all__ = [
     "paper_like_small_config",
     "paper_like_full_config",
     "midgpt_parity_config",
+    "midgpt_dag_latent_config",
     "runtime_preset_none",
     "adv_bmt_runtime_parity_preset",
     "get_runtime_preset",

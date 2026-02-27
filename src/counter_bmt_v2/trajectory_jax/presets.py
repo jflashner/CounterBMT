@@ -12,7 +12,9 @@ from typing import Dict
 from counter_bmt_v2.trajectory_jax.nnx_bmt import (
     BMTTokenSpaceConfig,
     NNXBMTConfig,
+    NNXDAGConditioningConfig,
     NNXDecoderParityConfig,
+    NNXDAGEncoderConfig,
     NNXRelationParityConfig,
     NNXSceneEncoderConfig,
 )
@@ -182,3 +184,26 @@ def midgpt_parity_config() -> NNXBMTConfig:
             dt_s=0.5,
         ),
     )
+
+
+def midgpt_dag_latent_config() -> NNXBMTConfig:
+    """MidGPT parity + opt-in DAG latent conditioning."""
+    cfg = midgpt_parity_config()
+    cfg.dag_encoder = NNXDAGEncoderConfig(
+        enabled=True,
+        d_node_in=24,
+        d_edge_in=8,
+        d_hidden=128,
+        n_layers=3,
+        dropout=0.0,
+        max_nodes=64,
+        max_edges=256,
+    )
+    cfg.dag_conditioning = NNXDAGConditioningConfig(
+        enabled=True,
+        injection_mode="global_gated_residual",
+        dag_dropout_prob=0.0,
+        use_null_latent=True,
+        null_latent_init_std=0.02,
+    )
+    return cfg

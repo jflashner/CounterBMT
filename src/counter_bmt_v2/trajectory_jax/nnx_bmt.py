@@ -12,7 +12,7 @@ Paper alignment:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import numpy as np
 
@@ -32,6 +32,7 @@ except Exception:  # pragma: no cover
     HAS_NNX = False
 
 from .fourier_embedding_nnx import FourierEmbeddingNNX
+from .dag_gnn_nnx import NNXDAGEncoderConfig, NNXDAGGraphEncoder
 from .relation_parity import compute_scene_relation_simple_jax
 
 
@@ -105,6 +106,15 @@ class NNXDecoderParityConfig:
 
 
 @dataclass
+class NNXDAGConditioningConfig:
+    enabled: bool = False
+    injection_mode: Literal["global_gated_residual"] = "global_gated_residual"
+    dag_dropout_prob: float = 0.0
+    use_null_latent: bool = True
+    null_latent_init_std: float = 0.02
+
+
+@dataclass
 class NNXBMTConfig:
     """Model configuration for relation-aware NNX BMT."""
 
@@ -125,6 +135,8 @@ class NNXBMTConfig:
     scene_encoder: NNXSceneEncoderConfig = field(default_factory=NNXSceneEncoderConfig)
     relation: NNXRelationParityConfig = field(default_factory=NNXRelationParityConfig)
     decoder: NNXDecoderParityConfig = field(default_factory=NNXDecoderParityConfig)
+    dag_encoder: NNXDAGEncoderConfig = field(default_factory=NNXDAGEncoderConfig)
+    dag_conditioning: NNXDAGConditioningConfig = field(default_factory=NNXDAGConditioningConfig)
     token_space: BMTTokenSpaceConfig = field(default_factory=BMTTokenSpaceConfig)
 
 
@@ -848,11 +860,106 @@ if HAS_NNX:
 
             self.scene_encoder = NNXSceneTokenEncoder(cfg, rngs=rngs)
 
+            # Optional DAG latent conditioning path.
+            self.dag_conditioning_enabled = bool(cfg.dag_conditioning.enabled)
+            self.dag_encoder_enabled = bool(cfg.dag_encoder.enabled)
+            if self.dag_conditioning_enabled:
+                if self.dag_encoder_enabled:
+                    self.dag_encoder = NNXDAGGraphEncoder(cfg.dag_encoder, rngs=rngs)
+                    dag_latent_in = int(cfg.dag_encoder.d_hidden) * 2
+                else:
+                    self.dag_encoder = None
+                    dag_latent_in = int(cfg.d_model)
+                self.dag_latent_proj = Linear(dag_latent_in, d_model, rngs=rngs)
+                self.dag_gate_proj = Linear(dag_latent_in, d_model, rngs=rngs)
+                self.null_dag_latent = nnx.Param(
+                    jax.random.normal(rngs.params(), (dag_latent_in,))
+                    * float(cfg.dag_conditioning.null_latent_init_std)
+                )
+            else:
+                self.dag_encoder = None
+                self.dag_latent_proj = None
+                self.dag_gate_proj = None
+                self.null_dag_latent = None
+
             self.decoder_blocks = tuple(
                 RelationAwareDecoderBlock(cfg, rngs=rngs) for _ in range(cfg.n_layers)
             )
             self.final_norm = RMSNorm(d_model)
             self.token_head = Linear(d_model, n_tokens, rngs=rngs)
+
+        def _apply_dag_conditioning(
+            self,
+            h: jnp.ndarray,
+            *,
+            dag_node_feat: Optional[jnp.ndarray],
+            dag_node_mask: Optional[jnp.ndarray],
+            dag_edge_src: Optional[jnp.ndarray],
+            dag_edge_dst: Optional[jnp.ndarray],
+            dag_edge_feat: Optional[jnp.ndarray],
+            dag_edge_mask: Optional[jnp.ndarray],
+            dag_global_feat: Optional[jnp.ndarray],
+        ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
+            meta: Dict[str, jnp.ndarray] = {}
+            if not self.dag_conditioning_enabled:
+                return h, meta
+
+            bsz = int(h.shape[0])
+            z_dag: Optional[jnp.ndarray] = None
+            has_dag = (
+                dag_node_feat is not None
+                and dag_node_mask is not None
+                and dag_edge_src is not None
+                and dag_edge_dst is not None
+                and dag_edge_feat is not None
+                and dag_edge_mask is not None
+            )
+            if has_dag and self.dag_encoder_enabled and self.dag_encoder is not None:
+                _, z_dag = self.dag_encoder(
+                    dag_node_feat=dag_node_feat,
+                    dag_node_mask=dag_node_mask,
+                    dag_edge_src=dag_edge_src,
+                    dag_edge_dst=dag_edge_dst,
+                    dag_edge_feat=dag_edge_feat,
+                    dag_edge_mask=dag_edge_mask,
+                    dag_global_feat=dag_global_feat,
+                )
+                dag_present = jnp.any(dag_node_mask.astype(bool), axis=1)
+                if bool(self.cfg.dag_conditioning.use_null_latent):
+                    z0 = self.null_dag_latent.value
+                    z_null = jnp.broadcast_to(z0[None, :], (bsz, z0.shape[0]))
+                    z_dag = jnp.where(dag_present[:, None], z_dag, z_null)
+                meta["dag_source_used"] = dag_present.astype(jnp.float32)
+            elif bool(self.cfg.dag_conditioning.use_null_latent):
+                z0 = self.null_dag_latent.value
+                z_dag = jnp.broadcast_to(z0[None, :], (bsz, z0.shape[0]))
+                meta["dag_source_used"] = jnp.zeros((bsz,), dtype=jnp.float32)
+            else:
+                return h, meta
+
+            if z_dag is None:
+                return h, meta
+
+            p_drop = float(np.clip(self.cfg.dag_conditioning.dag_dropout_prob, 0.0, 1.0))
+            if p_drop > 0.0:
+                keep = 1.0 - p_drop
+                # Stochastic without explicit rng threading: deterministic-ish hash by batch index.
+                idx = jnp.arange(z_dag.shape[0], dtype=jnp.float32)
+                pseudo = jnp.mod(jnp.sin(idx * 12.9898 + 78.233) * 43758.5453, 1.0)
+                keep_mask = (pseudo < keep).astype(z_dag.dtype)[:, None]
+                z_dag = z_dag * keep_mask
+
+            if str(self.cfg.dag_conditioning.injection_mode) != "global_gated_residual":
+                return h, meta
+
+            bias = self.dag_latent_proj(z_dag)  # [B,D]
+            gate = jax.nn.sigmoid(self.dag_gate_proj(z_dag))  # [B,D]
+            dag_bias = gate * bias
+            h = h + dag_bias[:, None, None, :]
+
+            meta["dag_latent_norm"] = jnp.linalg.norm(z_dag, axis=-1)
+            meta["dag_gate_mean"] = jnp.mean(gate, axis=-1)
+            return h, meta
 
         def encode_scene_tokens(
             self,
@@ -1080,6 +1187,13 @@ if HAS_NNX:
             a2a_mask: Optional[jnp.ndarray] = None,  # [B,T,N,N]
             a2t_mask: Optional[jnp.ndarray] = None,  # [B,N,T,T]
             a2s_mask: Optional[jnp.ndarray] = None,  # [B,T,N,S]
+            dag_node_feat: Optional[jnp.ndarray] = None,  # [B,G,Fn]
+            dag_node_mask: Optional[jnp.ndarray] = None,  # [B,G]
+            dag_edge_src: Optional[jnp.ndarray] = None,  # [B,E]
+            dag_edge_dst: Optional[jnp.ndarray] = None,  # [B,E]
+            dag_edge_feat: Optional[jnp.ndarray] = None,  # [B,E,Fe]
+            dag_edge_mask: Optional[jnp.ndarray] = None,  # [B,E]
+            dag_global_feat: Optional[jnp.ndarray] = None,  # [B,Fg]
             return_metadata: bool = False,
         ) -> jnp.ndarray | Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
             if bool(self.cfg.decoder.enabled) and bool(self.cfg.decoder.use_legacy_motion_embed):
@@ -1130,6 +1244,18 @@ if HAS_NNX:
                     return_metadata=False,
                 )
 
+            dag_meta: Dict[str, jnp.ndarray] = {}
+            h, dag_meta = self._apply_dag_conditioning(
+                h,
+                dag_node_feat=dag_node_feat,
+                dag_node_mask=dag_node_mask,
+                dag_edge_src=dag_edge_src,
+                dag_edge_dst=dag_edge_dst,
+                dag_edge_feat=dag_edge_feat,
+                dag_edge_mask=dag_edge_mask,
+                dag_global_feat=dag_global_feat,
+            )
+
             for block in self.decoder_blocks:
                 h = block(
                     h,
@@ -1147,7 +1273,10 @@ if HAS_NNX:
             h = self.final_norm(h)
             logits = self.token_head(h)  # [B,T,N,|A|]
             if return_metadata:
-                return logits, {"scene": scene_meta}
+                md: Dict[str, Dict[str, jnp.ndarray]] = {"scene": scene_meta}
+                if dag_meta:
+                    md["dag"] = dag_meta
+                return logits, md
             return logits
 
 

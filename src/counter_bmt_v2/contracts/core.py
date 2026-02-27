@@ -135,6 +135,18 @@ class RewardBreakdown:
     safety: float
     realism: float
     total: float
+    novelty: float = 0.0
+    consensus: float = 0.0
+    total_env: float = 0.0
+    total_augmented: float = 0.0
+
+
+@dataclass
+class RLBatchDiagnostics:
+    entropy: float
+    cluster_hist: Dict[str, int] = field(default_factory=dict)
+    thermostat_eta: float = 0.0
+    thermostat_alpha: float = 0.0
 
 
 @dataclass
