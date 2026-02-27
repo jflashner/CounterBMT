@@ -1,0 +1,60 @@
+run:
+  dataset_dir: data/scenarionet_waymo_training_500
+  output_dir: outputs/head2head_eval_example
+  n_scenarios: 50
+  seed: 0
+  scenario_indices_file: ""
+  metrics:
+    mode: approx # approx | strict_if_available
+  visualization:
+    max_scenarios: 8
+    max_agents: 10
+    selection_policy: largest_spread_sfde_min
+  replay_export:
+    enabled: true
+    max_scenarios: 8
+    mode_index: 0
+    include_ground_truth: false
+  legacy_policy: required_if_available # required_if_available | required | optional
+  reuse_artifacts: true
+  max_parallel_models: 1
+
+models:
+  - id: v2_midgpt_step42000
+    backend: v2
+    checkpoint: outputs/counter_bmt_v2_training_womd_full/checkpoints/step_0042000.pkl
+    enabled: true
+    runtime:
+      model_preset: midgpt_parity
+      tokenizer_mode: adv_bmt_parity
+      skip_steps: 5
+      num_modes: 6
+      sampling_method: topp
+      topp: 0.95
+      temperature: 1.0
+
+  - id: v2_midgpt_step60000
+    backend: v2
+    checkpoint: outputs/counter_bmt_v2_training_womd_full/checkpoints/step_0060000.pkl
+    enabled: true
+    runtime:
+      model_preset: midgpt_parity
+      tokenizer_mode: adv_bmt_parity
+      skip_steps: 5
+      num_modes: 6
+      sampling_method: topp
+      topp: 0.95
+      temperature: 1.0
+
+  - id: legacy_adv_bmt_last
+    backend: legacy_adv_bmt
+    checkpoint: src/Adv-BMT/bmt/ckpt/last.ckpt
+    enabled: false
+    runtime:
+      python_bin: python
+      legacy_root: src/Adv-BMT
+      skip_steps: 5
+      num_modes: 6
+      sampling_method: topp
+      topp: 0.95
+      temperature: 1.0

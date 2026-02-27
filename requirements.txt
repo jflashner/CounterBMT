@@ -17,3 +17,4 @@ flax==0.10.7
 optax==0.2.7
 openai==2.9.0
 matplotlib==3.9.0
+tensorboard==2.12.3

@@ -137,6 +137,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batches", type=int, default=10)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--checkpoint-every", type=int, default=200)
+    parser.add_argument(
+        "--tensorboard",
+        dest="tensorboard",
+        action="store_true",
+        help="enable TensorBoard scalar logging",
+    )
+    parser.add_argument(
+        "--no-tensorboard",
+        dest="tensorboard",
+        action="store_false",
+        help="disable TensorBoard scalar logging",
+    )
+    parser.set_defaults(tensorboard=True)
+    parser.add_argument(
+        "--tensorboard-subdir",
+        type=str,
+        default="tensorboard",
+        help="TensorBoard log subdirectory under --output-dir",
+    )
+    parser.add_argument(
+        "--tensorboard-flush-secs",
+        type=int,
+        default=30,
+        help="TensorBoard SummaryWriter flush interval in seconds",
+    )
+    parser.add_argument(
+        "--no-tensorboard-log-run-config",
+        dest="tensorboard_log_run_config",
+        action="store_false",
+        help="do not write run config/summary text entries to TensorBoard",
+    )
+    parser.set_defaults(tensorboard_log_run_config=True)
 
     parser.add_argument("--max-time-steps", type=int, default=91)
     parser.add_argument("--max-agents", type=int, default=128)
@@ -340,6 +372,10 @@ def main() -> int:
         eval_batches=args.eval_batches,
         log_every_steps=args.log_every,
         checkpoint_every_steps=args.checkpoint_every,
+        enable_tensorboard=bool(args.tensorboard),
+        tensorboard_subdir=str(args.tensorboard_subdir),
+        tensorboard_flush_secs=max(1, int(args.tensorboard_flush_secs)),
+        tensorboard_log_run_config=bool(args.tensorboard_log_run_config),
         max_time_steps=args.max_time_steps,
         max_agents=args.max_agents,
         max_map_features=args.max_map_features,

@@ -15,7 +15,7 @@ if __package__ is None or __package__ == "":
     if src_root_str not in sys.path:
         sys.path.insert(0, src_root_str)
 
-from counter_bmt_v2.training import DAGLatentTrainConfig, train_supervised_dag_latent
+from counter_bmt_v2.training import DAGLatentTrainConfig, ForwardPassEvalConfig, train_supervised_dag_latent
 from counter_bmt_v2.trajectory_jax import get_runtime_preset
 
 
@@ -111,6 +111,85 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batches", type=int, default=10)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--checkpoint-every", type=int, default=200)
+    parser.add_argument(
+        "--no-forward-eval",
+        action="store_true",
+        help="disable Adv-BMT-style forward-pass validation metrics",
+    )
+    parser.add_argument("--forward-eval-modes", type=int, default=6)
+    parser.add_argument(
+        "--forward-eval-sampling",
+        type=str,
+        default="topp",
+        choices=["topp", "topk", "softmax", "argmax"],
+    )
+    parser.add_argument("--forward-eval-temperature", type=float, default=1.0)
+    parser.add_argument("--forward-eval-topp", type=float, default=0.95)
+    parser.add_argument("--forward-eval-topk", type=int, default=5)
+    parser.add_argument(
+        "--no-forward-viz",
+        action="store_true",
+        help="disable saving rollout-vs-GT visualizations during eval",
+    )
+    parser.add_argument("--forward-viz-max-scenarios", type=int, default=2)
+    parser.add_argument("--forward-viz-max-agents", type=int, default=10)
+    parser.add_argument(
+        "--forward-export-artifacts",
+        dest="forward_export_artifacts",
+        action="store_true",
+        help="export per-scenario forward-eval artifacts for offline strict parity checks",
+    )
+    parser.add_argument(
+        "--no-forward-export-artifacts",
+        dest="forward_export_artifacts",
+        action="store_false",
+        help="disable forward-eval artifact export",
+    )
+    parser.set_defaults(forward_export_artifacts=True)
+    parser.add_argument(
+        "--forward-artifact-max-scenarios",
+        type=int,
+        default=32,
+        help="maximum number of scenarios to export per eval call",
+    )
+    parser.add_argument(
+        "--forward-artifact-subdir",
+        type=str,
+        default="forward_eval_artifacts",
+        help="output subdirectory for forward-eval artifact exports",
+    )
+    parser.add_argument(
+        "--tensorboard",
+        dest="tensorboard",
+        action="store_true",
+        help="enable TensorBoard scalar logging",
+    )
+    parser.add_argument(
+        "--no-tensorboard",
+        dest="tensorboard",
+        action="store_false",
+        help="disable TensorBoard scalar logging",
+    )
+    parser.set_defaults(tensorboard=True)
+    parser.add_argument(
+        "--tensorboard-subdir",
+        type=str,
+        default="tensorboard",
+        help="TensorBoard log subdirectory under --output-dir",
+    )
+    parser.add_argument(
+        "--tensorboard-flush-secs",
+        type=int,
+        default=30,
+        help="TensorBoard SummaryWriter flush interval in seconds",
+    )
+    parser.add_argument(
+        "--no-tensorboard-log-run-config",
+        dest="tensorboard_log_run_config",
+        action="store_false",
+        help="do not write run config/summary text entries to TensorBoard",
+    )
+    parser.set_defaults(tensorboard_log_run_config=True)
 
     parser.add_argument("--max-time-steps", type=int, default=91)
     parser.add_argument("--max-agents", type=int, default=128)
@@ -259,6 +338,10 @@ def main() -> int:
         eval_batches=int(args.eval_batches),
         log_every_steps=int(args.log_every),
         checkpoint_every_steps=int(args.checkpoint_every),
+        enable_tensorboard=bool(args.tensorboard),
+        tensorboard_subdir=str(args.tensorboard_subdir),
+        tensorboard_flush_secs=max(1, int(args.tensorboard_flush_secs)),
+        tensorboard_log_run_config=bool(args.tensorboard_log_run_config),
         max_time_steps=int(args.max_time_steps),
         max_agents=int(args.max_agents),
         max_map_features=int(args.max_map_features),
@@ -281,6 +364,20 @@ def main() -> int:
         stage_b_freeze_non_dag=bool(args.stage_b_freeze_non_dag),
         stage_c_decoder_lr_scale=float(args.stage_c_decoder_lr_scale),
         stage_c_dag_lr_scale=float(args.stage_c_dag_lr_scale),
+        forward_eval=ForwardPassEvalConfig(
+            enabled=(not args.no_forward_eval),
+            num_modes=max(1, int(args.forward_eval_modes)),
+            sampling_method=str(args.forward_eval_sampling),
+            temperature=float(args.forward_eval_temperature),
+            topp=float(args.forward_eval_topp),
+            topk=max(1, int(args.forward_eval_topk)),
+            export_artifacts=bool(args.forward_export_artifacts),
+            artifact_output_subdir=str(args.forward_artifact_subdir),
+            artifact_max_scenarios_per_eval=max(0, int(args.forward_artifact_max_scenarios)),
+            save_visualizations=(not args.no_forward_viz),
+            viz_max_scenarios=max(0, int(args.forward_viz_max_scenarios)),
+            viz_max_agents=max(1, int(args.forward_viz_max_agents)),
+        ),
     )
 
     summary = train_supervised_dag_latent(cfg)
@@ -292,4 +389,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

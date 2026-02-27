@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import time
@@ -47,6 +48,14 @@ from .supervised import (
     _write_jsonl,
     _write_split_artifacts,
     _compute_metric_dict,
+)
+from .forward_metrics import compute_forward_pass_metrics_for_batch, nanmean_metrics
+from .tensorboard_logging import (
+    create_tb_writer,
+    tb_close,
+    tb_write_scalar,
+    tb_write_scalars,
+    tb_write_text,
 )
 
 
@@ -149,6 +158,9 @@ def _attach_dag_inputs(
     }
     dag_inputs = _cast_tree_precision(dag_inputs, precision=train_cfg.precision)
     prepared["model_inputs"].update(dag_inputs)
+    # Keep resolved DAG payloads for eval-time qualitative export.
+    prepared["_dag_payloads"] = dags
+    prepared["_dag_sources"] = source_labels
 
     total = float(max(1, len(source_labels)))
     hits = float(sum(1 for s in source_labels if s == "cache"))
@@ -159,6 +171,166 @@ def _attach_dag_inputs(
         "dag_source/fallback_rate": fallback / total,
         "dag_source/null_rate": nulls / total,
     }
+
+
+def _sanitize_name(name: str) -> str:
+    safe = []
+    for ch in str(name):
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe).strip("_") or "scenario"
+
+
+def _save_scene_snapshot_plot(
+    *,
+    out_file: Path,
+    scenario_id: str,
+    raw_batch: Dict[str, Any],
+    sample_index: int,
+    max_agents: int,
+) -> bool:
+    """Save a compact BEV scene snapshot for qualitative checkpoint tracking."""
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return False
+
+    try:
+        pos_tn2 = np.asarray(raw_batch["agent_position_xy"][sample_index], dtype=np.float32)
+        valid_tn = np.asarray(raw_batch["agent_valid_mask"][sample_index], dtype=bool)
+        map_pos_m3 = np.asarray(raw_batch["map_position"][sample_index], dtype=np.float32)
+        map_valid_mvn = np.asarray(raw_batch["map_feature_valid_mask"][sample_index], dtype=bool)
+        tl_pos_ln2 = np.asarray(raw_batch["traffic_light_position"][sample_index], dtype=np.float32)
+        tl_valid_tl = np.asarray(raw_batch["traffic_light_valid_mask"][sample_index], dtype=bool)
+    except Exception:
+        return False
+
+    t_steps = int(pos_tn2.shape[0]) if pos_tn2.ndim == 3 else 0
+    n_agents = int(pos_tn2.shape[1]) if pos_tn2.ndim == 3 else 0
+    if t_steps <= 0 or n_agents <= 0:
+        return False
+
+    if np.any(valid_tn):
+        valid_t = np.where(np.any(valid_tn, axis=1))[0]
+        t0 = int(valid_t[0]) if valid_t.size > 0 else 0
+    else:
+        t0 = 0
+
+    fig = plt.figure(figsize=(7.0, 7.0))
+    ax = fig.add_subplot(1, 1, 1)
+
+    # Static map feature centers.
+    if map_pos_m3.ndim == 2 and map_pos_m3.shape[0] == map_valid_mvn.shape[0]:
+        map_valid_m = np.any(map_valid_mvn, axis=1)
+        map_xy = map_pos_m3[map_valid_m, :2]
+        if map_xy.size > 0:
+            keep = int(min(map_xy.shape[0], 4000))
+            ax.scatter(map_xy[:keep, 0], map_xy[:keep, 1], s=1.0, c="#b0b0b0", alpha=0.35)
+
+    # Traffic lights.
+    if tl_valid_tl.ndim == 2 and t0 < tl_valid_tl.shape[0]:
+        tl_valid_l = tl_valid_tl[t0]
+    elif tl_valid_tl.ndim == 1:
+        tl_valid_l = tl_valid_tl
+    else:
+        tl_valid_l = np.zeros((tl_pos_ln2.shape[0],), dtype=bool)
+
+    if tl_pos_ln2.ndim == 2 and tl_pos_ln2.shape[0] == tl_valid_l.shape[0]:
+        tl_xy = tl_pos_ln2[tl_valid_l, :2]
+        if tl_xy.size > 0:
+            ax.scatter(tl_xy[:, 0], tl_xy[:, 1], s=10, marker="s", c="#f39c12", alpha=0.9, label="traffic_light")
+
+    # Agents at snapshot timestep + short history.
+    valid_counts = np.sum(valid_tn, axis=0)
+    order = np.argsort(-valid_counts)
+    picked: List[int] = []
+    if n_agents > 0:
+        picked.append(0)  # SDC first.
+    for idx in order.tolist():
+        if idx in picked or valid_counts[idx] <= 0:
+            continue
+        picked.append(int(idx))
+        if len(picked) >= int(max(1, max_agents)):
+            break
+
+    cmap = plt.get_cmap("tab20")
+    for i, n in enumerate(picked):
+        color = cmap(i % 20)
+        hist_start = max(0, t0 - 6)
+        hist_mask = valid_tn[hist_start : t0 + 1, n]
+        if np.any(hist_mask):
+            hist_xy = pos_tn2[hist_start : t0 + 1, n][hist_mask]
+            ax.plot(hist_xy[:, 0], hist_xy[:, 1], color=color, linewidth=1.0, alpha=0.8)
+        if valid_tn[t0, n]:
+            ax.scatter(pos_tn2[t0, n, 0], pos_tn2[t0, n, 1], s=18 if n == 0 else 10, color=color, alpha=0.95)
+
+    ax.set_title(f"Scene Snapshot | {scenario_id} | t={t0}")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.grid(True, alpha=0.25)
+    ax.axis("equal")
+    fig.tight_layout()
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_file, dpi=140)
+    plt.close(fig)
+    return True
+
+
+def _export_eval_dag_context(
+    *,
+    output_dir: Path | None,
+    global_step: int | None,
+    prepared: Dict[str, Any],
+    max_scenarios: int,
+    max_agents: int,
+) -> int:
+    """Export DAG JSON + scene snapshot for a few eval scenarios."""
+    if output_dir is None or global_step is None or int(max_scenarios) <= 0:
+        return 0
+
+    raw = prepared["raw_batch"]
+    scenario_ids = list(raw.get("scenario_ids", []))
+    dags: List[Dict[str, Any]] = list(prepared.get("_dag_payloads", []))
+    sources: List[str] = list(prepared.get("_dag_sources", []))
+    if not scenario_ids:
+        return 0
+
+    step_dir = Path(output_dir) / "forward_eval_context" / f"step_{int(global_step):07d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+    for b, sid in enumerate(scenario_ids):
+        if saved >= int(max_scenarios):
+            break
+        sid_s = str(sid)
+        sid_safe = _sanitize_name(sid_s)
+        scenario_dir = step_dir / sid_safe
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        dag_payload: Dict[str, Any]
+        if b < len(dags) and isinstance(dags[b], dict):
+            dag_payload = dict(dags[b])
+        else:
+            dag_payload = _empty_dag_payload(sid_s)
+        dag_meta = dag_payload.get("metadata", {})
+        if not isinstance(dag_meta, dict):
+            dag_meta = {"metadata_raw": str(dag_meta)}
+        dag_meta["resolved_source"] = str(sources[b]) if b < len(sources) else "unknown"
+        dag_payload["metadata"] = dag_meta
+        dag_payload["scenario_id"] = sid_s
+
+        (scenario_dir / "dag.json").write_text(json.dumps(dag_payload, indent=2), encoding="utf-8")
+        _save_scene_snapshot_plot(
+            out_file=scenario_dir / "scene_snapshot.png",
+            scenario_id=sid_s,
+            raw_batch=raw,
+            sample_index=b,
+            max_agents=max(1, int(max_agents)),
+        )
+        saved += 1
+    return saved
 
 
 def _path_to_str(path: Tuple[Any, ...]) -> str:
@@ -328,6 +500,8 @@ def _evaluate_dag(
     rng: np.random.Generator,
     resolver: DAGSourceResolver,
     num_devices: int,
+    output_dir: Path | None = None,
+    global_step: int | None = None,
 ) -> Dict[str, float]:
     if len(val_indices) == 0:
         return {}
@@ -335,6 +509,13 @@ def _evaluate_dag(
     if int(train_cfg.eval_batches) > 0:
         val_batches = val_batches[: int(train_cfg.eval_batches)]
     all_metrics: List[Dict[str, float]] = []
+    forward_metrics_list: List[Dict[str, float]] = []
+    forward_viz_saved = 0
+    forward_artifact_saved = 0
+    forward_context_saved = 0
+    viz_remaining = max(0, int(train_cfg.forward_eval.viz_max_scenarios))
+    artifact_remaining = max(0, int(train_cfg.forward_eval.artifact_max_scenarios_per_eval))
+    context_remaining = max(viz_remaining, artifact_remaining)
     for idx_batch in val_batches:
         samples = [loader.load(int(i)) for i in idx_batch]
         prepared = _prepare_supervised_batch(
@@ -368,12 +549,50 @@ def _evaluate_dag(
         mf.update({k: float(v) for k, v in dag_stats.items()})
         all_metrics.append(mf)
 
-    if not all_metrics:
-        return {}
-    keys = list(all_metrics[0].keys())
+        if bool(train_cfg.forward_eval.enabled):
+            batch_forward_metrics, batch_viz_saved, batch_artifact_saved = compute_forward_pass_metrics_for_batch(
+                model=model,
+                prepared_batch=prepared,
+                tokenizer=tokenizer,
+                skip_steps=int(train_cfg.skip_steps),
+                eval_cfg=train_cfg.forward_eval,
+                seed=int(train_cfg.seed + int(global_step or 0) + int(idx_batch[0] if len(idx_batch) > 0 else 0)),
+                output_dir=output_dir,
+                global_step=global_step,
+                max_visualizations=viz_remaining,
+                max_artifacts=artifact_remaining,
+            )
+            forward_metrics_list.extend(batch_forward_metrics)
+            forward_viz_saved += int(batch_viz_saved)
+            forward_artifact_saved += int(batch_artifact_saved)
+            viz_remaining = max(0, viz_remaining - int(batch_viz_saved))
+            artifact_remaining = max(0, artifact_remaining - int(batch_artifact_saved))
+
+            # Export scenario snapshots + resolved DAGs aligned with rollout exports.
+            context_budget = max(int(batch_viz_saved), int(batch_artifact_saved))
+            if context_budget > 0 and context_remaining > 0:
+                saved_now = _export_eval_dag_context(
+                    output_dir=output_dir,
+                    global_step=global_step,
+                    prepared=prepared,
+                    max_scenarios=min(context_remaining, context_budget),
+                    max_agents=max(1, int(train_cfg.forward_eval.viz_max_agents)),
+                )
+                forward_context_saved += int(saved_now)
+                context_remaining = max(0, context_remaining - int(saved_now))
+
     out: Dict[str, float] = {}
-    for k in keys:
-        out[k] = float(np.mean([m[k] for m in all_metrics]))
+    if all_metrics:
+        keys = list(all_metrics[0].keys())
+        for k in keys:
+            out[k] = float(np.mean([m[k] for m in all_metrics]))
+    if forward_metrics_list:
+        forward_avg = nanmean_metrics(forward_metrics_list)
+        out.update({f"forward_approx/{k}": float(v) for k, v in forward_avg.items()})
+        out["forward_approx/scenario_count"] = float(len(forward_metrics_list))
+        out["forward_approx/visualizations_saved"] = float(forward_viz_saved)
+        out["forward_approx/artifacts_saved"] = float(forward_artifact_saved)
+        out["forward_approx/context_saved"] = float(forward_context_saved)
     return out
 
 
@@ -506,10 +725,34 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
             "cache_strict": bool(train_cfg.dag_cache_strict),
             "stage": str(train_cfg.stage),
         },
+        "forward_metric_namespaces": ["forward_approx"],
+        "forward_artifact_export": {
+            "enabled": bool(train_cfg.forward_eval.export_artifacts),
+            "subdir": str(train_cfg.forward_eval.artifact_output_subdir),
+            "max_scenarios_per_eval": int(train_cfg.forward_eval.artifact_max_scenarios_per_eval),
+            "metric_scope": str(train_cfg.forward_eval.metric_scope),
+            "context_subdir": "forward_eval_context",
+        },
+        "tensorboard": {
+            "enabled": bool(train_cfg.enable_tensorboard),
+            "log_dir": str(output_dir / str(train_cfg.tensorboard_subdir)),
+            "flush_secs": int(train_cfg.tensorboard_flush_secs),
+            "log_run_config": bool(train_cfg.tensorboard_log_run_config),
+        },
         "artifacts": artifact_paths,
         "created_at": int(time.time()),
     }
     (output_dir / "run_config.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
+    tb_writer = create_tb_writer(
+        output_dir=output_dir,
+        subdir=str(train_cfg.tensorboard_subdir),
+        enabled=bool(train_cfg.enable_tensorboard),
+        flush_secs=int(train_cfg.tensorboard_flush_secs),
+    )
+    if tb_writer is not None:
+        atexit.register(tb_close, tb_writer)
+    if bool(train_cfg.tensorboard_log_run_config):
+        tb_write_text(tb_writer, "run/config", json.dumps(run_meta, indent=2), step=0)
 
     resolver = DAGSourceResolver(
         mode=str(train_cfg.dag_source_mode),
@@ -628,6 +871,8 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
                 "metrics": mf,
             },
         )
+        tb_write_scalar(tb_writer, "train/lr", lr_now, global_step)
+        tb_write_scalars(tb_writer, "train", mf, global_step)
         if global_step % max(1, int(train_cfg.log_every_steps)) == 0:
             _print_metrics(
                 prefix=f"train[{stage_now}]",
@@ -637,6 +882,7 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
                 elapsed_s=time.time() - t0,
             )
 
+        did_eval_this_step = False
         if len(val_indices) > 0 and global_step % max(1, int(train_cfg.eval_every_steps)) == 0:
             eval_metrics = _evaluate_dag(
                 model=model,
@@ -649,7 +895,10 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
                 rng=train_rng,
                 resolver=resolver,
                 num_devices=num_devices,
+                output_dir=output_dir,
+                global_step=global_step,
             )
+            did_eval_this_step = True
             _assert_finite_metrics(eval_metrics, phase="eval", step=global_step)
             _write_jsonl(
                 metrics_log_path,
@@ -662,6 +911,7 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
                     "metrics": eval_metrics,
                 },
             )
+            tb_write_scalars(tb_writer, "eval", eval_metrics, global_step)
             _print_metrics(
                 prefix=f"eval [{stage_now}]",
                 step=global_step,
@@ -684,8 +934,40 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
                     runtime_state=_runtime_state(stage_now),
                 )
                 print(f"Saved improved checkpoint: {path}")
+                tb_write_scalar(tb_writer, "events/checkpoint_saved", 1.0, global_step)
 
         if global_step % max(1, int(train_cfg.checkpoint_every_steps)) == 0:
+            # Ensure checkpoint steps have qualitative rollout exports even when
+            # checkpoint cadence differs from eval cadence.
+            if len(val_indices) > 0 and bool(train_cfg.forward_eval.enabled) and (not did_eval_this_step):
+                ckpt_eval_metrics = _evaluate_dag(
+                    model=model,
+                    loader=val_loader,
+                    val_indices=val_indices,
+                    train_cfg=train_cfg,
+                    model_cfg=model_cfg,
+                    tokenizer=tokenizer,
+                    default_token_id=default_token_id,
+                    rng=train_rng,
+                    resolver=resolver,
+                    num_devices=num_devices,
+                    output_dir=output_dir,
+                    global_step=global_step,
+                )
+                _assert_finite_metrics(ckpt_eval_metrics, phase="checkpoint_eval", step=global_step)
+                _write_jsonl(
+                    metrics_log_path,
+                    {
+                        "phase": "checkpoint_eval",
+                        "step": int(global_step),
+                        "epoch": int(epoch),
+                        "lr": float(lr_now),
+                        "stage": str(stage_now),
+                        "metrics": ckpt_eval_metrics,
+                    },
+                )
+                tb_write_scalars(tb_writer, "checkpoint_eval", ckpt_eval_metrics, global_step)
+
             path = _save_checkpoint(
                 output_dir=output_dir,
                 train_step=global_step,
@@ -697,6 +979,7 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
                 runtime_state=_runtime_state(stage_now),
             )
             print(f"Saved checkpoint: {path}")
+            tb_write_scalar(tb_writer, "events/checkpoint_saved", 1.0, global_step)
 
     final_stage = _resolve_stage(train_cfg, global_step)
     final_eval = (
@@ -711,11 +994,14 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
             rng=train_rng,
             resolver=resolver,
             num_devices=num_devices,
+            output_dir=output_dir,
+            global_step=global_step,
         )
         if len(val_indices) > 0
         else {}
     )
     _assert_finite_metrics(final_eval, phase="final_eval", step=global_step)
+    tb_write_scalars(tb_writer, "final_eval", final_eval, global_step)
     final_ckpt = _save_checkpoint(
         output_dir=output_dir,
         train_step=global_step,
@@ -726,6 +1012,7 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
         latest_metrics=final_eval,
         runtime_state=_runtime_state(final_stage),
     )
+    tb_write_scalar(tb_writer, "events/checkpoint_saved", 1.0, global_step)
 
     summary = {
         "output_dir": str(output_dir),
@@ -747,4 +1034,7 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
         "elapsed_seconds": float(time.time() - t0),
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    if bool(train_cfg.tensorboard_log_run_config):
+        tb_write_text(tb_writer, "run/summary", json.dumps(summary, indent=2), step=global_step)
+    tb_close(tb_writer)
     return summary

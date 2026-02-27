@@ -11,6 +11,7 @@ Paper alignment notes:
 
 from __future__ import annotations
 
+import atexit
 from concurrent.futures import ThreadPoolExecutor
 import json
 import hashlib
@@ -35,6 +36,13 @@ from .forward_metrics import (
     ForwardPassEvalConfig,
     compute_forward_pass_metrics_for_batch,
     nanmean_metrics,
+)
+from .tensorboard_logging import (
+    create_tb_writer,
+    tb_close,
+    tb_write_scalar,
+    tb_write_scalars,
+    tb_write_text,
 )
 from counter_bmt_v2.trajectory_jax import (
     AdvBMTParityTokenizer,
@@ -110,6 +118,10 @@ class SupervisedTrainConfig:
     eval_batches: int = 10
     log_every_steps: int = 10
     checkpoint_every_steps: int = 200
+    enable_tensorboard: bool = True
+    tensorboard_subdir: str = "tensorboard"
+    tensorboard_flush_secs: int = 30
+    tensorboard_log_run_config: bool = True
 
     # Fixed collate shapes prevent recompilation churn and keep JIT stable.
     max_time_steps: int = 91
@@ -1732,11 +1744,28 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
             "max_scenarios_per_eval": int(train_cfg.forward_eval.artifact_max_scenarios_per_eval),
             "metric_scope": str(train_cfg.forward_eval.metric_scope),
         },
+        "tensorboard": {
+            "enabled": bool(train_cfg.enable_tensorboard),
+            "log_dir": str(output_dir / str(train_cfg.tensorboard_subdir)),
+            "flush_secs": int(train_cfg.tensorboard_flush_secs),
+            "log_run_config": bool(train_cfg.tensorboard_log_run_config),
+        },
         "created_at": int(time.time()),
     }
 
     with (output_dir / "run_config.json").open("w", encoding="utf-8") as f:
         json.dump(run_meta, f, indent=2)
+
+    tb_writer = create_tb_writer(
+        output_dir=output_dir,
+        subdir=str(train_cfg.tensorboard_subdir),
+        enabled=bool(train_cfg.enable_tensorboard),
+        flush_secs=int(train_cfg.tensorboard_flush_secs),
+    )
+    if tb_writer is not None:
+        atexit.register(tb_close, tb_writer)
+    if bool(train_cfg.tensorboard_log_run_config):
+        tb_write_text(tb_writer, "run/config", json.dumps(run_meta, indent=2), step=0)
 
     metrics_log_path = output_dir / "metrics.jsonl"
 
@@ -1858,6 +1887,8 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
                 "metrics": metrics_f,
             },
         )
+        tb_write_scalar(tb_writer, "train/lr", lr_now, global_step)
+        tb_write_scalars(tb_writer, "train", metrics_f, global_step)
 
         if global_step % max(1, train_cfg.log_every_steps) == 0:
             _print_metrics(
@@ -1894,6 +1925,7 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
                     "metrics": eval_metrics,
                 },
             )
+            tb_write_scalars(tb_writer, "eval", eval_metrics, global_step)
             _print_metrics(
                 prefix="eval ",
                 step=global_step,
@@ -1917,6 +1949,7 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
                     runtime_state=_runtime_state(),
                 )
                 print(f"Saved improved checkpoint: {best_path}")
+                tb_write_scalar(tb_writer, "events/checkpoint_saved", 1.0, global_step)
 
         if global_step % max(1, train_cfg.checkpoint_every_steps) == 0:
             ckpt_path = _save_checkpoint(
@@ -1930,6 +1963,7 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
                 runtime_state=_runtime_state(),
             )
             print(f"Saved checkpoint: {ckpt_path}")
+            tb_write_scalar(tb_writer, "events/checkpoint_saved", 1.0, global_step)
 
     # Final checkpoint and summary.
     final_metrics = _evaluate(
@@ -1945,6 +1979,7 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         global_step=global_step,
     ) if len(val_indices) > 0 else {}
     _assert_finite_metrics(final_metrics, phase="final_eval", step=global_step)
+    tb_write_scalars(tb_writer, "final_eval", final_metrics, global_step)
 
     final_ckpt = _save_checkpoint(
         output_dir=output_dir,
@@ -1956,6 +1991,7 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         latest_metrics=final_metrics,
         runtime_state=_runtime_state(),
     )
+    tb_write_scalar(tb_writer, "events/checkpoint_saved", 1.0, global_step)
 
     summary = {
         "output_dir": str(output_dir),
@@ -1977,5 +2013,8 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
 
     with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+    if bool(train_cfg.tensorboard_log_run_config):
+        tb_write_text(tb_writer, "run/summary", json.dumps(summary, indent=2), step=global_step)
+    tb_close(tb_writer)
 
     return summary

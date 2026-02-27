@@ -1,0 +1,34 @@
+run:
+  dataset_dir: data/scenarionet_waymo_training_500
+  output_dir: outputs/legacy_adv_bmt_waymo500_eval
+  n_scenarios: 500
+  seed: 0
+  scenario_indices_file: ""
+  metrics:
+    mode: approx
+  visualization:
+    max_scenarios: 0
+    max_agents: 10
+    selection_policy: largest_spread_sfde_min
+  replay_export:
+    enabled: false
+    max_scenarios: 0
+    mode_index: 0
+    include_ground_truth: false
+  legacy_policy: required
+  reuse_artifacts: true
+  max_parallel_models: 1
+
+models:
+  - id: legacy_adv_bmt_last
+    backend: legacy_adv_bmt
+    checkpoint: bmt/ckpt/last.ckpt
+    enabled: true
+    runtime:
+      python_bin: .venv/bin/python
+      legacy_root: src/Adv-BMT
+      skip_steps: 5
+      num_modes: 6
+      sampling_method: topp
+      topp: 0.95
+      temperature: 1.0
