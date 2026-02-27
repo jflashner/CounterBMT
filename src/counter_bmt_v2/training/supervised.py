@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import hashlib
 import math
+import os
 import pickle
 import sys
 import time
@@ -889,6 +890,22 @@ def _prescan_cache_path(output_dir: Path) -> Path:
     return output_dir / "manifests" / "prescan_cache.pkl"
 
 
+def _prescan_cache_store_root() -> Path:
+    env = str(os.environ.get("COUNTER_BMT_PRESCAN_CACHE_DIR", "")).strip()
+    if env:
+        return Path(env)
+    return Path("outputs") / "_prescan_cache"
+
+
+def _prescan_cache_key_hash(cache_key: Dict[str, Any]) -> str:
+    encoded = json.dumps(cache_key, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _prescan_global_cache_path(cache_key: Dict[str, Any]) -> Path:
+    return _prescan_cache_store_root() / f"{_prescan_cache_key_hash(cache_key)}.pkl"
+
+
 def _build_prescan_cache_key(
     *,
     split_mode: str,
@@ -911,15 +928,7 @@ def _build_prescan_cache_key(
     }
 
 
-def _load_prescan_cache(*, output_dir: Path, cache_key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    cache_path = _prescan_cache_path(output_dir)
-    if not cache_path.is_file():
-        return None
-    try:
-        with cache_path.open("rb") as f:
-            payload = pickle.load(f)
-    except Exception:
-        return None
+def _extract_prescan_cache_data(payload: Any, cache_key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return None
     if payload.get("cache_key") != cache_key:
@@ -941,12 +950,37 @@ def _load_prescan_cache(*, output_dir: Path, cache_key: Dict[str, Any]) -> Optio
     return data
 
 
+def _load_prescan_cache_from_path(*, cache_path: Path, cache_key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not cache_path.is_file():
+        return None
+    try:
+        with cache_path.open("rb") as f:
+            payload = pickle.load(f)
+    except Exception:
+        return None
+    return _extract_prescan_cache_data(payload, cache_key)
+
+
+def _load_prescan_cache(*, output_dir: Path, cache_key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # Prefer run-local cache for compatibility, then dataset-keyed global cache.
+    local_path = _prescan_cache_path(output_dir)
+    cached = _load_prescan_cache_from_path(cache_path=local_path, cache_key=cache_key)
+    if cached is not None:
+        return cached
+    global_path = _prescan_global_cache_path(cache_key)
+    return _load_prescan_cache_from_path(cache_path=global_path, cache_key=cache_key)
+
+
 def _save_prescan_cache(*, output_dir: Path, cache_key: Dict[str, Any], data: Dict[str, Any]) -> None:
-    cache_path = _prescan_cache_path(output_dir)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"cache_key": cache_key, "data": data}
-    with cache_path.open("wb") as f:
-        pickle.dump(payload, f)
+    # Write both run-local and global dataset-keyed caches.
+    for cache_path in (_prescan_cache_path(output_dir), _prescan_global_cache_path(cache_key)):
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with cache_path.open("wb") as f:
+                pickle.dump(payload, f)
+        except Exception:
+            continue
 
 
 def _assert_finite_metrics(metrics: Dict[str, float], *, phase: str, step: int) -> None:
@@ -1723,7 +1757,9 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         "prescan_cache": {
             "enabled": bool(train_cfg.use_prescan_cache),
             "cache_hit": bool(cached_prescan is not None),
-            "cache_path": str(_prescan_cache_path(output_dir)),
+            "cache_local_path": str(_prescan_cache_path(output_dir)),
+            "cache_global_path": str(_prescan_global_cache_path(prescan_cache_key)),
+            "cache_key_hash": str(_prescan_cache_key_hash(prescan_cache_key)),
             "cache_key": prescan_cache_key,
         },
         "train_size": int(len(train_indices)),
