@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import json
 import math
+import pickle
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -32,17 +33,21 @@ from .supervised import (
     SupervisedTrainConfig,
     _as_float_metrics,
     _assert_finite_metrics,
+    _build_prescan_cache_key,
     _build_lr_schedule,
     _cast_tree_precision,
     _eval_step,
     _eval_step_pmap,
     _hash_indices,
+    _load_prescan_cache,
     _load_checkpoint,
     _prepare_supervised_batch,
+    _prescan_cache_path,
     _prescan_indices,
     _print_metrics,
     _resolve_data_sources,
     _resolve_model_preset,
+    _save_prescan_cache,
     _save_checkpoint,
     _shard_tree_for_pmap,
     _write_jsonl,
@@ -65,6 +70,9 @@ StageType = Literal["A", "B", "C", "A_B_C"]
 
 @dataclass
 class DAGLatentTrainConfig(SupervisedTrainConfig):
+    # Optional override path to reuse a compatible prescan cache file from
+    # another run (for example the non-DAG WOMD full training run).
+    prescan_cache_source: str = ""
     dag_source_mode: DAGSourceModeType = "dual"
     dag_cache_dir: str = ""
     dag_cache_strict: bool = False
@@ -331,6 +339,35 @@ def _export_eval_dag_context(
         )
         saved += 1
     return saved
+
+
+def _load_prescan_cache_from_file(*, cache_file: Path, cache_key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not cache_file.is_file():
+        return None
+    try:
+        with cache_file.open("rb") as f:
+            payload = pickle.load(f)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("cache_key") != cache_key:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    required = (
+        "train_indices",
+        "val_indices",
+        "train_manifest",
+        "val_manifest",
+        "skipped_records",
+        "train_trunc_candidates",
+        "val_trunc_candidates",
+    )
+    if any(k not in data for k in required):
+        return None
+    return data
 
 
 def _path_to_str(path: Tuple[Any, ...]) -> str:
@@ -621,22 +658,79 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
     split_mode, train_loader, train_indices, val_loader, val_indices, resolved_dirs = _resolve_data_sources(train_cfg)
     train_size_pre_filter = int(len(train_indices))
     val_size_pre_filter = int(len(val_indices))
+    train_indices_pre = np.asarray(train_indices, dtype=np.int32).copy()
+    val_indices_pre = np.asarray(val_indices, dtype=np.int32).copy()
+    prescan_cache_key = _build_prescan_cache_key(
+        split_mode=split_mode,
+        resolved_dirs=resolved_dirs,
+        train_indices_pre=train_indices_pre,
+        val_indices_pre=val_indices_pre,
+        strict_91_steps=bool(train_cfg.strict_91_steps),
+        max_time_steps=int(train_cfg.max_time_steps),
+    )
 
-    train_indices, train_manifest, train_skipped, train_trunc_candidates = _prescan_indices(
-        loader=train_loader,
-        indices=train_indices,
-        split_name="train",
-        strict_91_steps=bool(train_cfg.strict_91_steps),
-        max_time_steps=int(train_cfg.max_time_steps),
-    )
-    val_indices, val_manifest, val_skipped, val_trunc_candidates = _prescan_indices(
-        loader=val_loader,
-        indices=val_indices,
-        split_name="val",
-        strict_91_steps=bool(train_cfg.strict_91_steps),
-        max_time_steps=int(train_cfg.max_time_steps),
-    )
-    skipped_records = [*train_skipped, *val_skipped]
+    cached_prescan: Optional[Dict[str, Any]] = None
+    if bool(train_cfg.use_prescan_cache):
+        cached_prescan = _load_prescan_cache(output_dir=output_dir, cache_key=prescan_cache_key)
+        if cached_prescan is None:
+            external = str(train_cfg.prescan_cache_source or "").strip()
+            if external:
+                cached_prescan = _load_prescan_cache_from_file(cache_file=Path(external), cache_key=prescan_cache_key)
+                if cached_prescan is not None:
+                    print(f"[prescan] loaded external cache: {external}")
+                    _save_prescan_cache(output_dir=output_dir, cache_key=prescan_cache_key, data=cached_prescan)
+                    print(f"[prescan] copied cache -> {_prescan_cache_path(output_dir)}")
+
+    if cached_prescan is not None:
+        train_indices = np.asarray(cached_prescan["train_indices"], dtype=np.int32)
+        val_indices = np.asarray(cached_prescan["val_indices"], dtype=np.int32)
+        train_manifest = list(cached_prescan["train_manifest"])
+        val_manifest = list(cached_prescan["val_manifest"])
+        skipped_records = list(cached_prescan["skipped_records"])
+        train_trunc_candidates = list(cached_prescan["train_trunc_candidates"])
+        val_trunc_candidates = list(cached_prescan["val_trunc_candidates"])
+        print(
+            "[prescan] loaded cache "
+            f"train={len(train_indices)} val={len(val_indices)} skipped={len(skipped_records)}"
+        )
+    else:
+        train_indices, train_manifest, train_skipped, train_trunc_candidates = _prescan_indices(
+            loader=train_loader,
+            indices=train_indices,
+            split_name="train",
+            strict_91_steps=bool(train_cfg.strict_91_steps),
+            max_time_steps=int(train_cfg.max_time_steps),
+            log_every=int(train_cfg.prescan_log_every),
+            workers=int(train_cfg.prescan_workers),
+        )
+        val_indices, val_manifest, val_skipped, val_trunc_candidates = _prescan_indices(
+            loader=val_loader,
+            indices=val_indices,
+            split_name="val",
+            strict_91_steps=bool(train_cfg.strict_91_steps),
+            max_time_steps=int(train_cfg.max_time_steps),
+            log_every=int(train_cfg.prescan_log_every),
+            workers=int(train_cfg.prescan_workers),
+        )
+        skipped_records = [*train_skipped, *val_skipped]
+        if bool(train_cfg.use_prescan_cache):
+            _save_prescan_cache(
+                output_dir=output_dir,
+                cache_key=prescan_cache_key,
+                data={
+                    "train_indices": np.asarray(train_indices, dtype=np.int32).tolist(),
+                    "val_indices": np.asarray(val_indices, dtype=np.int32).tolist(),
+                    "train_manifest": list(train_manifest),
+                    "val_manifest": list(val_manifest),
+                    "skipped_records": list(skipped_records),
+                    "train_trunc_candidates": list(train_trunc_candidates),
+                    "val_trunc_candidates": list(val_trunc_candidates),
+                },
+            )
+            print(
+                "[prescan] saved cache "
+                f"train={len(train_indices)} val={len(val_indices)} skipped={len(skipped_records)}"
+            )
     skip_reason_counts = {}
     for s in skipped_records:
         r = str(s.get("reason", "unknown"))
@@ -724,6 +818,22 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
             "cache_dir": str(train_cfg.dag_cache_dir),
             "cache_strict": bool(train_cfg.dag_cache_strict),
             "stage": str(train_cfg.stage),
+        },
+        "split_settings": {
+            "train_fraction": float(train_cfg.train_fraction),
+            "sample_interval_training": int(train_cfg.sample_interval_training),
+            "sample_interval_test": int(train_cfg.sample_interval_test),
+            "strict_91_steps": bool(train_cfg.strict_91_steps),
+            "prescan_log_every": int(train_cfg.prescan_log_every),
+            "prescan_workers": int(train_cfg.prescan_workers),
+            "use_prescan_cache": bool(train_cfg.use_prescan_cache),
+            "prescan_cache_source": str(train_cfg.prescan_cache_source or ""),
+        },
+        "prescan_cache": {
+            "enabled": bool(train_cfg.use_prescan_cache),
+            "cache_hit": bool(cached_prescan is not None),
+            "cache_path": str(_prescan_cache_path(output_dir)),
+            "cache_key": prescan_cache_key,
         },
         "forward_metric_namespaces": ["forward_approx"],
         "forward_artifact_export": {
