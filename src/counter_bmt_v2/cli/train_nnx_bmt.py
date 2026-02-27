@@ -132,6 +132,19 @@ def parse_args() -> argparse.Namespace:
         help="checkpoint .pkl path or checkpoint directory containing last.pkl",
     )
     parser.add_argument(
+        "--resume-strict-determinism",
+        dest="resume_strict_determinism",
+        action="store_true",
+        help="require split/config hash match when resuming from checkpoint",
+    )
+    parser.add_argument(
+        "--no-resume-strict-determinism",
+        dest="resume_strict_determinism",
+        action="store_false",
+        help="allow resuming from checkpoint even if split/config hashes differ (useful for eval-only runs)",
+    )
+    parser.set_defaults(resume_strict_determinism=True)
+    parser.add_argument(
         "--relation-debug-dump-dir",
         type=str,
         default="",
@@ -306,6 +319,7 @@ def main() -> int:
         max_traffic_lights=args.max_traffic_lights,
         center_to_map=(not args.no_center_to_map),
         resume_checkpoint=args.resume_checkpoint,
+        resume_strict_determinism=bool(args.resume_strict_determinism),
         relation_debug_dump_dir=args.relation_debug_dump_dir,
         relation_debug_dump_every_steps=max(0, int(args.relation_debug_dump_every)),
         relation_debug_max_batches=max(0, int(args.relation_debug_max_batches)),

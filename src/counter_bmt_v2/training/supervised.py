@@ -1397,6 +1397,10 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
                             f"Resume strict determinism failed: train_cfg[{k}] mismatch "
                             f"({ckpt_train_cfg[k]} vs {getattr(train_cfg, k)})"
                         )
+            else:
+                print(
+                    "Warning: resume strict determinism disabled; allowing split/config mismatch for this resumed run."
+                )
 
     run_meta = {
         "train_cfg": asdict(train_cfg),
