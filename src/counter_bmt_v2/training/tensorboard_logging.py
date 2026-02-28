@@ -5,27 +5,65 @@ from __future__ import annotations
 import math
 import os
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Dict
 
 
 def _require_summary_writer():
+    # Avoid TensorBoard pulling TensorFlow into the training environment.
+    # This keeps JAX-only runs independent from TF ABI constraints.
+    os.environ.setdefault("TENSORBOARD_NO_TF", "1")
+    if os.environ.get("TENSORBOARD_NO_TF", "0") == "1":
+        sys.modules.setdefault("tensorboard.compat.notf", types.ModuleType("tensorboard.compat.notf"))
+
+    # Preferred path: torch SummaryWriter.
     try:
-        # Avoid TensorBoard pulling TensorFlow into the training environment.
-        # This keeps JAX/PyTorch-only runs independent from TF ABI constraints.
-        os.environ.setdefault("TENSORBOARD_NO_TF", "1")
-        if os.environ.get("TENSORBOARD_NO_TF", "0") == "1":
-            # Some TensorBoard distributions expect this module to exist when
-            # running in "no TensorFlow" mode; create a shim if absent.
-            sys.modules.setdefault("tensorboard.compat.notf", types.ModuleType("tensorboard.compat.notf"))
         from torch.utils.tensorboard import SummaryWriter  # type: ignore
+
+        return SummaryWriter
+    except Exception:
+        pass
+
+    # Fallback path: native TensorBoard event writer (no torch dependency).
+    try:
+        from tensorboard.compat.proto.event_pb2 import Event  # type: ignore
+        from tensorboard.compat.proto.summary_pb2 import Summary  # type: ignore
+        from tensorboard.summary.writer.event_file_writer import EventFileWriter  # type: ignore
     except Exception as exc:  # pragma: no cover - import guard
         raise RuntimeError(
-            "TensorBoard logging is enabled but `torch.utils.tensorboard` is unavailable. "
-            "Install TensorBoard support (e.g. `pip install tensorboard`) or run with --no-tensorboard."
+            "TensorBoard logging is enabled but no writer backend is available. "
+            "Install either `torch` (for torch.utils.tensorboard) or `tensorboard`, "
+            "or run with --no-tensorboard."
         ) from exc
-    return SummaryWriter
+
+    class _NativeSummaryWriter:
+        def __init__(self, log_dir: str, flush_secs: int = 30, **_: object) -> None:
+            self._writer = EventFileWriter(
+                logdir=str(log_dir),
+                max_queue=1000,
+                flush_secs=max(1, int(flush_secs)),
+                filename_suffix="",
+            )
+
+        def add_scalar(self, tag: str, scalar_value: float, global_step: int) -> None:
+            summary = Summary(value=[Summary.Value(tag=str(tag), simple_value=float(scalar_value))])
+            event = Event(wall_time=float(time.time()), step=int(global_step), summary=summary)
+            self._writer.add_event(event)
+
+        def add_text(self, tag: str, text_string: str, global_step: int) -> None:
+            # Keep fallback lightweight; write a scalar marker for text payload size.
+            text_len = float(len(str(text_string)))
+            self.add_scalar(f"{str(tag).rstrip('/')}/_text_len", text_len, int(global_step))
+
+        def flush(self) -> None:
+            self._writer.flush()
+
+        def close(self) -> None:
+            self._writer.close()
+
+    return _NativeSummaryWriter
 
 
 def create_tb_writer(
