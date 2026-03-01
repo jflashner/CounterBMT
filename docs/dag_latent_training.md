@@ -52,6 +52,9 @@ PYTHONPATH=src .venv-v2/bin/python -m counter_bmt_v2.cli.train_nnx_bmt_dag_laten
 Notes:
 - Keep `num-train-scenarios` divisible by global batch for pmap stability.
 - If memory is tight, reduce `max-map-features`, `max-vectors`, `max-agents`, or switch to `paper_like_small`.
+- For stage B/C with strict cache mode, cache files must be compact v2:
+  - `schema_version=counter_bmt_v2_dag_cache_v2_compact10`
+  - v1 cache files are intentionally rejected.
 
 ## 2) Assessing a Finished Long Run
 
@@ -196,4 +199,3 @@ PYTHONPATH=src .venv-v2/bin/python outputs/replay_from_forward_artifact/replay_s
 - Checkpoints: `outputs/<run>/checkpoints/*.pkl`
 - Forward eval visuals: `outputs/<run>/forward_eval_viz/step_*/`
 - Forward eval artifacts: `outputs/<run>/forward_eval_artifacts/step_*/`
-

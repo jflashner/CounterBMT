@@ -16,9 +16,15 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from counter_bmt_v2.causal.dag_contract import (
+    DAGContractConfig,
+    enforce_dag_contract,
+    payload_to_bayesian_dag,
+)
 from counter_bmt_v2.causal.dag import DAGBuilder, SimpleDAGBuilder
 from counter_bmt_v2.contracts import BayesianDAG, DAGEdge, DAGNode, ScenarioInput, VLMFeatures
 from counter_bmt_v2.llm import OpenAIChatClient
+from counter_bmt_v2.training.dag_cache_schema import SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +118,8 @@ class PromptBNDAGBuilder(DAGBuilder):
     api_key: Optional[str] = None
     max_retries: int = 4
     use_simple_fallback: bool = True
+    dag_contract: str = "compact10"
+    dag_contract_mode: str = "hard"
 
     def __post_init__(self) -> None:
         self._fallback = SimpleDAGBuilder()
@@ -160,7 +168,54 @@ class PromptBNDAGBuilder(DAGBuilder):
                                     mechanism="event impacts collision risk",
                                 )
                             )
-                return dag
+                payload = {
+                    "schema_version": SCHEMA_VERSION,
+                    "scenario_id": str(scene.scenario_id),
+                    "nodes": [
+                        {
+                            "node_id": str(n.node_id),
+                            "node_type": str(n.node_type),
+                            "value": n.value,
+                            "timestamp_s": n.timestamp_s,
+                            "metadata": dict(n.metadata),
+                        }
+                        for n in dag.nodes.values()
+                    ],
+                    "edges": [
+                        {
+                            "parent_id": str(e.parent_id),
+                            "child_id": str(e.child_id),
+                            "confidence": float(e.confidence),
+                            "mechanism": str(e.mechanism),
+                        }
+                        for e in dag.edges
+                    ],
+                    "cpts": dict(dag.cpts),
+                    "metadata": {"source": "counter_bmt_v2_promptbn"},
+                }
+                cfg = DAGContractConfig(
+                    name=str(self.dag_contract),
+                    mode=str(self.dag_contract_mode),
+                )
+                contract_ok, canonical_payload, contract_report = enforce_dag_contract(payload, config=cfg)
+                if not contract_ok:
+                    logger.warning(
+                        "PromptBN DAG failed compact contract on attempt %d/%d: violations=%s",
+                        attempt,
+                        self.max_retries,
+                        contract_report.violation_counts,
+                    )
+                    continue
+                canonical_payload["schema_version"] = SCHEMA_VERSION
+                canonical_payload["scenario_id"] = str(scene.scenario_id)
+                canonical_meta = canonical_payload.get("metadata", {})
+                if not isinstance(canonical_meta, dict):
+                    canonical_meta = {"metadata_raw": str(canonical_meta)}
+                canonical_meta.setdefault("source", "counter_bmt_v2_promptbn")
+                canonical_payload["metadata"] = canonical_meta
+                canonical_dag = payload_to_bayesian_dag(canonical_payload)
+                setattr(canonical_dag, "_contract_metadata", canonical_meta)
+                return canonical_dag
 
             logger.warning("PromptBN DAG output invalid on attempt %d/%d", attempt, self.max_retries)
 
@@ -204,6 +259,24 @@ class PromptBNDAGBuilder(DAGBuilder):
                     ],
                 }
             )
+        if not any(str(v.get("node_type", "")) == "maneuver" for v in vars_out):
+            vars_out.append(
+                {
+                    "node_id": "maneuver_0",
+                    "node_type": "maneuver",
+                    "value": "straight",
+                    "timestamp_s": 0.0,
+                    "description": "default maneuver anchor",
+                    "alternatives": [
+                        "straight",
+                        "lane_change_left",
+                        "lane_change_right",
+                        "left_turn",
+                        "right_turn",
+                        "stop",
+                    ],
+                }
+            )
 
         for i, d in enumerate(features.decisions):
             vars_out.append(
@@ -214,6 +287,17 @@ class PromptBNDAGBuilder(DAGBuilder):
                     "timestamp_s": d.timestamp_s,
                     "description": d.reasoning or "decision event",
                     "alternatives": d.alternatives or [d.choice],
+                }
+            )
+        if not any(str(v.get("node_type", "")) == "decision" for v in vars_out):
+            vars_out.append(
+                {
+                    "node_id": "decision_0",
+                    "node_type": "decision",
+                    "value": "maintain_speed",
+                    "timestamp_s": 0.0,
+                    "description": "default decision anchor",
+                    "alternatives": ["maintain_speed", "accelerate", "decelerate", "yield_or_proceed"],
                 }
             )
 

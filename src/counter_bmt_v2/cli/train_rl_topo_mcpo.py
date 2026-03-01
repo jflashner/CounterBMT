@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import List, Sequence
 
@@ -20,6 +21,7 @@ from counter_bmt_v2.rl import (
     EntropyThermostat,
     GRPOTrainer,
     TopologyEmbeddingRunner,
+    VLMAlignmentVerifier,
     build_novelty_estimator,
     collect_group_rollouts,
     compute_group_advantages,
@@ -54,6 +56,7 @@ def _scene_from_loader(loader: ScenarioNetNNXLoader, index: int) -> ScenarioInpu
             "source": "scenarionet",
             "loader_index": int(index),
             "dt_s": float(sample.dt_s),
+            "nnx_sample": sample,
         },
     )
 
@@ -107,6 +110,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--w-novelty", type=float, default=0.05)
     p.add_argument("--w-consensus", type=float, default=0.10)
 
+    p.add_argument("--alignment-source-mode", type=str, default="judge", choices=["judge", "vlm_replace"])
+    p.add_argument("--vlm-alignment-enabled", action="store_true")
+    p.add_argument("--no-vlm-alignment-enabled", dest="vlm_alignment_enabled", action="store_false")
+    p.set_defaults(vlm_alignment_enabled=False)
+    p.add_argument("--vlm-alignment-backend", type=str, default="gpt4o", choices=["gpt4o", "mock"])
+    p.add_argument("--vlm-alignment-model", type=str, default="gpt-4o")
+    p.add_argument("--vlm-alignment-api-key", type=str, default=None)
+    p.add_argument("--vlm-alignment-sample-rate", type=float, default=0.15)
+    p.add_argument("--vlm-alignment-every-n-steps", type=int, default=5)
+    p.add_argument("--vlm-alignment-max-calls-per-step", type=int, default=2)
+    p.add_argument("--vlm-alignment-max-concurrency", type=int, default=2)
+    p.add_argument("--vlm-alignment-timeout-sec", type=float, default=8.0)
+    p.add_argument("--vlm-alignment-step-wait-budget-sec", type=float, default=6.0)
+    p.add_argument("--vlm-alignment-neutral-score", type=float, default=0.0)
+    p.add_argument("--vlm-alignment-cache-dir", type=str, default="outputs/rl_vlm_alignment_cache")
+    p.add_argument("--vlm-alignment-save-evidence", action="store_true")
+    p.add_argument("--no-vlm-alignment-save-evidence", dest="vlm_alignment_save_evidence", action="store_false")
+    p.set_defaults(vlm_alignment_save_evidence=True)
+    p.add_argument("--vlm-alignment-num-frames", type=int, default=6)
+    p.add_argument("--vlm-alignment-max-agents-render", type=int, default=48)
+
     p.add_argument("--perception-backend", type=str, default="mock", choices=["mock", "gpt4o"])
     p.add_argument("--dag-backend", type=str, default="simple", choices=["simple", "promptbn"])
     p.add_argument("--llm-model", type=str, default="gpt-4o")
@@ -145,6 +169,22 @@ def main() -> int:
     cfg.rl.novelty.ema_decay = float(args.novelty_ema_decay)
     cfg.rl.consensus.clusterer = str(args.clusterer)
     cfg.rl.consensus.k_clusters = int(args.k_clusters)
+    cfg.rl.vlm_alignment.enabled = bool(args.vlm_alignment_enabled)
+    cfg.rl.vlm_alignment.source_mode = str(args.alignment_source_mode)  # type: ignore[assignment]
+    cfg.rl.vlm_alignment.backend = str(args.vlm_alignment_backend)  # type: ignore[assignment]
+    cfg.rl.vlm_alignment.model = str(args.vlm_alignment_model)
+    cfg.rl.vlm_alignment.api_key = args.vlm_alignment_api_key
+    cfg.rl.vlm_alignment.sample_rate = float(args.vlm_alignment_sample_rate)
+    cfg.rl.vlm_alignment.every_n_steps = int(args.vlm_alignment_every_n_steps)
+    cfg.rl.vlm_alignment.max_calls_per_step = int(args.vlm_alignment_max_calls_per_step)
+    cfg.rl.vlm_alignment.max_concurrency = int(args.vlm_alignment_max_concurrency)
+    cfg.rl.vlm_alignment.per_call_timeout_s = float(args.vlm_alignment_timeout_sec)
+    cfg.rl.vlm_alignment.step_wait_budget_s = float(args.vlm_alignment_step_wait_budget_sec)
+    cfg.rl.vlm_alignment.neutral_score = float(args.vlm_alignment_neutral_score)
+    cfg.rl.vlm_alignment.cache_dir = str(args.vlm_alignment_cache_dir)
+    cfg.rl.vlm_alignment.save_evidence_artifacts = bool(args.vlm_alignment_save_evidence)
+    cfg.rl.vlm_alignment.num_frames = int(args.vlm_alignment_num_frames)
+    cfg.rl.vlm_alignment.max_agents_render = int(args.vlm_alignment_max_agents_render)
 
     pipeline = CounterBMTPipeline.from_backends(
         config=cfg,
@@ -165,6 +205,7 @@ def main() -> int:
     consensus = ConsensusScorer(cfg=cfg.rl.consensus)
     thermostat = EntropyThermostat.from_config(cfg.rl.train)
     trainer = GRPOTrainer()
+    vlm_aligner = VLMAlignmentVerifier(cfg=cfg.rl.vlm_alignment, output_dir=out_dir)
 
     loader = None
     scene_indices: Sequence[int] = []
@@ -172,11 +213,16 @@ def main() -> int:
         loader = ScenarioNetNNXLoader(args.data_dir)
         scene_indices = _resolve_scene_indices(loader, max_scenes=int(args.max_scenes), seed=int(args.seed))
 
+    vlm_alignment_cfg = asdict(cfg.rl.vlm_alignment)
+    if vlm_alignment_cfg.get("api_key"):
+        vlm_alignment_cfg["api_key"] = "***redacted***"
+
     run_config = {
         "args": vars(args),
         "resolved": {
             "scene_source": "scenarionet" if loader is not None else "demo",
             "scene_pool_size": int(len(scene_indices)) if loader is not None else 0,
+            "vlm_alignment": vlm_alignment_cfg,
         },
     }
     run_config_path.write_text(json.dumps(run_config, indent=2), encoding="utf-8")
@@ -196,11 +242,13 @@ def main() -> int:
             batch = collect_group_rollouts(
                 pipeline,
                 scene,
+                step=int(step),
                 encoder=encoder,
                 novelty_estimator=novelty,
                 consensus_scorer=consensus,
                 thermostat=thermostat,
                 group_size=int(cfg.rl.train.group_size),
+                vlm_aligner=vlm_aligner,
                 seed=int(args.seed) + step,
                 rare=rare,
                 update_novelty=True,
@@ -220,6 +268,32 @@ def main() -> int:
                     "diagnostics/eta": float(batch.diagnostics.thermostat_eta),
                     "diagnostics/alpha": float(batch.diagnostics.thermostat_alpha),
                     "diagnostics/num_clusters": float(len(batch.diagnostics.cluster_hist)),
+                    "alignment/vlm_mean": (
+                        float(np.mean(batch.alignment_scores))
+                        if batch.alignment_scores.size and float(batch.alignment_diagnostics.get("source_mode_vlm_replace", 0.0)) > 0.5
+                        else 0.0
+                    ),
+                    "alignment/vlm_scored_fraction": float(np.mean(batch.alignment_scored_mask.astype(np.float32)))
+                    if batch.alignment_scored_mask.size
+                    else 0.0,
+                    "alignment/judge_original_mean": float(
+                        np.mean(
+                            np.asarray(
+                                [float(r.metadata.get("judge_reward_original", 0.0)) for r in batch.rollouts],
+                                dtype=np.float32,
+                            )
+                        )
+                    )
+                    if batch.rollouts
+                    else 0.0,
+                    "alignment/source_mode_vlm_replace": float(batch.alignment_diagnostics.get("source_mode_vlm_replace", 0.0)),
+                    "alignment/vlm_calls_attempted": float(batch.alignment_diagnostics.get("calls_attempted", 0.0)),
+                    "alignment/vlm_calls_success": float(batch.alignment_diagnostics.get("calls_success", 0.0)),
+                    "alignment/vlm_cache_hits": float(batch.alignment_diagnostics.get("cache_hits", 0.0)),
+                    "alignment/vlm_timeouts": float(batch.alignment_diagnostics.get("timeouts", 0.0)),
+                    "alignment/vlm_errors": float(batch.alignment_diagnostics.get("errors", 0.0)),
+                    "alignment/vlm_latency_ms_mean": float(batch.alignment_diagnostics.get("latency_ms_mean", 0.0)),
+                    "alignment/vlm_step_skipped": float(batch.alignment_diagnostics.get("step_skipped", 0.0)),
                 },
                 "cluster_hist": batch.diagnostics.cluster_hist,
             }
@@ -260,4 +334,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

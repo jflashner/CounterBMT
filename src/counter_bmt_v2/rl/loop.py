@@ -24,6 +24,7 @@ from counter_bmt_v2.rl.grpo import GRPOTrainer, compute_group_advantages as _com
 from counter_bmt_v2.rl.novelty import NoveltyEstimator
 from counter_bmt_v2.rl.reward import compose_reward
 from counter_bmt_v2.rl.thermostat import EntropyThermostat
+from counter_bmt_v2.rl.vlm_alignment import VLMAlignmentVerifier
 
 if TYPE_CHECKING:
     from counter_bmt_v2.orchestration import CounterBMTPipeline
@@ -44,6 +45,9 @@ class GroupedRolloutBatch:
     novelty_scores: np.ndarray
     cluster_ids: np.ndarray
     consensus_scores: np.ndarray
+    alignment_scores: np.ndarray
+    alignment_scored_mask: np.ndarray
+    alignment_diagnostics: Dict[str, float]
     diagnostics: RLBatchDiagnostics
     pipeline_result: PipelineResult
 
@@ -79,11 +83,13 @@ def collect_group_rollouts(
     pipeline: "CounterBMTPipeline",
     scene: ScenarioInput,
     *,
+    step: int,
     encoder: BehaviorManifoldEncoder,
     novelty_estimator: NoveltyEstimator,
     consensus_scorer: ConsensusScorer,
     thermostat: EntropyThermostat,
     group_size: int,
+    vlm_aligner: Optional[VLMAlignmentVerifier] = None,
     seed: int = 0,
     rare: bool = False,
     update_novelty: bool = True,
@@ -120,6 +126,9 @@ def collect_group_rollouts(
             novelty_scores=np.zeros((0,), dtype=np.float32),
             cluster_ids=np.zeros((0,), dtype=np.int32),
             consensus_scores=np.zeros((0,), dtype=np.float32),
+            alignment_scores=np.zeros((0,), dtype=np.float32),
+            alignment_scored_mask=np.zeros((0,), dtype=bool),
+            alignment_diagnostics={"step_skipped": 1.0},
             diagnostics=diag,
             pipeline_result=result,
         )
@@ -141,6 +150,7 @@ def collect_group_rollouts(
     # Consensus tilt with alpha (higher when entropy is above target).
     consensus_scores = (consensus_base * (1.0 + float(alpha))).astype(np.float32)
 
+    judge_original = [float(j.reward) for j in result.judge_results]
     for i, rollout in enumerate(result.rollouts):
         _update_rollout_metadata(
             rollout,
@@ -151,6 +161,51 @@ def collect_group_rollouts(
             cluster_id=int(cluster_ids[i]),
             consensus_score=float(consensus_scores[i]),
         )
+        rollout.metadata["judge_reward_original"] = float(judge_original[i]) if i < len(judge_original) else 0.0
+
+    alignment_scores = np.asarray(judge_original, dtype=np.float32)
+    alignment_scored_mask = np.zeros((len(result.rollouts),), dtype=bool)
+    alignment_diag: Dict[str, float] = {"source_mode_vlm_replace": 0.0, "step_skipped": 1.0}
+    if (
+        vlm_aligner is not None
+        and bool(pipeline.config.rl.vlm_alignment.enabled)
+        and str(pipeline.config.rl.vlm_alignment.source_mode) == "vlm_replace"
+    ):
+        alignment_result = vlm_aligner.score_rollouts(
+            step=int(step),
+            scenario=scene,
+            dag=result.dag,
+            intervention=result.intervention,
+            rollouts=result.rollouts,
+        )
+        alignment_scores = np.asarray(alignment_result.scores, dtype=np.float32)
+        alignment_scored_mask = np.asarray(alignment_result.scored_mask, dtype=bool)
+        alignment_diag = dict(alignment_result.diagnostics)
+        alignment_diag["source_mode_vlm_replace"] = 1.0
+        alignment_diag.setdefault("step_skipped", 0.0)
+        for i, rollout in enumerate(result.rollouts):
+            score_i = float(alignment_scores[i]) if i < alignment_scores.shape[0] else 0.0
+            scored_i = bool(alignment_scored_mask[i]) if i < alignment_scored_mask.shape[0] else False
+            rollout.metadata["vlm_dag_conformance_score"] = score_i
+            rollout.metadata["vlm_dag_conformance_scored"] = scored_i
+        # Replace judge alignment reward in RL-only vlm_replace mode.
+        replaced: List[JudgeResult] = []
+        threshold = float(pipeline.config.rl.vlm_alignment.match_threshold)
+        for i, j in enumerate(result.judge_results):
+            sc = float(alignment_scores[i]) if i < alignment_scores.shape[0] else 0.0
+            details = dict(j.details) if isinstance(j.details, dict) else {}
+            details["judge_reward_original"] = float(j.reward)
+            details["vlm_alignment_score"] = float(sc)
+            details["vlm_alignment_scored"] = bool(alignment_scored_mask[i]) if i < alignment_scored_mask.shape[0] else False
+            replaced.append(
+                JudgeResult(
+                    reward=float(sc),
+                    matched=bool(sc >= threshold),
+                    explanation="vlm_replace alignment",
+                    details=details,
+                )
+            )
+        result.judge_results = replaced
 
     rewards = [
         compose_reward(j, r, pipeline.config.reward)
@@ -178,6 +233,9 @@ def collect_group_rollouts(
         novelty_scores=novelty_scores,
         cluster_ids=cluster_ids,
         consensus_scores=consensus_scores,
+        alignment_scores=alignment_scores,
+        alignment_scored_mask=alignment_scored_mask,
+        alignment_diagnostics=alignment_diag,
         diagnostics=diag,
         pipeline_result=result,
     )
@@ -211,6 +269,7 @@ def summarize_reward_breakdown(rewards: Sequence[RewardBreakdown]) -> Dict[str, 
     env_total = np.asarray([float(r.total_env) for r in rewards], dtype=np.float32)
     novelty = np.asarray([float(r.novelty) for r in rewards], dtype=np.float32)
     consensus = np.asarray([float(r.consensus) for r in rewards], dtype=np.float32)
+    vlm_align = np.asarray([float(r.vlm_dag_conformance) for r in rewards], dtype=np.float32)
     return {
         "n": int(total.size),
         "total_mean": float(np.mean(total)),
@@ -218,4 +277,5 @@ def summarize_reward_breakdown(rewards: Sequence[RewardBreakdown]) -> Dict[str, 
         "total_env_mean": float(np.mean(env_total)),
         "novelty_mean": float(np.mean(novelty)),
         "consensus_mean": float(np.mean(consensus)),
+        "vlm_dag_conformance_mean": float(np.mean(vlm_align)),
     }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import sys
@@ -40,12 +41,39 @@ def _require_summary_writer():
 
     class _NativeSummaryWriter:
         def __init__(self, log_dir: str, flush_secs: int = 30, **_: object) -> None:
-            self._writer = EventFileWriter(
-                logdir=str(log_dir),
-                max_queue=1000,
-                flush_secs=max(1, int(flush_secs)),
-                filename_suffix="",
-            )
+            flush_s = max(1, int(flush_secs))
+            params = {}
+            try:
+                params = dict(inspect.signature(EventFileWriter.__init__).parameters)
+            except Exception:
+                params = {}
+
+            kwargs = {}
+            if "logdir" in params:
+                kwargs["logdir"] = str(log_dir)
+            elif "log_dir" in params:
+                kwargs["log_dir"] = str(log_dir)
+            if "max_queue" in params:
+                kwargs["max_queue"] = 1000
+            elif "max_queue_size" in params:
+                kwargs["max_queue_size"] = 1000
+            if "flush_secs" in params:
+                kwargs["flush_secs"] = flush_s
+            if "filename_suffix" in params:
+                kwargs["filename_suffix"] = ""
+
+            # Try signature-aware kwargs first, then degrade to positional variants
+            # for older TensorBoard releases.
+            try:
+                self._writer = EventFileWriter(**kwargs)
+            except TypeError:
+                try:
+                    self._writer = EventFileWriter(str(log_dir), 1000, flush_s, "")
+                except TypeError:
+                    try:
+                        self._writer = EventFileWriter(str(log_dir), 1000, flush_s)
+                    except TypeError:
+                        self._writer = EventFileWriter(str(log_dir))
 
         def add_scalar(self, tag: str, scalar_value: float, global_step: int) -> None:
             summary = Summary(value=[Summary.Value(tag=str(tag), simple_value=float(scalar_value))])

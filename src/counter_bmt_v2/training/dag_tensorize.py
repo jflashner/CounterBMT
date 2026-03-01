@@ -9,20 +9,53 @@ import numpy as np
 
 
 _NODE_TYPE_TO_ID = {
-    "ego_state": 0,
-    "maneuver": 1,
-    "decision": 2,
-    "outcome": 3,
+    "context": 0,
+    "ego_state": 1,
+    "interaction": 2,
+    "maneuver": 3,
+    "decision": 4,
+    "risk": 5,
+    "outcome": 6,
+}
+
+_BEHAVIOR_CLASS_TO_ID = {
+    "straight": 0,
+    "left_turn": 1,
+    "right_turn": 2,
+    "lane_change_left": 3,
+    "lane_change_right": 4,
+    "stop": 5,
+    "maintain_speed": 6,
+    "accelerate": 7,
+    "decelerate": 8,
+    "yield_or_proceed": 9,
 }
 
 
-def _text_hash_feature(text: str, n: int = 8) -> np.ndarray:
-    out = np.zeros((n,), dtype=np.float32)
-    b = text.encode("utf-8")
-    if not b:
+def _to_float_or_zero(x: Any) -> float:
+    try:
+        y = float(x)
+    except Exception:
+        return 0.0
+    if not math.isfinite(y):
+        return 0.0
+    return float(y)
+
+
+def _behavior_onehot(node_type: str, value: Any, metadata: Dict[str, Any]) -> np.ndarray:
+    out = np.zeros((10,), dtype=np.float32)
+    if node_type not in {"maneuver", "decision"}:
         return out
-    for i, v in enumerate(b):
-        out[i % n] += (float(v % 29) / 28.0) - 0.5
+    cls = str(metadata.get("behavior_class", "")).strip().lower()
+    if not cls:
+        cls = str(value).strip().lower()
+    idx = _BEHAVIOR_CLASS_TO_ID.get(cls)
+    if idx is None:
+        if node_type == "maneuver":
+            idx = int(_BEHAVIOR_CLASS_TO_ID["straight"])
+        else:
+            idx = int(_BEHAVIOR_CLASS_TO_ID["maintain_speed"])
+    out[int(idx)] = 1.0
     return out
 
 
@@ -97,25 +130,30 @@ def _tensorize_one(
     node_mask = np.zeros((int(max_nodes),), dtype=bool)
     for i, nrec in enumerate(nodes):
         node_mask[i] = True
-        t_id = int(_NODE_TYPE_TO_ID.get(str(nrec.get("node_type", "")).lower(), 0))
-        onehot = np.zeros((4,), dtype=np.float32)
+        ntype = str(nrec.get("node_type", "")).lower()
+        t_id = int(_NODE_TYPE_TO_ID.get(ntype, 0))
+        onehot = np.zeros((7,), dtype=np.float32)
         onehot[t_id] = 1.0
 
         timestamp = float(nrec.get("timestamp_s") or 0.0)
-        value_hash = _text_hash_feature(str(nrec.get("value", "")), n=8)
+        metadata = nrec.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        behavior_oh = _behavior_onehot(ntype, nrec.get("value"), metadata)
+        value_scalar = _to_float_or_zero(nrec.get("value", 0.0))
         cpt_spec = cpts.get(str(nrec.get("node_id", "")), {})
-        cpt_ent, cpt_vals, cpt_par, cpt_rows = _cpt_summary(cpt_spec)
+        cpt_ent, _cpt_vals, cpt_par, cpt_rows = _cpt_summary(cpt_spec)
         core = np.asarray(
             [
                 *onehot.tolist(),
-                timestamp,
+                *behavior_oh.tolist(),
+                float(timestamp),
                 float(indeg[i]),
                 float(outdeg[i]),
-                *value_hash.tolist(),
-                cpt_ent,
-                cpt_vals,
-                cpt_par,
-                cpt_rows,
+                float(value_scalar),
+                float(cpt_ent),
+                float(cpt_par),
+                float(cpt_rows),
             ],
             dtype=np.float32,
         )
@@ -194,4 +232,3 @@ def tensorize_dag_batch(
     for k in one[0].keys():
         out[k] = np.stack([o[k] for o in one], axis=0)
     return out
-

@@ -135,6 +135,7 @@ class RewardBreakdown:
     safety: float
     realism: float
     total: float
+    vlm_dag_conformance: float = 0.0
     novelty: float = 0.0
     consensus: float = 0.0
     total_env: float = 0.0

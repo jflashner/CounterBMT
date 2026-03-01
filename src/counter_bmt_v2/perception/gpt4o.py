@@ -137,12 +137,46 @@ class GPT4oPerceptionModel(PerceptionModel):
         return encoded
 
     def _build_prompt(self, scene: ScenarioInput) -> str:
-        ts = ", ".join(f"{f.timestamp_s:.2f}s" for f in scene.frames[: self.max_frames]) or "none"
+        frames = scene.frames[: self.max_frames]
+        ts = ", ".join(f"{f.timestamp_s:.2f}s" for f in frames) or "none"
+        meta = scene.metadata if isinstance(scene.metadata, dict) else {}
+        ego_color_hint = str(meta.get("ego_color_hint", "green"))
+        dual_view_enabled = bool(meta.get("dual_view_enabled", False))
+        dual_view_mode = str(meta.get("dual_view_mode", ""))
+        context_text = str(meta.get("vlm_context_text", "")).strip()
+        frame_lines = []
+        for i, f in enumerate(frames):
+            frame_lines.append(f"- seq={i:02d} t={float(f.timestamp_s):.2f}s path={Path(f.path).name}")
+        frame_block = "\n".join(frame_lines) if frame_lines else "- (no frames)"
+
+        semantics = [
+            "You are analyzing a top-down traffic scenario.",
+            f"The ego vehicle is highlighted in {ego_color_hint.upper()}.",
+            "Frames are a time-ordered sequence. Use timestamp ordering only; do not reverse time.",
+            "Track the same ego vehicle consistently across the full sequence.",
+        ]
+        if dual_view_enabled:
+            semantics.append(
+                "Each timestep may include two images in order: global scene first, then ego-focused companion view."
+            )
+            if dual_view_mode:
+                semantics.append(f"Dual-view mode: {dual_view_mode}.")
+
+        context_block = ""
+        if context_text:
+            context_block = f"\nKnown context (trusted side-channel):\n{context_text}\n"
+
         return f"""
-You are extracting driving behavior from frame sequences.
+You are extracting driving behavior from top-down traffic frame sequences.
 
 Scenario id: {scene.scenario_id}
 Frame timestamps: {ts}
+Frame ordering:
+{frame_block}
+
+Semantics:
+{chr(10).join(f"- {s}" for s in semantics)}
+{context_block}
 
 Return JSON only with schema:
 {{
@@ -173,12 +207,16 @@ Rules:
 - Be conservative and avoid hallucinated events.
 - If uncertainty is high, lower confidence and output fewer events.
 - Keep maneuvers time-ordered and non-overlapping when possible.
+- Base conclusions only on visible evidence and supplied context text.
 """.strip()
 
     def extract(self, scene: ScenarioInput) -> VLMFeatures:
         if self._client is None:
             return self._fallback.extract(scene)
 
+        meta = scene.metadata if isinstance(scene.metadata, dict) else {}
+        ego_color_hint = str(meta.get("ego_color_hint", "green"))
+        dual_view_enabled = bool(meta.get("dual_view_enabled", False))
         prompt = self._build_prompt(scene)
         images = self._encode_images(scene)
 
@@ -246,5 +284,9 @@ Rules:
                 "summary": data.get("summary", ""),
                 "raw_response": raw,
                 "n_images_sent": len(images),
+                "prompt_version": "v2_topdown_ego_v1",
+                "ego_color_hint": ego_color_hint,
+                "dual_view_enabled": dual_view_enabled,
+                "frame_count_sent": len(images),
             },
         )

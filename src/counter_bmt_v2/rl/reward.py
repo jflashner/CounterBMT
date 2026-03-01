@@ -30,6 +30,7 @@ def compose_reward(judge: JudgeResult, rollout: TrajectoryRollout, cfg: RewardCo
     alignment = float(np.clip(judge.reward, 0.0, 1.0))
     safety = _estimate_safety(rollout)
     realism = _estimate_realism(rollout)
+    vlm_dag_conformance = float(np.clip(float(rollout.metadata.get("vlm_dag_conformance_score", 0.0)), 0.0, 1.0))
     total_env = (
         cfg.w_alignment * alignment
         + cfg.w_safety * safety
@@ -47,6 +48,7 @@ def compose_reward(judge: JudgeResult, rollout: TrajectoryRollout, cfg: RewardCo
         safety=safety,
         realism=realism,
         total=float(total_augmented),
+        vlm_dag_conformance=vlm_dag_conformance,
         novelty=novelty,
         consensus=consensus,
         total_env=float(total_env),

@@ -17,6 +17,7 @@ from .topology import (
     TopologyEmbeddingRunner,
     ZigzagTopologyEncoder,
 )
+from .vlm_alignment import AlignmentBatchResult, VLMAlignmentVerifier
 
 __all__ = [
     "BehaviorImageBuilder",
@@ -30,6 +31,8 @@ __all__ = [
     "KNNNovelty",
     "PHPersistenceFallbackEncoder",
     "TopologyEmbeddingRunner",
+    "AlignmentBatchResult",
+    "VLMAlignmentVerifier",
     "ZigzagTopologyEncoder",
     "build_novelty_estimator",
     "collect_group_rollouts",

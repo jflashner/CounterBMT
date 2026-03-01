@@ -111,12 +111,17 @@ def _slice_raw_for_sample(raw: Dict[str, Any], b: int) -> Dict[str, Any]:
 
 def _empty_dag_payload(scenario_id: str) -> Dict[str, Any]:
     return {
-        "schema_version": "counter_bmt_v2_dag_cache_v1",
+        "schema_version": "counter_bmt_v2_dag_cache_v2_compact10",
         "scenario_id": str(scenario_id),
         "nodes": [],
         "edges": [],
         "cpts": {},
-        "metadata": {"source": "null"},
+        "metadata": {
+            "source": "null",
+            "contract_name": "compact10",
+            "contract_version": "1",
+            "contract_report": {"passed": False, "reason": "null_payload"},
+        },
     }
 
 
@@ -142,7 +147,9 @@ def _attach_dag_inputs(
         if source == "cache_miss_strict":
             raise ValueError(
                 f"DAG cache strict mode enabled and cache miss for scenario_id={sid}. "
-                f"dag_cache_dir={train_cfg.dag_cache_dir}"
+                f"dag_cache_dir={train_cfg.dag_cache_dir}. "
+                "Expected compact cache schema: counter_bmt_v2_dag_cache_v2_compact10 "
+                "(v1 caches are intentionally incompatible)."
             )
         if dag is None:
             dag = _empty_dag_payload(str(sid))

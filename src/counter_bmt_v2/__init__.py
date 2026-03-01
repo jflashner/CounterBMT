@@ -10,6 +10,7 @@ from .config import (
     RLTrainConfig,
     RewardConfig,
     TrajectoryModelConfig,
+    VLMAlignmentConfig,
 )
 from .contracts import *
 from .data import NNXBMTSceneSample, ScenarioNetNNXLoader, collate_nnx_scene_samples
@@ -32,6 +33,7 @@ __all__ = [
     "RLTrainConfig",
     "RewardConfig",
     "TrajectoryModelConfig",
+    "VLMAlignmentConfig",
     "NNXBMTSceneSample",
     "ScenarioNetNNXLoader",
     "collate_nnx_scene_samples",

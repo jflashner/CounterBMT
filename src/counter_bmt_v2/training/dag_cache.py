@@ -7,11 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from counter_bmt_v2.training.dag_cache_schema import SCHEMA_VERSION, validate_cache_payload
+
 
 @dataclass
 class DAGCacheReader:
     cache_dir: str
-    schema_version: str = "counter_bmt_v2_dag_cache_v1"
+    schema_version: str = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         self.root = Path(self.cache_dir)
@@ -32,7 +34,6 @@ class DAGCacheReader:
             return None
         if str(payload.get("scenario_id", "")) != str(scenario_id):
             return None
-        if "nodes" not in payload or "edges" not in payload:
+        if not validate_cache_payload(payload):
             return None
         return payload
-

@@ -59,11 +59,36 @@ class ConsensusConfig:
 
 
 @dataclass
+class VLMAlignmentConfig:
+    enabled: bool = False
+    source_mode: Literal["judge", "vlm_replace"] = "judge"
+    backend: Literal["gpt4o", "mock"] = "gpt4o"
+    model: str = "gpt-4o"
+    api_key: str | None = None
+    sample_rate: float = 0.15
+    every_n_steps: int = 5
+    max_calls_per_step: int = 2
+    max_concurrency: int = 2
+    per_call_timeout_s: float = 8.0
+    step_wait_budget_s: float = 6.0
+    neutral_score: float = 0.0
+    match_threshold: float = 0.6
+    unscored_policy: Literal["step_mean_fill"] = "step_mean_fill"
+    cache_dir: str = "outputs/rl_vlm_alignment_cache"
+    save_evidence_artifacts: bool = True
+    evidence_subdir: str = "vlm_alignment_evidence"
+    num_frames: int = 6
+    max_agents_render: int = 48
+    prompt_version: str = "vlm_alignment_topdown_dag_v1"
+
+
+@dataclass
 class RLConfig:
     train: RLTrainConfig = field(default_factory=RLTrainConfig)
     embedding: BehaviorEmbeddingConfig = field(default_factory=BehaviorEmbeddingConfig)
     novelty: NoveltyConfig = field(default_factory=NoveltyConfig)
     consensus: ConsensusConfig = field(default_factory=ConsensusConfig)
+    vlm_alignment: VLMAlignmentConfig = field(default_factory=VLMAlignmentConfig)
 
 
 @dataclass
