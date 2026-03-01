@@ -52,9 +52,10 @@ PYTHONPATH=src .venv-v2/bin/python -m counter_bmt_v2.cli.train_nnx_bmt_dag_laten
 Notes:
 - Keep `num-train-scenarios` divisible by global batch for pmap stability.
 - If memory is tight, reduce `max-map-features`, `max-vectors`, `max-agents`, or switch to `paper_like_small`.
-- For stage B/C with strict cache mode, cache files must be compact v2:
-  - `schema_version=counter_bmt_v2_dag_cache_v2_compact10`
-  - v1 cache files are intentionally rejected.
+- For stage B/C with strict cache mode, set the expected schema explicitly:
+  - new default contract cache: `schema_version=counter_bmt_v2_dag_cache_v3_maneuver_outcome`
+  - legacy compact cache: `schema_version=counter_bmt_v2_dag_cache_v2_compact10`
+  - use `--dag-expected-schema v3_maneuver_outcome` (or `v2_compact10`) to fail fast on mismatches.
 
 ## 2) Assessing a Finished Long Run
 

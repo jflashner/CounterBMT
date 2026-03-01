@@ -16,13 +16,16 @@ if __package__ is None or __package__ == "":
         sys.path.insert(0, src_root_str)
 
 from counter_bmt_v2.causal.dag_contract import DAGContractConfig, enforce_dag_contract
-from counter_bmt_v2.training.dag_cache_schema import SCHEMA_VERSION, validate_cache_payload
+from counter_bmt_v2.training.dag_cache_schema import (
+    schema_version_for_contract,
+    validate_cache_payload,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Validate compact10 DAG cache payloads")
+    p = argparse.ArgumentParser(description="Validate DAG cache payloads against contract + schema")
     p.add_argument("--cache-dir", type=str, required=True)
-    p.add_argument("--dag-contract", type=str, default="compact10", choices=["compact10"])
+    p.add_argument("--dag-contract", type=str, default="maneuver_outcome_v1", choices=["compact10", "maneuver_outcome_v1"])
     p.add_argument("--dag-contract-mode", type=str, default="hard", choices=["hard"])
     p.add_argument("--stop-on-first-failure", action="store_true")
     return p.parse_args()
@@ -37,6 +40,7 @@ def main() -> int:
         return 1
 
     cfg = DAGContractConfig(name=str(args.dag_contract), mode=str(args.dag_contract_mode))
+    expected_schema = schema_version_for_contract(str(args.dag_contract))
     ok_count = 0
     fail_count = 0
     fail_reasons: Dict[str, int] = {}
@@ -51,13 +55,13 @@ def main() -> int:
                 break
             continue
 
-        if str(payload.get("schema_version", "")) != SCHEMA_VERSION:
+        if str(payload.get("schema_version", "")) != expected_schema:
             fail_count += 1
             fail_reasons["wrong_schema_version"] = int(fail_reasons.get("wrong_schema_version", 0) + 1)
             if args.stop_on_first_failure:
                 break
             continue
-        if not validate_cache_payload(payload):
+        if not validate_cache_payload(payload, allowed_schema_versions=(expected_schema,)):
             fail_count += 1
             fail_reasons["schema_validation_failed"] = int(fail_reasons.get("schema_validation_failed", 0) + 1)
             if args.stop_on_first_failure:
@@ -76,7 +80,7 @@ def main() -> int:
 
     summary = {
         "cache_dir": str(root),
-        "schema_version_expected": SCHEMA_VERSION,
+        "schema_version_expected": expected_schema,
         "checked": int(ok_count + fail_count),
         "passed": int(ok_count),
         "failed": int(fail_count),

@@ -20,6 +20,10 @@ from flax import nnx
 from counter_bmt_v2.data import NNXBMTSceneSample
 from counter_bmt_v2.training.dag_sources import DAGSourceResolver
 from counter_bmt_v2.training.dag_tensorize import tensorize_dag_batch
+from counter_bmt_v2.training.dag_cache_schema import (
+    SCHEMA_VERSION_V2_COMPACT10,
+    SCHEMA_VERSION_V3_MANEUVER_OUTCOME,
+)
 from counter_bmt_v2.trajectory_jax import (
     AdvBMTParityTokenizer,
     NNXBMTConfig,
@@ -78,6 +82,7 @@ class DAGLatentTrainConfig(SupervisedTrainConfig):
     dag_source_mode: DAGSourceModeType = "dual"
     dag_cache_dir: str = ""
     dag_cache_strict: bool = False
+    dag_expected_schema: str = "any"  # any|v2_compact10|v3_maneuver_outcome
     stage: StageType = "A_B_C"
     stage_a_steps: int = 200
     stage_b_steps: int = 200
@@ -88,6 +93,20 @@ class DAGLatentTrainConfig(SupervisedTrainConfig):
     stage_b_freeze_non_dag: bool = True
     stage_c_decoder_lr_scale: float = 0.1
     stage_c_dag_lr_scale: float = 1.0
+
+
+def _resolve_expected_schema_name(mode: str) -> str:
+    key = str(mode).strip().lower()
+    if key in {"any", ""}:
+        return "any"
+    if key in {"v2_compact10", SCHEMA_VERSION_V2_COMPACT10}:
+        return SCHEMA_VERSION_V2_COMPACT10
+    if key in {"v3_maneuver_outcome", SCHEMA_VERSION_V3_MANEUVER_OUTCOME}:
+        return SCHEMA_VERSION_V3_MANEUVER_OUTCOME
+    raise ValueError(
+        "Unsupported dag_expected_schema value: "
+        f"{mode}. Expected one of: any, v2_compact10, v3_maneuver_outcome."
+    )
 
 
 def _resolve_model_preset_dag(name: str) -> NNXBMTConfig:
@@ -111,14 +130,14 @@ def _slice_raw_for_sample(raw: Dict[str, Any], b: int) -> Dict[str, Any]:
 
 def _empty_dag_payload(scenario_id: str) -> Dict[str, Any]:
     return {
-        "schema_version": "counter_bmt_v2_dag_cache_v2_compact10",
+        "schema_version": SCHEMA_VERSION_V3_MANEUVER_OUTCOME,
         "scenario_id": str(scenario_id),
         "nodes": [],
         "edges": [],
         "cpts": {},
         "metadata": {
             "source": "null",
-            "contract_name": "compact10",
+            "contract_name": "maneuver_outcome_v1",
             "contract_version": "1",
             "contract_report": {"passed": False, "reason": "null_payload"},
         },
@@ -137,6 +156,7 @@ def _attach_dag_inputs(
 
     dags: List[Dict[str, Any]] = []
     source_labels: List[str] = []
+    expected_schema = _resolve_expected_schema_name(str(train_cfg.dag_expected_schema))
     for b, sid in enumerate(scenario_ids):
         batch_slice = _slice_raw_for_sample(raw, b)
         dag, source = resolver.resolve_one(
@@ -144,16 +164,22 @@ def _attach_dag_inputs(
             batch_slice=batch_slice,
             sample_index=b,
         )
-        if source == "cache_miss_strict":
+        if source in {"cache_miss_strict", "cache_schema_mismatch_strict"}:
             raise ValueError(
-                f"DAG cache strict mode enabled and cache miss for scenario_id={sid}. "
+                f"DAG cache strict mode enabled and cache lookup failed for scenario_id={sid}. "
                 f"dag_cache_dir={train_cfg.dag_cache_dir}. "
-                "Expected compact cache schema: counter_bmt_v2_dag_cache_v2_compact10 "
-                "(v1 caches are intentionally incompatible)."
+                f"reason={source}. expected_schema={expected_schema}."
             )
         if dag is None:
             dag = _empty_dag_payload(str(sid))
             source = "null"
+        schema_version = str(dag.get("schema_version", ""))
+        if expected_schema != "any" and schema_version != expected_schema:
+            raise ValueError(
+                "DAG schema mismatch while attaching model inputs: "
+                f"scenario_id={sid} expected={expected_schema} got={schema_version} "
+                f"source={source}"
+            )
         dags.append(dag)
         source_labels.append(source)
 
@@ -826,6 +852,7 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
             "source_mode": str(train_cfg.dag_source_mode),
             "cache_dir": str(train_cfg.dag_cache_dir),
             "cache_strict": bool(train_cfg.dag_cache_strict),
+            "expected_schema": _resolve_expected_schema_name(str(train_cfg.dag_expected_schema)),
             "stage": str(train_cfg.stage),
         },
         "split_settings": {
@@ -879,6 +906,7 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
         mode=str(train_cfg.dag_source_mode),
         cache_dir=str(train_cfg.dag_cache_dir),
         cache_strict=bool(train_cfg.dag_cache_strict),
+        expected_schema=_resolve_expected_schema_name(str(train_cfg.dag_expected_schema)),
     )
     metrics_log_path = output_dir / "metrics.jsonl"
     train_rng = np.random.default_rng(train_cfg.seed + 7)
@@ -902,6 +930,7 @@ def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, An
             "active_stage": str(stage_now),
             "dag_source_mode": str(train_cfg.dag_source_mode),
             "dag_cache_strict": bool(train_cfg.dag_cache_strict),
+            "dag_expected_schema": _resolve_expected_schema_name(str(train_cfg.dag_expected_schema)),
         }
 
     while global_step < int(total_steps_target):

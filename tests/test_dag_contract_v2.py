@@ -5,14 +5,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from counter_bmt_v2.causal.dag_contract import DAGContractConfig, enforce_dag_contract
 from counter_bmt_v2.training.dag_cache import DAGCacheReader
-from counter_bmt_v2.training.dag_cache_schema import SCHEMA_VERSION, validate_cache_payload
+from counter_bmt_v2.training.dag_cache_schema import (
+    SCHEMA_VERSION_V2_COMPACT10,
+    SCHEMA_VERSION_V3_MANEUVER_OUTCOME,
+    validate_cache_payload,
+)
+from counter_bmt_v2.training.dag_tensorize import tensorize_dag_batch
 
 
 def _base_payload() -> dict:
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION_V2_COMPACT10,
         "scenario_id": "scenario_unit",
         "nodes": [
             {
@@ -183,11 +190,109 @@ class DAGContractV2Tests(unittest.TestCase):
 
             ok, canonical, _ = enforce_dag_contract(_base_payload(), config=self.cfg)
             self.assertTrue(ok)
-            self.assertTrue(validate_cache_payload(canonical))
+            self.assertTrue(validate_cache_payload(canonical, allowed_schema_versions=(SCHEMA_VERSION_V2_COMPACT10,)))
             (root / f"{sid}.json").write_text(json.dumps(canonical), encoding="utf-8")
             loaded = reader.get(sid)
             self.assertIsNotNone(loaded)
-            self.assertEqual(str(loaded["schema_version"]), SCHEMA_VERSION)
+            self.assertEqual(str(loaded["schema_version"]), SCHEMA_VERSION_V2_COMPACT10)
+
+
+def _mo_payload() -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION_V3_MANEUVER_OUTCOME,
+        "scenario_id": "scenario_mo",
+        "nodes": [
+            {
+                "node_id": "segment_a",
+                "node_type": "maneuver",
+                "value": "changing lane left",
+                "timestamp_s": 1.0,
+                "metadata": {"start_s": 0.5, "end_s": 1.5},
+            },
+            {
+                "node_id": "collision",
+                "node_type": "outcome",
+                "value": "possible collision",
+                "metadata": {},
+            },
+            {
+                "node_id": "progress",
+                "node_type": "outcome",
+                "value": "good progress",
+                "metadata": {},
+            },
+            {
+                "node_id": "compliance",
+                "node_type": "outcome",
+                "value": "compliant",
+                "metadata": {},
+            },
+        ],
+        "edges": [
+            {"parent_id": "segment_a", "child_id": "collision", "confidence": 0.8, "mechanism": "maneuver_to_outcome"},
+            {"parent_id": "segment_a", "child_id": "progress", "confidence": 0.7, "mechanism": "maneuver_to_outcome"},
+            {"parent_id": "segment_a", "child_id": "compliance", "confidence": 0.7, "mechanism": "maneuver_to_outcome"},
+        ],
+        "cpts": {},
+        "metadata": {"source": "unit_test"},
+    }
+
+
+class DAGContractV3ManeuverOutcomeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cfg = DAGContractConfig(name="maneuver_outcome_v1", mode="hard")
+
+    def test_maneuver_outcome_contract_passes(self) -> None:
+        ok, canonical, report = enforce_dag_contract(_mo_payload(), config=self.cfg)
+        self.assertTrue(ok)
+        self.assertTrue(report.passed)
+        self.assertEqual(canonical["schema_version"], SCHEMA_VERSION_V3_MANEUVER_OUTCOME)
+        self.assertTrue(
+            validate_cache_payload(canonical, allowed_schema_versions=(SCHEMA_VERSION_V3_MANEUVER_OUTCOME,))
+        )
+
+    def test_rejects_invalid_node_types(self) -> None:
+        p = _mo_payload()
+        p["nodes"].append(
+            {"node_id": "decision_0", "node_type": "decision", "value": "accelerate", "metadata": {}}
+        )
+        ok, _canonical, report = enforce_dag_contract(p, config=self.cfg)
+        self.assertFalse(ok)
+        self.assertIn("invalid_node_type", report.violation_counts)
+
+    def test_rejects_missing_interval_metadata(self) -> None:
+        p = _mo_payload()
+        p["nodes"][0]["metadata"] = {"start_s": 0.5}
+        ok, _canonical, report = enforce_dag_contract(p, config=self.cfg)
+        self.assertFalse(ok)
+        self.assertIn("invalid_interval", report.violation_counts)
+
+    def test_tensorize_v3_shape_and_interval_features(self) -> None:
+        ok, canonical, _ = enforce_dag_contract(_mo_payload(), config=self.cfg)
+        self.assertTrue(ok)
+        batch = tensorize_dag_batch([canonical], max_nodes=16, max_edges=32, d_node_in=24, d_edge_in=8)
+        self.assertEqual(batch["dag_node_feat"].shape[-1], 24)
+        self.assertEqual(batch["dag_node_feat"].shape[0], 1)
+        # first maneuver node should have non-zero interval features (slice 18:22 in v3 layout)
+        feat = batch["dag_node_feat"][0, 0]
+        self.assertGreater(float(np.sum(np.abs(feat[18:22]))), 0.0)
+
+    def test_dual_read_and_strict_schema_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sid = "scenario_mo"
+            ok, canonical, _ = enforce_dag_contract(_mo_payload(), config=self.cfg)
+            self.assertTrue(ok)
+            (root / f"{sid}.json").write_text(json.dumps(canonical), encoding="utf-8")
+
+            reader_any = DAGCacheReader(str(root))
+            self.assertIsNotNone(reader_any.get(sid))
+
+            reader_v3 = DAGCacheReader(str(root), allowed_schema_versions=(SCHEMA_VERSION_V3_MANEUVER_OUTCOME,))
+            self.assertIsNotNone(reader_v3.get(sid))
+
+            reader_v2_only = DAGCacheReader(str(root), allowed_schema_versions=(SCHEMA_VERSION_V2_COMPACT10,))
+            self.assertIsNone(reader_v2_only.get(sid))
 
 
 if __name__ == "__main__":

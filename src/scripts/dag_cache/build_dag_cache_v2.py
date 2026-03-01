@@ -28,7 +28,11 @@ from counter_bmt_v2.causal.dag_contract import DAGContractConfig, enforce_dag_co
 from counter_bmt_v2.contracts import ScenarioInput, TimestampedFrame
 from counter_bmt_v2.data import ScenarioNetNNXLoader, build_vlm_frame_pack, render_scenario_frames
 from counter_bmt_v2.perception import GPT4oPerceptionModel
-from counter_bmt_v2.training.dag_cache_schema import SCHEMA_VERSION, dag_to_cache_payload, validate_cache_payload
+from counter_bmt_v2.training.dag_cache_schema import (
+    dag_to_cache_payload,
+    schema_version_for_contract,
+    validate_cache_payload,
+)
 
 
 def _normalize_sid(sid: str) -> str:
@@ -230,7 +234,10 @@ def parse_args() -> argparse.Namespace:
     p.set_defaults(include_ego_context_text=True)
     p.add_argument("--dual-view", dest="dual_view", action="store_true")
     p.add_argument("--no-dual-view", dest="dual_view", action="store_false")
-    p.set_defaults(dual_view=True)
+    p.set_defaults(dual_view=False)
+    p.add_argument("--add-ego-inset", dest="add_ego_inset", action="store_true")
+    p.add_argument("--no-add-ego-inset", dest="add_ego_inset", action="store_false")
+    p.set_defaults(add_ego_inset=True)
     p.add_argument(
         "--dual-view-mode",
         type=str,
@@ -259,7 +266,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-strict-promptbn", dest="strict_promptbn", action="store_false")
     p.set_defaults(strict_promptbn=True)
     p.add_argument("--save-raw-llm", action="store_true")
-    p.add_argument("--dag-contract", type=str, default="compact10", choices=["compact10"])
+    p.add_argument(
+        "--dag-contract",
+        type=str,
+        default="maneuver_outcome_v1",
+        choices=["maneuver_outcome_v1", "compact10"],
+    )
     p.add_argument("--dag-contract-mode", type=str, default="hard", choices=["hard"])
     return p.parse_args()
 
@@ -508,6 +520,7 @@ def main() -> int:
         name=str(args.dag_contract),
         mode=str(args.dag_contract_mode),
     )
+    expected_cache_schema_version = schema_version_for_contract(str(args.dag_contract))
 
     started_ts = time.time()
     successful_ids: List[str] = []
@@ -520,6 +533,8 @@ def main() -> int:
     contract_nodes_after: List[int] = []
     contract_edges_after: List[int] = []
     contract_norm_counts: Dict[str, int] = {}
+    maneuver_node_counts: List[int] = []
+    maneuver_interval_complete_counts: List[float] = []
 
     print(
         f"[dag-cache-v2] dataset={args.data_dir} total={len(loader)} selected={len(indices)} "
@@ -543,6 +558,8 @@ def main() -> int:
             contract_pass = False
             contract_violation_counts: Dict[str, int] = {}
             contract_report_summary: Dict[str, Any] = {}
+            maneuver_nodes = 0
+            maneuver_interval_complete_rate = 0.0
 
             for attempt in range(1, max(1, int(args.max_retries)) + 1):
                 attempts = attempt
@@ -580,6 +597,7 @@ def main() -> int:
                         include_ego_context_text=bool(args.include_ego_context_text),
                         dual_view=bool(args.dual_view),
                         dual_view_mode=str(args.dual_view_mode),
+                        add_ego_inset=bool(args.add_ego_inset),
                     )
                     n_frames_vlm = int(len(vlm_frames))
                     frame_manifest_path = ex_dir / "frame_manifest.json"
@@ -601,6 +619,7 @@ def main() -> int:
                             "ego_color_hint": str(args.ego_color_hint),
                             "dual_view_enabled": bool(args.dual_view),
                             "dual_view_mode": str(args.dual_view_mode),
+                            "add_ego_inset": bool(args.add_ego_inset),
                             "annotation_enabled": bool(args.annotate_vlm_frames),
                             "annotation_style": str(args.annotation_style),
                             "frame_manifest_path": str(frame_manifest_path),
@@ -612,6 +631,7 @@ def main() -> int:
                     features = perception.extract(scene)
                     dag = dag_builder.build(scene, features)
                     payload = dag_to_cache_payload(dag)
+                    payload["schema_version"] = expected_cache_schema_version
                     meta = payload.get("metadata", {})
                     if not isinstance(meta, dict):
                         meta = {"metadata_raw": str(meta)}
@@ -631,6 +651,7 @@ def main() -> int:
                         "annotation_style": str(args.annotation_style),
                         "dual_view": bool(args.dual_view),
                         "dual_view_mode": str(args.dual_view_mode),
+                        "add_ego_inset": bool(args.add_ego_inset),
                         "ego_color_hint": str(args.ego_color_hint),
                         "n_frames_raw": int(n_frames_raw),
                         "n_frames_vlm": int(n_frames_vlm),
@@ -657,6 +678,22 @@ def main() -> int:
                     if not validate_cache_payload(payload):
                         raise RuntimeError("Generated DAG payload failed schema validation.")
 
+                    node_list = payload.get("nodes", []) if isinstance(payload.get("nodes", []), list) else []
+                    maneuver_nodes = int(
+                        sum(1 for n in node_list if str(n.get("node_type", "")).strip().lower() == "maneuver")
+                    )
+                    interval_complete = 0
+                    if maneuver_nodes > 0:
+                        for n in node_list:
+                            if str(n.get("node_type", "")).strip().lower() != "maneuver":
+                                continue
+                            md = n.get("metadata", {})
+                            if not isinstance(md, dict):
+                                continue
+                            has_all = all(k in md for k in ("start_s", "end_s", "duration_s", "mid_s"))
+                            interval_complete += int(has_all)
+                        maneuver_interval_complete_rate = float(interval_complete / max(1, maneuver_nodes))
+
                     cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
                     feat_dict = _jsonify(features)
@@ -668,6 +705,7 @@ def main() -> int:
                         "ego_color_hint": str(args.ego_color_hint),
                         "dual_view_enabled": bool(args.dual_view),
                         "dual_view_mode": str(args.dual_view_mode),
+                        "add_ego_inset": bool(args.add_ego_inset),
                         "annotation_enabled": bool(args.annotate_vlm_frames),
                         "annotation_style": str(args.annotation_style),
                         "include_ego_context_text": bool(args.include_ego_context_text),
@@ -692,6 +730,8 @@ def main() -> int:
 
                     n_nodes = int(len(payload.get("nodes", [])))
                     n_edges = int(len(payload.get("edges", [])))
+                    maneuver_node_counts.append(int(maneuver_nodes))
+                    maneuver_interval_complete_counts.append(float(maneuver_interval_complete_rate))
                     status = "success"
                     successful_ids.append(sid)
                     break
@@ -728,6 +768,9 @@ def main() -> int:
                 "contract_pass": bool(contract_pass),
                 "contract_violation_counts": contract_violation_counts,
                 "contract_report": contract_report_summary,
+                "schema_version": str(expected_cache_schema_version),
+                "maneuver_nodes": int(maneuver_nodes),
+                "maneuver_interval_complete_rate": float(maneuver_interval_complete_rate),
             }
             _append_jsonl(results_jsonl, record)
             scenario_results[sid] = record
@@ -778,6 +821,7 @@ def main() -> int:
             "include_ego_context_text": bool(args.include_ego_context_text),
             "dual_view": bool(args.dual_view),
             "dual_view_mode": str(args.dual_view_mode),
+            "add_ego_inset": bool(args.add_ego_inset),
             "frame_renderer": str(args.frame_renderer),
             "render_film_size": int(args.render_film_size),
             "render_screen_size": int(args.render_screen_size),
@@ -791,7 +835,7 @@ def main() -> int:
             "save_raw_llm": bool(args.save_raw_llm),
             "dag_contract": str(args.dag_contract),
             "dag_contract_mode": str(args.dag_contract_mode),
-            "cache_schema_version": SCHEMA_VERSION,
+            "cache_schema_version": str(expected_cache_schema_version),
         },
         "selected_loader_indices": [int(i) for i in indices],
         "counts": {
@@ -806,6 +850,10 @@ def main() -> int:
             "avg_nodes_after": float(np.mean(contract_nodes_after)) if contract_nodes_after else 0.0,
             "avg_edges_after": float(np.mean(contract_edges_after)) if contract_edges_after else 0.0,
             "normalization_stats": contract_norm_counts,
+            "avg_maneuver_nodes": float(np.mean(maneuver_node_counts)) if maneuver_node_counts else 0.0,
+            "avg_maneuver_interval_complete_rate": (
+                float(np.mean(maneuver_interval_complete_counts)) if maneuver_interval_complete_counts else 0.0
+            ),
         },
         "failure_reasons": failure_reasons,
         "latency": {
@@ -833,6 +881,7 @@ def main() -> int:
         "python -m counter_bmt_v2.cli.train_nnx_bmt_dag_latent "
         "--dag-source-mode cache "
         f"--dag-cache-dir {cache_dir} "
+        f"--dag-expected-schema {'v3_maneuver_outcome' if str(args.dag_contract) == 'maneuver_outcome_v1' else 'v2_compact10'} "
         "--dag-cache-strict ..."
     , flush=True)
 

@@ -86,6 +86,34 @@ def _build_ego_context_text(sample: NNXBMTSceneSample, raw_frames: Sequence[Time
     speed_max = float(np.max(speed_valid)) if speed_valid.size else 0.0
 
     ts_list = ", ".join(f"{float(f.timestamp_s):.2f}" for f in raw_frames) if raw_frames else "none"
+    final_turn = "unknown"
+    try:
+        valid_idx = np.where(ego_valid)[0]
+        if valid_idx.size >= 3:
+            n_tail = max(2, int(round(0.25 * valid_idx.size)))
+            tail = valid_idx[-n_tail:]
+            dh_tail = np.diff(ego_heading[tail])
+            if dh_tail.size > 0:
+                wrapped_tail = np.arctan2(np.sin(dh_tail), np.cos(dh_tail))
+                mean_tail = float(np.mean(wrapped_tail))
+                mag_tail = float(np.mean(np.abs(wrapped_tail)))
+                if mag_tail < 0.03:
+                    final_turn = "no_significant_turn"
+                elif mean_tail > 0.0:
+                    final_turn = "left_turning_trend"
+                else:
+                    final_turn = "right_turning_trend"
+    except Exception:
+        final_turn = "unknown"
+
+    keyframe_lines: List[str] = []
+    for f in raw_frames:
+        ti = _timestamp_to_t_index(sample, float(f.timestamp_s))
+        if ti < valid.shape[0] and bool(valid[ti, 0]):
+            sp = float(speed[ti])
+            hd = float(np.degrees(ego_heading[ti]))
+            keyframe_lines.append(f"  t={float(f.timestamp_s):.2f}s speed={sp:.2f} heading_deg={hd:.1f}")
+
     lines = [
         "Known context from tensors (not inferred from images):",
         f"- View type: top-down traffic scene sequence",
@@ -93,9 +121,13 @@ def _build_ego_context_text(sample: NNXBMTSceneSample, raw_frames: Sequence[Time
         f"- Ego speed m/s: min={speed_min:.2f}, mean={speed_mean:.2f}, max={speed_max:.2f}",
         f"- Ego mean absolute heading delta per step (rad): {mean_heading_delta:.4f}",
         f"- Maneuver proxy from kinematics: {maneuver}",
+        f"- Final-horizon turn trend: {final_turn}",
         f"- Frame timestamps (s): {ts_list}",
         f"- Frame dt (s): {dt:.3f}",
     ]
+    if keyframe_lines:
+        lines.append("- Ego keyframe states:")
+        lines.extend(keyframe_lines)
     return "\n".join(lines)
 
 
@@ -108,6 +140,8 @@ def annotate_global_frame(
     timestamp_s: float,
     annotation_style: str = "banner+legend",
     ego_color_hint: str = "green",
+    ego_inset_path: str | Path | None = None,
+    ego_state_text: str = "",
 ) -> None:
     try:
         import matplotlib
@@ -144,7 +178,8 @@ def annotate_global_frame(
     if annotation_style == "banner+legend":
         legend_text = (
             "Sequence is chronological left-to-right in index order. "
-            "Use this frame's timestamp label for temporal grounding."
+            "Use this frame's timestamp label for temporal grounding. "
+            "Analyze early/mid/late sequence; do not ignore late-frame ego maneuvers."
         )
         ax.text(
             0.01,
@@ -157,6 +192,33 @@ def annotate_global_frame(
             color="white",
             bbox={"facecolor": "black", "alpha": 0.55, "pad": 3},
         )
+    if ego_state_text:
+        ax.text(
+            0.01,
+            0.875,
+            ego_state_text,
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=8,
+            color="white",
+            bbox={"facecolor": "black", "alpha": 0.55, "pad": 3},
+        )
+
+    if ego_inset_path:
+        try:
+            inset_img = plt.imread(str(ego_inset_path))
+            inset_ax = fig.add_axes([0.66, 0.02, 0.32, 0.32])
+            inset_ax.imshow(inset_img)
+            inset_ax.set_xticks([])
+            inset_ax.set_yticks([])
+            inset_ax.set_title("EGO ZOOM (same timestamp)", fontsize=8, color="white", pad=2)
+            for spine in inset_ax.spines.values():
+                spine.set_edgecolor("#22C55E")
+                spine.set_linewidth(1.8)
+            inset_ax.patch.set_alpha(1.0)
+        except Exception:
+            pass
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,6 +397,7 @@ def build_vlm_frame_pack(
     include_ego_context_text: bool = True,
     dual_view: bool = True,
     dual_view_mode: str = "global_plus_ego_tensor",
+    add_ego_inset: bool = True,
 ) -> Tuple[List[TimestampedFrame], List[Dict[str, Any]], str]:
     if dual_view and dual_view_mode != "global_plus_ego_tensor":
         raise ValueError(f"Unsupported dual_view_mode: {dual_view_mode}")
@@ -348,6 +411,47 @@ def build_vlm_frame_pack(
 
     for i, raw in enumerate(ordered):
         global_path = out_dir / f"global_t{i:03d}.png"
+        t_idx = _timestamp_to_t_index(sample, float(raw.timestamp_s))
+        ego_path = out_dir / f"ego_t{i:03d}.png"
+        ego_render_ok = False
+        if add_ego_inset or dual_view:
+            try:
+                render_ego_tensor_view(
+                    sample=sample,
+                    t_index=t_idx,
+                    out_path=ego_path,
+                    max_agents=max_agents,
+                    ego_color_hint=ego_color_hint,
+                )
+                ego_render_ok = True
+            except Exception:
+                ego_render_ok = False
+
+        ego_state_text = ""
+        try:
+            pos = np.asarray(sample.agent_position_xy, dtype=np.float32)
+            vel = np.asarray(sample.agent_velocity_xy, dtype=np.float32)
+            valid = np.asarray(sample.agent_valid_mask, dtype=bool)
+            heading = np.asarray(sample.agent_heading, dtype=np.float32)
+            if (
+                pos.ndim == 3
+                and vel.ndim == 3
+                and valid.ndim == 2
+                and heading.ndim == 2
+                and t_idx < pos.shape[0]
+                and pos.shape[1] > 0
+                and bool(valid[t_idx, 0])
+            ):
+                ego_xy = pos[t_idx, 0, :2]
+                ego_speed = float(np.linalg.norm(vel[t_idx, 0, :2]))
+                ego_heading_deg = float(np.degrees(heading[t_idx, 0]))
+                ego_state_text = (
+                    f"Ego@t: x={ego_xy[0]:.1f}m y={ego_xy[1]:.1f}m "
+                    f"speed={ego_speed:.1f}m/s heading={ego_heading_deg:.1f}deg"
+                )
+        except Exception:
+            ego_state_text = ""
+
         if annotate_vlm_frames:
             try:
                 annotate_global_frame(
@@ -358,6 +462,8 @@ def build_vlm_frame_pack(
                     timestamp_s=float(raw.timestamp_s),
                     annotation_style=annotation_style,
                     ego_color_hint=ego_color_hint,
+                    ego_inset_path=(ego_path if (add_ego_inset and ego_render_ok) else None),
+                    ego_state_text=ego_state_text,
                 )
             except Exception:
                 shutil.copy2(raw.path, global_path)
@@ -373,19 +479,19 @@ def build_vlm_frame_pack(
                 "timestamp_s": float(raw.timestamp_s),
                 "path": str(global_path),
                 "sequence_index": int(sequence_index),
+                "has_ego_inset": bool(add_ego_inset and ego_render_ok),
             }
         )
 
         if dual_view:
-            t_idx = _timestamp_to_t_index(sample, float(raw.timestamp_s))
-            ego_path = out_dir / f"ego_t{i:03d}.png"
-            render_ego_tensor_view(
-                sample=sample,
-                t_index=t_idx,
-                out_path=ego_path,
-                max_agents=max_agents,
-                ego_color_hint=ego_color_hint,
-            )
+            if not ego_render_ok:
+                render_ego_tensor_view(
+                    sample=sample,
+                    t_index=t_idx,
+                    out_path=ego_path,
+                    max_agents=max_agents,
+                    ego_color_hint=ego_color_hint,
+                )
             sequence_index = len(frames_for_vlm)
             frames_for_vlm.append(TimestampedFrame(path=str(ego_path), timestamp_s=float(raw.timestamp_s)))
             manifest.append(
@@ -401,4 +507,3 @@ def build_vlm_frame_pack(
 
     context_text = _build_ego_context_text(sample, ordered) if include_ego_context_text else ""
     return frames_for_vlm, manifest, context_text
-

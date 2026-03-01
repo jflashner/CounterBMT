@@ -1,4 +1,4 @@
-"""Import legacy pipeline DAG JSON outputs into v2 DAG cache format."""
+"""Import legacy pipeline DAG JSON outputs into contract-aligned DAG cache format."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ if __package__ is None or __package__ == "":
         sys.path.insert(0, src_root_str)
 
 from counter_bmt_v2.causal.dag_contract import DAGContractConfig, enforce_dag_contract
-from counter_bmt_v2.training.dag_cache_schema import SCHEMA_VERSION, validate_cache_payload
+from counter_bmt_v2.training.dag_cache_schema import schema_version_for_contract, validate_cache_payload
 
 
 def _normalize_node(n: Dict[str, Any]) -> Dict[str, Any]:
@@ -54,7 +54,7 @@ def _normalize_edge(e: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _infer_payload(raw: Dict[str, Any], scenario_id_hint: str) -> Dict[str, Any]:
+def _infer_payload(raw: Dict[str, Any], scenario_id_hint: str, *, dag_contract: str) -> Dict[str, Any]:
     scenario_id = str(
         raw.get("scenario_id")
         or raw.get("id")
@@ -77,14 +77,14 @@ def _infer_payload(raw: Dict[str, Any], scenario_id_hint: str) -> Dict[str, Any]
     edges_n = [_normalize_edge(e) for e in (edges if isinstance(edges, list) else [])]
 
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version_for_contract(dag_contract),
         "scenario_id": scenario_id,
         "nodes": nodes_n,
         "edges": edges_n,
         "cpts": cpts if isinstance(cpts, dict) else {},
         "metadata": {
             "source": "legacy_import",
-            "contract_name": "compact10",
+            "contract_name": str(dag_contract),
             "contract_version": "1",
             "contract_report": {"passed": False, "reason": "not_checked"},
         },
@@ -92,10 +92,10 @@ def _infer_payload(raw: Dict[str, Any], scenario_id_hint: str) -> Dict[str, Any]
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Import legacy DAG JSONs into v2 cache format")
+    p = argparse.ArgumentParser(description="Import legacy DAG JSONs into contract-aligned cache format")
     p.add_argument("--legacy-root", type=str, required=True)
     p.add_argument("--out-dir", type=str, required=True)
-    p.add_argument("--dag-contract", type=str, default="compact10", choices=["compact10"])
+    p.add_argument("--dag-contract", type=str, default="compact10", choices=["compact10", "maneuver_outcome_v1"])
     p.add_argument("--dag-contract-mode", type=str, default="hard", choices=["hard"])
     args = p.parse_args()
 
@@ -112,6 +112,7 @@ def main() -> int:
     skipped = 0
     fail_reasons: Dict[str, int] = {}
     contract_cfg = DAGContractConfig(name=str(args.dag_contract), mode=str(args.dag_contract_mode))
+    schema_version = schema_version_for_contract(str(args.dag_contract))
     for fp in files:
         try:
             raw = json.loads(fp.read_text(encoding="utf-8"))
@@ -120,7 +121,7 @@ def main() -> int:
             fail_reasons["invalid_json"] = int(fail_reasons.get("invalid_json", 0) + 1)
             continue
         sid_hint = fp.parent.name
-        payload = _infer_payload(raw, sid_hint)
+        payload = _infer_payload(raw, sid_hint, dag_contract=str(args.dag_contract))
         sid = str(payload.get("scenario_id", "")).strip()
         if not sid:
             skipped += 1
@@ -131,9 +132,9 @@ def main() -> int:
             skipped += 1
             fail_reasons["contract_failed"] = int(fail_reasons.get("contract_failed", 0) + 1)
             continue
-        canonical["schema_version"] = SCHEMA_VERSION
+        canonical["schema_version"] = schema_version
         canonical["scenario_id"] = sid
-        if not validate_cache_payload(canonical):
+        if not validate_cache_payload(canonical, allowed_schema_versions=(schema_version,)):
             skipped += 1
             fail_reasons["schema_failed"] = int(fail_reasons.get("schema_failed", 0) + 1)
             continue

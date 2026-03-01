@@ -139,10 +139,12 @@ class GPT4oPerceptionModel(PerceptionModel):
     def _build_prompt(self, scene: ScenarioInput) -> str:
         frames = scene.frames[: self.max_frames]
         ts = ", ".join(f"{f.timestamp_s:.2f}s" for f in frames) or "none"
+        max_ts = float(max((f.timestamp_s for f in frames), default=0.0))
         meta = scene.metadata if isinstance(scene.metadata, dict) else {}
         ego_color_hint = str(meta.get("ego_color_hint", "green"))
         dual_view_enabled = bool(meta.get("dual_view_enabled", False))
         dual_view_mode = str(meta.get("dual_view_mode", ""))
+        add_ego_inset = bool(meta.get("add_ego_inset", False))
         context_text = str(meta.get("vlm_context_text", "")).strip()
         frame_lines = []
         for i, f in enumerate(frames):
@@ -154,6 +156,8 @@ class GPT4oPerceptionModel(PerceptionModel):
             f"The ego vehicle is highlighted in {ego_color_hint.upper()}.",
             "Frames are a time-ordered sequence. Use timestamp ordering only; do not reverse time.",
             "Track the same ego vehicle consistently across the full sequence.",
+            "Inspect the full horizon including the final 25% of frames for late maneuvers.",
+            "Infer ego maneuvers from visible motion over time, not single-frame snapshots.",
         ]
         if dual_view_enabled:
             semantics.append(
@@ -161,6 +165,10 @@ class GPT4oPerceptionModel(PerceptionModel):
             )
             if dual_view_mode:
                 semantics.append(f"Dual-view mode: {dual_view_mode}.")
+        elif add_ego_inset:
+            semantics.append(
+                "Each global frame includes an EGO ZOOM inset (same timestamp) showing ego-centric local context."
+            )
 
         context_block = ""
         if context_text:
@@ -207,6 +215,8 @@ Rules:
 - Be conservative and avoid hallucinated events.
 - If uncertainty is high, lower confidence and output fewer events.
 - Keep maneuvers time-ordered and non-overlapping when possible.
+- Always include at least one maneuver segment that covers the end of the horizon (end_s near {max_ts:.2f}s).
+- If the ego performs a late turn (left/right) near the end, include that maneuver explicitly with timestamps.
 - Base conclusions only on visible evidence and supplied context text.
 """.strip()
 
@@ -217,6 +227,7 @@ Rules:
         meta = scene.metadata if isinstance(scene.metadata, dict) else {}
         ego_color_hint = str(meta.get("ego_color_hint", "green"))
         dual_view_enabled = bool(meta.get("dual_view_enabled", False))
+        add_ego_inset = bool(meta.get("add_ego_inset", False))
         prompt = self._build_prompt(scene)
         images = self._encode_images(scene)
 
@@ -284,9 +295,10 @@ Rules:
                 "summary": data.get("summary", ""),
                 "raw_response": raw,
                 "n_images_sent": len(images),
-                "prompt_version": "v2_topdown_ego_v1",
+                "prompt_version": "v2_topdown_ego_v2_endaware",
                 "ego_color_hint": ego_color_hint,
                 "dual_view_enabled": dual_view_enabled,
+                "add_ego_inset": add_ego_inset,
                 "frame_count_sent": len(images),
             },
         )

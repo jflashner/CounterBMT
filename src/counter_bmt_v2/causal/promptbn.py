@@ -24,9 +24,30 @@ from counter_bmt_v2.causal.dag_contract import (
 from counter_bmt_v2.causal.dag import DAGBuilder, SimpleDAGBuilder
 from counter_bmt_v2.contracts import BayesianDAG, DAGEdge, DAGNode, ScenarioInput, VLMFeatures
 from counter_bmt_v2.llm import OpenAIChatClient
-from counter_bmt_v2.training.dag_cache_schema import SCHEMA_VERSION
+from counter_bmt_v2.training.dag_cache_schema import schema_version_for_contract
 
 logger = logging.getLogger(__name__)
+
+_MANEUVER_ALTERNATIVES_COMPACT12: List[str] = [
+    "straight",
+    "left_turn",
+    "right_turn",
+    "lane_change_left",
+    "lane_change_right",
+    "stop",
+    "accelerate",
+    "decelerate",
+    "yield",
+    "merge",
+    "u_turn",
+    "park",
+]
+
+_OUTCOME_ALTERNATIVES_MO: Dict[str, List[str]] = {
+    "collision_outcome": ["collision_avoided", "collision_possible"],
+    "progress_outcome": ["progress_good", "progress_limited"],
+    "compliance_outcome": ["compliant", "violation_possible"],
+}
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
@@ -118,7 +139,7 @@ class PromptBNDAGBuilder(DAGBuilder):
     api_key: Optional[str] = None
     max_retries: int = 4
     use_simple_fallback: bool = True
-    dag_contract: str = "compact10"
+    dag_contract: str = "maneuver_outcome_v1"
     dag_contract_mode: str = "hard"
 
     def __post_init__(self) -> None:
@@ -144,6 +165,7 @@ class PromptBNDAGBuilder(DAGBuilder):
 
             ok, dag = self._parse_and_validate(scene, variables, parsed)
             if ok and dag is not None:
+                self._project_edges_for_contract(dag)
                 dag.cpts = self._ensure_minimal_cpts(dag)
                 dag.cpts.update(self._extract_cpts(parsed, dag))
                 dag.cpts = {k: v for k, v in dag.cpts.items() if k in dag.nodes}
@@ -157,19 +179,26 @@ class PromptBNDAGBuilder(DAGBuilder):
                         metadata={"alternatives": ["collision_avoided", "collision_possible"]},
                     ),
                 )
-                if not any(e.child_id == "collision_outcome" for e in dag.edges):
+                default_outcomes = ["collision_outcome"]
+                if str(self.dag_contract) == "maneuver_outcome_v1":
+                    default_outcomes = ["collision_outcome", "progress_outcome", "compliance_outcome"]
+                for out_node in default_outcomes:
+                    if out_node not in dag.nodes:
+                        continue
+                    if any(e.child_id == out_node for e in dag.edges):
+                        continue
                     for node in dag.nodes.values():
-                        if node.node_type in {"maneuver", "decision"}:
+                        if node.node_type == "maneuver":
                             dag.edges.append(
                                 DAGEdge(
                                     parent_id=node.node_id,
-                                    child_id="collision_outcome",
+                                    child_id=out_node,
                                     confidence=0.7,
-                                    mechanism="event impacts collision risk",
+                                    mechanism="maneuver_to_outcome",
                                 )
                             )
                 payload = {
-                    "schema_version": SCHEMA_VERSION,
+                    "schema_version": schema_version_for_contract(str(self.dag_contract)),
                     "scenario_id": str(scene.scenario_id),
                     "nodes": [
                         {
@@ -200,13 +229,13 @@ class PromptBNDAGBuilder(DAGBuilder):
                 contract_ok, canonical_payload, contract_report = enforce_dag_contract(payload, config=cfg)
                 if not contract_ok:
                     logger.warning(
-                        "PromptBN DAG failed compact contract on attempt %d/%d: violations=%s",
+                        "PromptBN DAG failed contract on attempt %d/%d: violations=%s",
                         attempt,
                         self.max_retries,
                         contract_report.violation_counts,
                     )
                     continue
-                canonical_payload["schema_version"] = SCHEMA_VERSION
+                canonical_payload["schema_version"] = schema_version_for_contract(str(self.dag_contract))
                 canonical_payload["scenario_id"] = str(scene.scenario_id)
                 canonical_meta = canonical_payload.get("metadata", {})
                 if not isinstance(canonical_meta, dict):
@@ -225,6 +254,75 @@ class PromptBNDAGBuilder(DAGBuilder):
 
     def _build_variable_schema(self, scene: ScenarioInput, features: VLMFeatures) -> List[Dict[str, Any]]:
         vars_out: List[Dict[str, Any]] = []
+
+        if str(self.dag_contract) == "maneuver_outcome_v1":
+            maneuvers = sorted(list(features.maneuvers), key=lambda m: (float(m.start_s), float(m.end_s)))
+            for i, m in enumerate(maneuvers[:8]):
+                start_s = float(m.start_s)
+                end_s = float(max(float(m.end_s), start_s))
+                duration_s = float(max(0.0, end_s - start_s))
+                mid_s = float(0.5 * (start_s + end_s))
+                vars_out.append(
+                    {
+                        "node_id": f"maneuver_{i}",
+                        "node_type": "maneuver",
+                        "value": str(m.maneuver_type.value),
+                        "timestamp_s": mid_s,
+                        "start_s": start_s,
+                        "end_s": end_s,
+                        "duration_s": duration_s,
+                        "mid_s": mid_s,
+                        "description": m.reasoning or "critical maneuver segment",
+                        "alternatives": list(_MANEUVER_ALTERNATIVES_COMPACT12),
+                        "observed": True,
+                    }
+                )
+            if not any(str(v.get("node_type", "")) == "maneuver" for v in vars_out):
+                vars_out.append(
+                    {
+                        "node_id": "maneuver_0",
+                        "node_type": "maneuver",
+                        "value": "straight",
+                        "timestamp_s": 0.0,
+                        "start_s": 0.0,
+                        "end_s": 0.0,
+                        "duration_s": 0.0,
+                        "mid_s": 0.0,
+                        "description": "default maneuver anchor",
+                        "alternatives": list(_MANEUVER_ALTERNATIVES_COMPACT12),
+                        "observed": True,
+                    }
+                )
+
+            vars_out.extend(
+                [
+                    {
+                        "node_id": "collision_outcome",
+                        "node_type": "outcome",
+                        "value": "collision_avoided",
+                        "description": "collision consequence at scenario horizon",
+                        "alternatives": list(_OUTCOME_ALTERNATIVES_MO["collision_outcome"]),
+                        "observed": True,
+                    },
+                    {
+                        "node_id": "progress_outcome",
+                        "node_type": "outcome",
+                        "value": "progress_good",
+                        "description": "goal/progress consequence at scenario horizon",
+                        "alternatives": list(_OUTCOME_ALTERNATIVES_MO["progress_outcome"]),
+                        "observed": True,
+                    },
+                    {
+                        "node_id": "compliance_outcome",
+                        "node_type": "outcome",
+                        "value": "compliant",
+                        "description": "rule-compliance consequence at scenario horizon",
+                        "alternatives": list(_OUTCOME_ALTERNATIVES_MO["compliance_outcome"]),
+                        "observed": True,
+                    },
+                ]
+            )
+            return vars_out
 
         init_speed = 10.0
         if scene.ego_trajectory_xy is not None and len(scene.ego_trajectory_xy) > 1:
@@ -313,6 +411,12 @@ class PromptBNDAGBuilder(DAGBuilder):
         return vars_out
 
     def _build_prompt(self, scene: ScenarioInput, variables: List[Dict[str, Any]]) -> str:
+        cpt_scope = "maneuver and outcome" if str(self.dag_contract) == "maneuver_outcome_v1" else "maneuver, decision, and outcome"
+        edge_rule = (
+            "Edges MUST be only maneuver -> outcome. Do NOT emit outcome->* or maneuver->maneuver edges."
+            if str(self.dag_contract) == "maneuver_outcome_v1"
+            else "Edges may follow general causal semantics from parent causes to child effects."
+        )
         return f"""
 You are discovering a Bayesian Network structure from variable metadata.
 
@@ -320,8 +424,9 @@ Follow PromptBN-style constraints:
 1) Output both node-centric and edge-centric structures.
 2) Use ONLY node IDs from the provided metadata.
 3) Ensure edge set forms a valid DAG (no cycles).
-4) Include discrete CPTs for maneuver, decision, and outcome nodes.
+4) Include discrete CPTs for {cpt_scope} nodes.
 5) Keep probabilities in each CPT row normalized to sum to 1.
+6) {edge_rule}
 
 Scenario: {scene.scenario_id}
 Variables metadata:
@@ -356,6 +461,46 @@ Output JSON only with this schema:
 }}
 """.strip()
 
+    def _project_edges_for_contract(self, dag: BayesianDAG) -> None:
+        """Hard-shape edges for contract mode to reduce retry churn."""
+        if str(self.dag_contract) != "maneuver_outcome_v1":
+            return
+        maneuvers = {n.node_id for n in dag.nodes.values() if str(n.node_type) == "maneuver"}
+        outcomes = {n.node_id for n in dag.nodes.values() if str(n.node_type) == "outcome"}
+        if not maneuvers or not outcomes:
+            dag.edges = []
+            return
+
+        best: Dict[Tuple[str, str], DAGEdge] = {}
+        for e in dag.edges:
+            u = str(e.parent_id)
+            v = str(e.child_id)
+            if u not in maneuvers or v not in outcomes:
+                continue
+            key = (u, v)
+            prev = best.get(key)
+            if prev is None or float(e.confidence) > float(prev.confidence):
+                best[key] = DAGEdge(
+                    parent_id=u,
+                    child_id=v,
+                    confidence=float(max(0.0, min(1.0, float(e.confidence)))),
+                    mechanism=str(e.mechanism or "maneuver_to_outcome"),
+                )
+
+        # Guarantee at least one incoming edge per required outcome if maneuvers exist.
+        required_outcomes = ("collision_outcome", "progress_outcome", "compliance_outcome")
+        first_m = sorted(maneuvers)[0]
+        for o in required_outcomes:
+            if o in outcomes and not any(k[1] == o for k in best.keys()):
+                best[(first_m, o)] = DAGEdge(
+                    parent_id=first_m,
+                    child_id=o,
+                    confidence=0.7,
+                    mechanism="maneuver_to_outcome",
+                )
+
+        dag.edges = [best[k] for k in sorted(best.keys())]
+
     def _parse_and_validate(
         self,
         scene: ScenarioInput,
@@ -376,10 +521,6 @@ Output JSON only with this schema:
             parents = {str(p) for p in n.get("parents", []) if str(p) in allowed and str(p) != nid}
             node_parent_map[nid] = parents
 
-        # PromptBN expects full node-centric coverage.
-        if set(node_parent_map.keys()) != allowed:
-            return False, None
-
         edge_pairs: Set[Tuple[str, str]] = set()
         for e in raw_edges:
             u = str(e.get("from", ""))
@@ -387,11 +528,24 @@ Output JSON only with this schema:
             if u in allowed and v in allowed and u != v:
                 edge_pairs.add((u, v))
 
-        # Structural consistency validation (PromptBN): node parents == incoming edge set.
-        for nid, parents in node_parent_map.items():
-            incoming = {u for (u, v) in edge_pairs if v == nid}
-            if parents != incoming:
+        if str(self.dag_contract) == "maneuver_outcome_v1":
+            # In maneuver_outcome mode we allow partial node-centric outputs and
+            # project edge shape later. If edge list is empty but parents were
+            # provided in node-centric form, use those links.
+            if not edge_pairs and node_parent_map:
+                for nid, parents in node_parent_map.items():
+                    for p in parents:
+                        if p in allowed and p != nid:
+                            edge_pairs.add((p, nid))
+        else:
+            # PromptBN expects full node-centric coverage.
+            if set(node_parent_map.keys()) != allowed:
                 return False, None
+            # Structural consistency validation (PromptBN): node parents == incoming edge set.
+            for nid, parents in node_parent_map.items():
+                incoming = {u for (u, v) in edge_pairs if v == nid}
+                if parents != incoming:
+                    return False, None
 
         # Ensure every edge references known nodes, and graph is acyclic.
         if not _check_dag(allowed, list(edge_pairs)):
@@ -402,15 +556,19 @@ Output JSON only with this schema:
 
         for nid in allowed:
             meta = var_map[nid]
+            node_meta = {
+                "alternatives": meta.get("alternatives", []),
+                "description": meta.get("description", ""),
+            }
+            for key in ("start_s", "end_s", "duration_s", "mid_s", "observed"):
+                if key in meta:
+                    node_meta[key] = meta.get(key)
             dag.nodes[nid] = DAGNode(
                 node_id=nid,
                 node_type=str(meta.get("node_type", "unknown")),
                 value=meta.get("value"),
                 timestamp_s=meta.get("timestamp_s"),
-                metadata={
-                    "alternatives": meta.get("alternatives", []),
-                    "description": meta.get("description", ""),
-                },
+                metadata=node_meta,
             )
 
         edge_info: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -437,6 +595,8 @@ Output JSON only with this schema:
         out: Dict[str, Dict[str, Any]] = {}
         for node in dag.nodes.values():
             if node.node_type not in {"maneuver", "decision", "outcome"}:
+                continue
+            if str(self.dag_contract) == "maneuver_outcome_v1" and node.node_type == "decision":
                 continue
             values = [str(x) for x in node.metadata.get("alternatives", [])]
             if str(node.value) not in values and node.value is not None:
@@ -493,9 +653,14 @@ Output JSON only with this schema:
                 u = 1.0 / float(len(values))
                 rowed = {"*": {v: u for v in values}}
 
+            if str(self.dag_contract) == "maneuver_outcome_v1":
+                parents = [e.parent_id for e in dag.edges if e.child_id == nid]
+            else:
+                parents = [str(p) for p in spec.get("parents", []) if p in dag.nodes]
+
             out[nid] = {
                 "values": values,
-                "parents": [str(p) for p in spec.get("parents", []) if p in dag.nodes],
+                "parents": [str(p) for p in parents if str(p) in dag.nodes],
                 "cpt": rowed,
             }
         return out

@@ -240,6 +240,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dag-cache-dir", type=str, default="")
     parser.add_argument("--dag-cache-strict", action="store_true")
+    parser.add_argument(
+        "--dag-expected-schema",
+        type=str,
+        default="any",
+        choices=["any", "v2_compact10", "v3_maneuver_outcome"],
+        help="optional strict DAG cache schema expectation during training",
+    )
 
     # Stage schedule.
     parser.add_argument(
@@ -389,6 +396,7 @@ def main() -> int:
         dag_source_mode=str(args.dag_source_mode),
         dag_cache_dir=str(args.dag_cache_dir),
         dag_cache_strict=bool(args.dag_cache_strict),
+        dag_expected_schema=str(args.dag_expected_schema),
         stage=str(args.stage),
         stage_a_steps=int(args.stage_a_steps),
         stage_b_steps=int(args.stage_b_steps),

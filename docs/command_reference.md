@@ -153,6 +153,7 @@ Key options:
   - `--dag-source-mode {dual,cache,scene_derived}`
   - `--dag-cache-dir`
   - `--dag-cache-strict`
+  - `--dag-expected-schema {any,v2_compact10,v3_maneuver_outcome}`
 - staged training:
   - `--stage {A,B,C,A_B_C}`
   - `--stage-a-steps`, `--stage-b-steps`, `--stage-c-steps`
@@ -187,8 +188,9 @@ PYTHONPATH=src .venv-v2/bin/python -m counter_bmt_v2.cli.train_nnx_bmt_dag_laten
   --stage B \
   --stage-b-steps 2000 \
   --dag-source-mode cache \
-  --dag-cache-dir outputs/dag_cache_v2_contract/cache \
+  --dag-cache-dir outputs/dag_cache_v3_mo/cache \
   --dag-cache-strict \
+  --dag-expected-schema v3_maneuver_outcome \
   --batch-size 8
 ```
 
@@ -200,9 +202,9 @@ Command:
 - `python src/scripts/dag_cache/build_dag_cache_v2.py`
 
 What it does:
-- renders scenario frames (global + optional dual ego view)
+- renders scenario frames (global-only by default; optional dual ego view)
 - runs GPT-4o perception + PromptBN DAG build
-- enforces compact contract hard mode
+- enforces DAG contract hard mode (`maneuver_outcome_v1` by default)
 - writes cache JSON + examples + manifest
 
 Key options:
@@ -219,7 +221,7 @@ Key options:
   - `--max-retries`, `--retry-backoff-sec`, `--continue-on-error`
   - `--overwrite`
 - contract:
-  - `--dag-contract compact10`
+  - `--dag-contract {maneuver_outcome_v1,compact10}`
   - `--dag-contract-mode hard`
 
 Example:
@@ -227,16 +229,16 @@ Example:
 ```bash
 PYTHONPATH=src .venv-v2/bin/python src/scripts/dag_cache/build_dag_cache_v2.py \
   --data-dir data/scenarionet_waymo_training_500 \
-  --out-dir outputs/dag_cache_v2_contract_smoke \
+  --out-dir outputs/dag_cache_v3_mo_smoke \
   --n-scenarios 50 \
   --seed 0 \
   --strict-promptbn \
   --frame-renderer scenarionet \
   --num-frames 6 \
-  --dual-view \
+  --no-dual-view \
   --annotate-vlm-frames \
   --include-ego-context-text \
-  --dag-contract compact10 \
+  --dag-contract maneuver_outcome_v1 \
   --dag-contract-mode hard
 ```
 
@@ -249,7 +251,8 @@ Example:
 
 ```bash
 PYTHONPATH=src .venv/bin/python src/scripts/dag_cache/validate_cache_contract.py \
-  --cache-dir outputs/dag_cache_v2_contract_smoke/cache
+  --cache-dir outputs/dag_cache_v3_mo_smoke/cache \
+  --dag-contract maneuver_outcome_v1
 ```
 
 ### 3.3 Inspect generated DAG examples
@@ -261,14 +264,14 @@ Example:
 
 ```bash
 PYTHONPATH=src .venv/bin/python src/scripts/dag_cache/inspect_dag_examples.py \
-  --cache-dir outputs/dag_cache_v2_contract_smoke/cache \
-  --examples-dir outputs/dag_cache_v2_contract_smoke/examples \
+  --cache-dir outputs/dag_cache_v3_mo_smoke/cache \
+  --examples-dir outputs/dag_cache_v3_mo_smoke/examples \
   --n 5 \
   --seed 0 \
-  --output-md outputs/dag_cache_v2_contract_smoke/inspect.md
+  --output-md outputs/dag_cache_v3_mo_smoke/inspect.md
 ```
 
-### 3.4 Import legacy DAG JSONs into v2 compact cache
+### 3.4 Import legacy DAG JSONs into contract-aligned cache
 
 Command:
 - `python src/scripts/dag_cache/import_legacy_dag_json.py`
@@ -278,7 +281,8 @@ Example:
 ```bash
 PYTHONPATH=src .venv/bin/python src/scripts/dag_cache/import_legacy_dag_json.py \
   --legacy-root outputs/legacy_pipeline_runs \
-  --out-dir data/dag_cache_v2_from_legacy
+  --out-dir data/dag_cache_from_legacy \
+  --dag-contract maneuver_outcome_v1
 ```
 
 ## 4) Parity Suite
