@@ -567,8 +567,6 @@ def _canonicalize_maneuver_outcome_payload(
 
     # Canonical edges: only maneuver -> outcome.
     edge_best: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    parents_count: Dict[str, int] = {}
-    outgoing_count: Dict[str, int] = {}
     for i, rec in enumerate(raw_edges):
         if not isinstance(rec, Mapping):
             violations.append(
@@ -606,10 +604,14 @@ def _canonicalize_maneuver_outcome_payload(
             edge_best[key] = {"parent_id": u, "child_id": v, "confidence": conf, "mechanism": mech}
         elif conf == float(prev["confidence"]) and mech < str(prev["mechanism"]):
             edge_best[key] = {"parent_id": u, "child_id": v, "confidence": conf, "mechanism": mech}
+    canonical_edges = sorted(edge_best.values(), key=lambda r: (r["parent_id"], r["child_id"]))
+    parents_count: Dict[str, int] = {}
+    outgoing_count: Dict[str, int] = {}
+    for e in canonical_edges:
+        u = str(e["parent_id"])
+        v = str(e["child_id"])
         parents_count[v] = int(parents_count.get(v, 0) + 1)
         outgoing_count[u] = int(outgoing_count.get(u, 0) + 1)
-
-    canonical_edges = sorted(edge_best.values(), key=lambda r: (r["parent_id"], r["child_id"]))
     for node_id, count in parents_count.items():
         if count > int(cfg.max_parents_per_node):
             violations.append(
@@ -760,11 +762,11 @@ def canonicalize_dag_payload(
             name=str(cfg.name),
             version=str(cfg.version),
             mode=str(cfg.mode),
-            max_nodes=min(int(cfg.max_nodes), 11),
-            max_edges=min(int(cfg.max_edges), 24),
-            max_parents_per_node=min(int(cfg.max_parents_per_node), 8),
-            max_outgoing_per_node=min(int(cfg.max_outgoing_per_node), 3),
-            max_depth=min(int(cfg.max_depth), 2),
+            max_nodes=11,
+            max_edges=24,
+            max_parents_per_node=8,
+            max_outgoing_per_node=3,
+            max_depth=2,
         )
         return _canonicalize_maneuver_outcome_payload(payload, cfg)
     p = copy.deepcopy(dict(payload))
