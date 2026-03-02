@@ -72,6 +72,10 @@ def _to_runtime(d: Mapping[str, Any]) -> ModelRuntimeConfig:
         python_bin=str(d.get("python_bin", "python")),
         legacy_root=str(d.get("legacy_root", "src/Adv-BMT")),
         config_name=str(d.get("config_name", "")),
+        dag_source_mode=str(d.get("dag_source_mode", "none")),
+        dag_cache_dir=str(d.get("dag_cache_dir", "")),
+        dag_cache_strict=bool(d.get("dag_cache_strict", False)),
+        dag_expected_schema=str(d.get("dag_expected_schema", "any")),
     )
 
 

@@ -25,6 +25,10 @@ class ModelRuntimeConfig:
     python_bin: str = "python"
     legacy_root: str = "src/Adv-BMT"
     config_name: str = ""
+    dag_source_mode: str = "none"  # none|dual|cache|scene_derived
+    dag_cache_dir: str = ""
+    dag_cache_strict: bool = False
+    dag_expected_schema: str = "any"  # any|v2_compact10|v3_maneuver_outcome
 
 
 @dataclass
@@ -110,5 +114,9 @@ def model_spec_hashable_dict(spec: ModelSpec) -> Dict[str, Any]:
             "python_bin": str(spec.runtime.python_bin),
             "legacy_root": str(spec.runtime.legacy_root),
             "config_name": str(spec.runtime.config_name),
+            "dag_source_mode": str(spec.runtime.dag_source_mode),
+            "dag_cache_dir": str(spec.runtime.dag_cache_dir),
+            "dag_cache_strict": bool(spec.runtime.dag_cache_strict),
+            "dag_expected_schema": str(spec.runtime.dag_expected_schema),
         },
     }

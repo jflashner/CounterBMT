@@ -32,6 +32,10 @@ models:
       sampling_method: topp
       topp: 0.95
       temperature: 1.0
+      dag_source_mode: dual
+      dag_cache_dir: outputs/dag_cache_v3_mo_100_dual/cache_merged
+      dag_cache_strict: false
+      dag_expected_schema: v3_maneuver_outcome
 
   - id: dag_latent_stageBC_from_8k_cache100
     backend: v2
@@ -45,3 +49,7 @@ models:
       sampling_method: topp
       topp: 0.95
       temperature: 1.0
+      dag_source_mode: dual
+      dag_cache_dir: outputs/dag_cache_v3_mo_100_dual/cache_merged
+      dag_cache_strict: false
+      dag_expected_schema: v3_maneuver_outcome

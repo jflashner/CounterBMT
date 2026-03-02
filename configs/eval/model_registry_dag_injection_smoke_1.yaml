@@ -1,13 +1,13 @@
 run:
   dataset_dir: data/scenarionet_waymo_training_500
-  output_dir: outputs/head2head_dag_latent_8k_vs_stagebc_8_fast
-  n_scenarios: 8
+  output_dir: outputs/head2head_dag_injection_smoke_1
+  n_scenarios: 1
   seed: 0
   scenario_indices_file: outputs/head2head_dag_latent_8k_vs_stagebc_50/indices_first8.json
   metrics:
     mode: approx
   visualization:
-    max_scenarios: 4
+    max_scenarios: 0
     max_agents: 10
     selection_policy: largest_spread_sfde_min
   replay_export:
@@ -20,7 +20,7 @@ run:
   max_parallel_models: 1
 
 models:
-  - id: dag_latent_stageA_8k
+  - id: dag_latent_stageA_8k_dagcache_smoke
     backend: v2
     checkpoint: outputs/counter_bmt_v2_training_womd_full_dag_latent_bs32_8h/checkpoints/last.pkl
     enabled: true
@@ -32,24 +32,7 @@ models:
       sampling_method: topp
       topp: 0.95
       temperature: 1.0
-      dag_source_mode: dual
+      dag_source_mode: cache
       dag_cache_dir: outputs/dag_cache_v3_mo_100_dual/cache_merged
-      dag_cache_strict: false
-      dag_expected_schema: v3_maneuver_outcome
-
-  - id: dag_latent_stageBC_from_8k_cache100
-    backend: v2
-    checkpoint: outputs/dag_latent_stageBC_from_8k_cache100/checkpoints/last.pkl
-    enabled: true
-    runtime:
-      model_preset: midgpt_dag_latent
-      tokenizer_mode: adv_bmt_parity
-      skip_steps: 5
-      num_modes: 1
-      sampling_method: topp
-      topp: 0.95
-      temperature: 1.0
-      dag_source_mode: dual
-      dag_cache_dir: outputs/dag_cache_v3_mo_100_dual/cache_merged
-      dag_cache_strict: false
+      dag_cache_strict: true
       dag_expected_schema: v3_maneuver_outcome
