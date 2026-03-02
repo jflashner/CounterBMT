@@ -24,9 +24,17 @@ from counter_bmt_v2.trajectory_jax import (
     BidirectionalMotionTokenizer,
     NNXBidirectionalMotionTransformer,
     ParityTokenizerConfig,
+    midgpt_dag_latent_config,
 )
 
 from .types import ModelRunResult, ModelSpec, ScenarioSubsetEntry, model_spec_hashable_dict
+
+
+def _resolve_model_cfg_for_eval(preset_name: str):
+    name = str(preset_name)
+    if name == "midgpt_dag_latent":
+        return midgpt_dag_latent_config()
+    return _resolve_model_preset(name)  # type: ignore[arg-type]
 
 
 def _resolve_checkpoint_path(path: str) -> Path:
@@ -128,7 +136,7 @@ def run_v2_model(
     payload = _load_v2_checkpoint(ckpt_path)
     ckpt_train_cfg = payload.get("train_cfg", {}) if isinstance(payload.get("train_cfg"), dict) else {}
     preset_name = str(spec.runtime.model_preset or ckpt_train_cfg.get("model_preset", "paper_like_small"))
-    model_cfg = _resolve_model_preset(preset_name)  # keeps behavior aligned with training presets
+    model_cfg = _resolve_model_cfg_for_eval(preset_name)  # keeps behavior aligned with training presets
 
     model = NNXBidirectionalMotionTransformer(model_cfg, rngs=nnx.Rngs(run_seed))
     nnx.update(model, payload["model_state"])
@@ -175,19 +183,26 @@ def run_v2_model(
         metric_scope="core_realism",
         export_artifacts=True,
         artifact_output_subdir="step_eval",
-        artifact_max_scenarios_per_eval=1,
+        artifact_max_scenarios_per_eval=64,
         save_visualizations=False,
     )
 
     rng = np.random.default_rng(int(run_seed))
     per_scenario_metrics: List[Dict[str, Any]] = []
+    indexed_subset: List[tuple[int, ScenarioSubsetEntry, int]] = []
     for i, ss in enumerate(subset):
         idx = rel_to_idx.get(str(ss.relative_path))
         if idx is None:
             continue
-        sample = loader.load(int(idx))
+        indexed_subset.append((int(i), ss, int(idx)))
+
+    # Keep head2head eval memory-bounded; forward rollout can be heavy with relation features.
+    batch_size_eval = 2
+    for start in range(0, len(indexed_subset), batch_size_eval):
+        chunk = indexed_subset[start: start + batch_size_eval]
+        samples = [loader.load(int(idx)) for _, _, idx in chunk]
         prepared = _prepare_supervised_batch(
-            [sample],
+            samples,
             train_cfg=train_cfg,
             model_cfg=model_cfg,
             tokenizer=tokenizer,
@@ -200,18 +215,16 @@ def run_v2_model(
             tokenizer=tokenizer,
             skip_steps=int(skip_steps),
             eval_cfg=eval_cfg,
-            seed=int(run_seed + i),
+            seed=int(run_seed + start),
             output_dir=model_dir,
             global_step=1,
             max_visualizations=0,
-            max_artifacts=1,
+            max_artifacts=len(samples),
         )
-        if metrics_list:
-            rec = dict(metrics_list[0])
-        else:
-            rec = {}
-        rec["scenario_id"] = str(ss.scenario_id)
-        per_scenario_metrics.append(rec)
+        for j, (_orig_i, ss, _idx) in enumerate(chunk):
+            rec = dict(metrics_list[j]) if j < len(metrics_list) else {}
+            rec["scenario_id"] = str(ss.scenario_id)
+            per_scenario_metrics.append(rec)
 
     flat_dir = _flatten_step_eval_dir(model_dir)
     files = _artifact_files(flat_dir)

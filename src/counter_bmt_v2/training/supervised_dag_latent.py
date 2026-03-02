@@ -585,11 +585,23 @@ def _evaluate_dag(
     forward_viz_saved = 0
     forward_artifact_saved = 0
     forward_context_saved = 0
+    dropped_for_pmap = 0
     viz_remaining = max(0, int(train_cfg.forward_eval.viz_max_scenarios))
     artifact_remaining = max(0, int(train_cfg.forward_eval.artifact_max_scenarios_per_eval))
     context_remaining = max(viz_remaining, artifact_remaining)
     for idx_batch in val_batches:
-        samples = [loader.load(int(i)) for i in idx_batch]
+        idx_batch_arr = np.asarray(idx_batch, dtype=np.int32)
+        if train_cfg.distributed_backend == "pmap":
+            rem = int(idx_batch_arr.shape[0]) % int(num_devices)
+            if rem != 0:
+                keep = int(idx_batch_arr.shape[0]) - rem
+                if keep <= 0:
+                    dropped_for_pmap += int(idx_batch_arr.shape[0])
+                    continue
+                dropped_for_pmap += int(rem)
+                idx_batch_arr = idx_batch_arr[:keep]
+
+        samples = [loader.load(int(i)) for i in idx_batch_arr]
         prepared = _prepare_supervised_batch(
             samples,
             train_cfg=train_cfg,
@@ -628,7 +640,9 @@ def _evaluate_dag(
                 tokenizer=tokenizer,
                 skip_steps=int(train_cfg.skip_steps),
                 eval_cfg=train_cfg.forward_eval,
-                seed=int(train_cfg.seed + int(global_step or 0) + int(idx_batch[0] if len(idx_batch) > 0 else 0)),
+                seed=int(
+                    train_cfg.seed + int(global_step or 0) + int(idx_batch_arr[0] if len(idx_batch_arr) > 0 else 0)
+                ),
                 output_dir=output_dir,
                 global_step=global_step,
                 max_visualizations=viz_remaining,
@@ -665,6 +679,8 @@ def _evaluate_dag(
         out["forward_approx/visualizations_saved"] = float(forward_viz_saved)
         out["forward_approx/artifacts_saved"] = float(forward_artifact_saved)
         out["forward_approx/context_saved"] = float(forward_context_saved)
+    if dropped_for_pmap > 0:
+        out["eval/dropped_for_pmap"] = float(dropped_for_pmap)
     return out
 
 
