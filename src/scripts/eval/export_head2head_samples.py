@@ -223,6 +223,19 @@ def _select_regimes(
     return explore, exploit
 
 
+def _select_paired_regimes(
+    scored: Sequence[Mapping[str, Any]],
+    *,
+    top_k: int,
+    source: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    key = "explore_score" if str(source).strip().lower() != "exploit" else "exploit_score"
+    ordered = sorted(scored, key=lambda r: float(r.get(key, -1e9)), reverse=True)
+    picked = [dict(x) for x in ordered[: max(0, int(top_k))]]
+    # Same scenario IDs for both regimes; downstream export uses different mode lists.
+    return [dict(x) for x in picked], [dict(x) for x in picked]
+
+
 @dataclass
 class ExportRecord:
     regime: str
@@ -306,6 +319,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top-k-explore", type=int, default=3)
     p.add_argument("--top-k-exploit", type=int, default=3)
     p.add_argument("--allow-overlap", action="store_true", help="Allow same scenarios in explore and exploit sets.")
+    p.add_argument(
+        "--paired-scenes",
+        action="store_true",
+        help="Use identical scenario IDs for explore and exploit exports.",
+    )
+    p.add_argument(
+        "--paired-source",
+        type=str,
+        default="explore",
+        choices=("explore", "exploit"),
+        help="When --paired-scenes is set, select shared scenarios by this score.",
+    )
     p.add_argument("--explore-quality-penalty", type=float, default=0.3, help="Penalty coefficient on sfde_min in explore score.")
     p.add_argument("--modes-explore", type=str, default="0,1,2,3,4,5", help="Comma-separated mode indices to export for explore scenarios.")
     p.add_argument("--modes-exploit", type=str, default="0", help="Comma-separated mode indices to export for exploit scenarios.")
@@ -351,12 +376,23 @@ def main() -> int:
         raise ValueError(f"Artifact directory not found for model_id={model_id} under {artifacts_root}")
 
     scored = _build_scores(model_rows, explore_quality_penalty=float(args.explore_quality_penalty))
-    explore, exploit = _select_regimes(
-        scored,
-        top_k_explore=int(args.top_k_explore),
-        top_k_exploit=int(args.top_k_exploit),
-        allow_overlap=bool(args.allow_overlap),
-    )
+    if bool(args.paired_scenes):
+        if int(args.top_k_explore) != int(args.top_k_exploit):
+            raise ValueError(
+                "--paired-scenes requires --top-k-explore == --top-k-exploit so both regimes use the same set size."
+            )
+        explore, exploit = _select_paired_regimes(
+            scored,
+            top_k=int(args.top_k_explore),
+            source=str(args.paired_source),
+        )
+    else:
+        explore, exploit = _select_regimes(
+            scored,
+            top_k_explore=int(args.top_k_explore),
+            top_k_exploit=int(args.top_k_exploit),
+            allow_overlap=bool(args.allow_overlap),
+        )
 
     out_root = Path(str(args.output_dir).strip() or str(run_dir / "curated_samples"))
     out_root.mkdir(parents=True, exist_ok=True)
@@ -423,6 +459,8 @@ def main() -> int:
             "top_k_explore": int(args.top_k_explore),
             "top_k_exploit": int(args.top_k_exploit),
             "allow_overlap": bool(args.allow_overlap),
+            "paired_scenes": bool(args.paired_scenes),
+            "paired_source": str(args.paired_source),
             "explore_quality_penalty": float(args.explore_quality_penalty),
             "modes_explore": explore_modes,
             "modes_exploit": exploit_modes,
