@@ -402,6 +402,51 @@ PYTHONPATH=src .venv-v2/bin/python src/scripts/replay/export_forward_artifacts_b
   --max-scenarios 8
 ```
 
+### 6.3 Create GIFs for convenient visualization
+
+Command:
+- `python src/scripts/replay/make_scenario_gif.py`
+
+What it does:
+- creates GIFs either from existing frame folders or by rendering scenarios directly
+- useful for quick qualitative inspection without launching interactive replay
+
+Example A: make GIF from existing frame folder (fast)
+
+```bash
+PYTHONPATH=src .venv/bin/python src/scripts/replay/make_scenario_gif.py \
+  --frames-dir outputs/dag_cache_single_test_v2prompt_fix/examples/2ff20c0841a51211/frames_vlm \
+  --frames-glob "global_t*.png" \
+  --output-dir outputs/gif_exports \
+  --output-name 2ff20c0841a51211_global.gif \
+  --fps 3
+```
+
+Example B: render scenarios from ScenarioNet dataset and export GIFs
+
+```bash
+PYTHONPATH=src .venv-v2/bin/python src/scripts/replay/make_scenario_gif.py \
+  --data-dir data/scenarionet_waymo_training_500 \
+  --output-dir outputs/scenario_gifs \
+  --scenario-indexes 0,1,2 \
+  --num-frames 16 \
+  --fps 4 \
+  --continue-on-error
+```
+
+Example C: render by scenario ID directly
+
+```bash
+PYTHONPATH=src .venv-v2/bin/python src/scripts/replay/make_scenario_gif.py \
+  --data-dir data/scenarionet_waymo_training_500 \
+  --output-dir outputs/scenario_gifs_by_id \
+  --scenario-id 10af3d70d93ef629 \
+  --num-frames 12 \
+  --fps 4
+```
+
+Multiple IDs are supported via `--scenario-ids a,b,c` or `--scenario-ids-file`.
+
 ## 7) Legacy Adv-BMT Evaluation (Paper Protocol)
 
 Command:
