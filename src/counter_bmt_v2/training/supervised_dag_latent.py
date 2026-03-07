@@ -74,6 +74,17 @@ DAGSourceModeType = Literal["dual", "cache", "scene_derived"]
 StageType = Literal["A", "B", "C", "A_B_C"]
 
 
+_DAG_INPUT_KEYS: Tuple[str, ...] = (
+    "dag_node_feat",
+    "dag_node_mask",
+    "dag_edge_src",
+    "dag_edge_dst",
+    "dag_edge_feat",
+    "dag_edge_mask",
+    "dag_global_feat",
+)
+
+
 @dataclass
 class DAGLatentTrainConfig(SupervisedTrainConfig):
     # Optional override path to reuse a compatible prescan cache file from
@@ -449,6 +460,120 @@ def _build_grad_scale_tree(
     return jax.tree_util.tree_unflatten(treedef, scales)
 
 
+def _has_dag_inputs(model_inputs: Dict[str, jnp.ndarray]) -> bool:
+    return all(k in model_inputs for k in _DAG_INPUT_KEYS)
+
+
+def _dag_present_rate(model_inputs: Dict[str, jnp.ndarray]) -> float:
+    node_mask = model_inputs.get("dag_node_mask")
+    if node_mask is None:
+        return 0.0
+    arr = np.asarray(jax.device_get(node_mask), dtype=bool)
+    if arr.ndim == 0:
+        return 0.0
+    if arr.ndim == 1:
+        return float(np.mean(arr.astype(np.float32)))
+    return float(np.mean(np.any(arr, axis=1).astype(np.float32)))
+
+
+def _clone_with_null_dag_inputs(model_inputs: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+    out = dict(model_inputs)
+    for key in _DAG_INPUT_KEYS:
+        if key not in out:
+            continue
+        val = out[key]
+        if key in {"dag_node_mask", "dag_edge_mask"}:
+            out[key] = jnp.zeros_like(val, dtype=bool)
+        else:
+            out[key] = jnp.zeros_like(val)
+    return out
+
+
+def _clone_with_shuffled_dag_inputs(
+    model_inputs: Dict[str, jnp.ndarray],
+) -> Tuple[Dict[str, jnp.ndarray], bool]:
+    out = dict(model_inputs)
+    node_mask = out.get("dag_node_mask")
+    if node_mask is None:
+        return out, False
+    bsz = int(np.asarray(jax.device_get(node_mask)).shape[0])
+    if bsz < 2:
+        return out, False
+    perm = jnp.asarray(np.roll(np.arange(bsz, dtype=np.int32), -1))
+    for key in _DAG_INPUT_KEYS:
+        if key in out:
+            out[key] = jnp.take(out[key], perm, axis=0)
+    return out, True
+
+
+def _eval_metrics_for_inputs(
+    *,
+    model: NNXBidirectionalMotionTransformer,
+    model_inputs: Dict[str, jnp.ndarray],
+    targets: jnp.ndarray,
+    target_mask: jnp.ndarray,
+    reverse_indicator: jnp.ndarray,
+    default_token_id: int,
+    distributed_backend: str,
+    num_devices: int,
+) -> Dict[str, float]:
+    if distributed_backend == "pmap":
+        metrics = _eval_step_pmap(
+            model,
+            _shard_tree_for_pmap(model_inputs, num_devices=num_devices),
+            _shard_tree_for_pmap(targets, num_devices=num_devices),
+            _shard_tree_for_pmap(target_mask, num_devices=num_devices),
+            _shard_tree_for_pmap(reverse_indicator, num_devices=num_devices),
+            default_token_id,
+        )
+    else:
+        metrics = _eval_step(
+            model,
+            model_inputs,
+            targets,
+            target_mask,
+            reverse_indicator,
+            default_token_id,
+        )
+    return _as_float_metrics(metrics)
+
+
+def _compute_dag_alignment_metrics(
+    *,
+    with_dag: Dict[str, float],
+    without_dag: Dict[str, float],
+    shuffled_dag: Dict[str, float],
+    dag_present_rate: float,
+    shuffle_available: bool,
+) -> Dict[str, float]:
+    loss_with = float(with_dag.get("total_loss", 0.0))
+    loss_without = float(without_dag.get("total_loss", 0.0))
+    loss_shuffled = float(shuffled_dag.get("total_loss", loss_with))
+    acc_with = float(with_dag.get("accuracy", 0.0))
+    acc_without = float(without_dag.get("accuracy", 0.0))
+    acc_shuffled = float(shuffled_dag.get("accuracy", acc_with))
+
+    denom_no = max(1e-6, abs(loss_without))
+    denom_shuf = max(1e-6, abs(loss_shuffled))
+
+    return {
+        "dag_alignment/present_rate": float(dag_present_rate),
+        "dag_alignment/shuffle_available": float(1.0 if shuffle_available else 0.0),
+        "dag_alignment/loss_with_dag": loss_with,
+        "dag_alignment/loss_without_dag": loss_without,
+        "dag_alignment/loss_gain_vs_without_dag": float(loss_without - loss_with),
+        "dag_alignment/loss_gain_ratio_vs_without_dag": float((loss_without - loss_with) / denom_no),
+        "dag_alignment/loss_with_shuffled_dag": loss_shuffled,
+        "dag_alignment/loss_gain_vs_shuffled_dag": float(loss_shuffled - loss_with),
+        "dag_alignment/loss_gain_ratio_vs_shuffled_dag": float((loss_shuffled - loss_with) / denom_shuf),
+        "dag_alignment/accuracy_with_dag": acc_with,
+        "dag_alignment/accuracy_without_dag": acc_without,
+        "dag_alignment/accuracy_gain_vs_without_dag": float(acc_with - acc_without),
+        "dag_alignment/accuracy_with_shuffled_dag": acc_shuffled,
+        "dag_alignment/accuracy_gain_vs_shuffled_dag": float(acc_with - acc_shuffled),
+    }
+
+
 @nnx.jit
 def _train_step_scaled(
     model: NNXBidirectionalMotionTransformer,
@@ -577,6 +702,11 @@ def _evaluate_dag(
 ) -> Dict[str, float]:
     if len(val_indices) == 0:
         return {}
+    prev_eval_dag_dropout = None
+    if getattr(model.cfg, "dag_conditioning", None) is not None:
+        prev_eval_dag_dropout = float(model.cfg.dag_conditioning.dag_dropout_prob)
+        # Eval should measure the actual latent effect, not a dropout-corrupted one.
+        model.cfg.dag_conditioning.dag_dropout_prob = 0.0
     val_batches = [val_indices[i : i + int(train_cfg.batch_size)] for i in range(0, len(val_indices), int(train_cfg.batch_size))]
     if int(train_cfg.eval_batches) > 0:
         val_batches = val_batches[: int(train_cfg.eval_batches)]
@@ -589,99 +719,130 @@ def _evaluate_dag(
     viz_remaining = max(0, int(train_cfg.forward_eval.viz_max_scenarios))
     artifact_remaining = max(0, int(train_cfg.forward_eval.artifact_max_scenarios_per_eval))
     context_remaining = max(viz_remaining, artifact_remaining)
-    for idx_batch in val_batches:
-        idx_batch_arr = np.asarray(idx_batch, dtype=np.int32)
-        if train_cfg.distributed_backend == "pmap":
-            rem = int(idx_batch_arr.shape[0]) % int(num_devices)
-            if rem != 0:
-                keep = int(idx_batch_arr.shape[0]) - rem
-                if keep <= 0:
-                    dropped_for_pmap += int(idx_batch_arr.shape[0])
-                    continue
-                dropped_for_pmap += int(rem)
-                idx_batch_arr = idx_batch_arr[:keep]
+    try:
+        for idx_batch in val_batches:
+            idx_batch_arr = np.asarray(idx_batch, dtype=np.int32)
+            if train_cfg.distributed_backend == "pmap":
+                rem = int(idx_batch_arr.shape[0]) % int(num_devices)
+                if rem != 0:
+                    keep = int(idx_batch_arr.shape[0]) - rem
+                    if keep <= 0:
+                        dropped_for_pmap += int(idx_batch_arr.shape[0])
+                        continue
+                    dropped_for_pmap += int(rem)
+                    idx_batch_arr = idx_batch_arr[:keep]
 
-        samples = [loader.load(int(i)) for i in idx_batch_arr]
-        prepared = _prepare_supervised_batch(
-            samples,
-            train_cfg=train_cfg,
-            model_cfg=model_cfg,
-            tokenizer=tokenizer,
-            rng=rng,
-            is_training=False,
-        )
-        dag_stats = _attach_dag_inputs(prepared, resolver=resolver, model_cfg=model_cfg, train_cfg=train_cfg)
-        if train_cfg.distributed_backend == "pmap":
-            metrics = _eval_step_pmap(
-                model,
-                _shard_tree_for_pmap(prepared["model_inputs"], num_devices=num_devices),
-                _shard_tree_for_pmap(prepared["targets"], num_devices=num_devices),
-                _shard_tree_for_pmap(prepared["target_mask"], num_devices=num_devices),
-                _shard_tree_for_pmap(prepared["reverse_indicator"], num_devices=num_devices),
-                default_token_id,
-            )
-        else:
-            metrics = _eval_step(
-                model,
-                prepared["model_inputs"],
-                prepared["targets"],
-                prepared["target_mask"],
-                prepared["reverse_indicator"],
-                default_token_id,
-            )
-        mf = _as_float_metrics(metrics)
-        mf.update({k: float(v) for k, v in dag_stats.items()})
-        all_metrics.append(mf)
-
-        if bool(train_cfg.forward_eval.enabled):
-            batch_forward_metrics, batch_viz_saved, batch_artifact_saved = compute_forward_pass_metrics_for_batch(
-                model=model,
-                prepared_batch=prepared,
+            samples = [loader.load(int(i)) for i in idx_batch_arr]
+            prepared = _prepare_supervised_batch(
+                samples,
+                train_cfg=train_cfg,
+                model_cfg=model_cfg,
                 tokenizer=tokenizer,
-                skip_steps=int(train_cfg.skip_steps),
-                eval_cfg=train_cfg.forward_eval,
-                seed=int(
-                    train_cfg.seed + int(global_step or 0) + int(idx_batch_arr[0] if len(idx_batch_arr) > 0 else 0)
-                ),
-                output_dir=output_dir,
-                global_step=global_step,
-                max_visualizations=viz_remaining,
-                max_artifacts=artifact_remaining,
+                rng=rng,
+                is_training=False,
             )
-            forward_metrics_list.extend(batch_forward_metrics)
-            forward_viz_saved += int(batch_viz_saved)
-            forward_artifact_saved += int(batch_artifact_saved)
-            viz_remaining = max(0, viz_remaining - int(batch_viz_saved))
-            artifact_remaining = max(0, artifact_remaining - int(batch_artifact_saved))
+            dag_stats = _attach_dag_inputs(prepared, resolver=resolver, model_cfg=model_cfg, train_cfg=train_cfg)
+            mf = _eval_metrics_for_inputs(
+                model=model,
+                model_inputs=prepared["model_inputs"],
+                targets=prepared["targets"],
+                target_mask=prepared["target_mask"],
+                reverse_indicator=prepared["reverse_indicator"],
+                default_token_id=default_token_id,
+                distributed_backend=str(train_cfg.distributed_backend),
+                num_devices=int(num_devices),
+            )
 
-            # Export scenario snapshots + resolved DAGs aligned with rollout exports.
-            context_budget = max(int(batch_viz_saved), int(batch_artifact_saved))
-            if context_budget > 0 and context_remaining > 0:
-                saved_now = _export_eval_dag_context(
+            if bool(model_cfg.dag_conditioning.enabled) and _has_dag_inputs(prepared["model_inputs"]):
+                null_inputs = _clone_with_null_dag_inputs(prepared["model_inputs"])
+                without_dag = _eval_metrics_for_inputs(
+                    model=model,
+                    model_inputs=null_inputs,
+                    targets=prepared["targets"],
+                    target_mask=prepared["target_mask"],
+                    reverse_indicator=prepared["reverse_indicator"],
+                    default_token_id=default_token_id,
+                    distributed_backend=str(train_cfg.distributed_backend),
+                    num_devices=int(num_devices),
+                )
+                shuffled_inputs, shuffle_available = _clone_with_shuffled_dag_inputs(prepared["model_inputs"])
+                shuffled_metrics = mf
+                if shuffle_available:
+                    shuffled_metrics = _eval_metrics_for_inputs(
+                        model=model,
+                        model_inputs=shuffled_inputs,
+                        targets=prepared["targets"],
+                        target_mask=prepared["target_mask"],
+                        reverse_indicator=prepared["reverse_indicator"],
+                        default_token_id=default_token_id,
+                        distributed_backend=str(train_cfg.distributed_backend),
+                        num_devices=int(num_devices),
+                    )
+                mf.update(
+                    _compute_dag_alignment_metrics(
+                        with_dag=mf,
+                        without_dag=without_dag,
+                        shuffled_dag=shuffled_metrics,
+                        dag_present_rate=_dag_present_rate(prepared["model_inputs"]),
+                        shuffle_available=shuffle_available,
+                    )
+                )
+
+            mf.update({k: float(v) for k, v in dag_stats.items()})
+            all_metrics.append(mf)
+
+            if bool(train_cfg.forward_eval.enabled):
+                batch_forward_metrics, batch_viz_saved, batch_artifact_saved = compute_forward_pass_metrics_for_batch(
+                    model=model,
+                    prepared_batch=prepared,
+                    tokenizer=tokenizer,
+                    skip_steps=int(train_cfg.skip_steps),
+                    eval_cfg=train_cfg.forward_eval,
+                    seed=int(
+                        train_cfg.seed + int(global_step or 0) + int(idx_batch_arr[0] if len(idx_batch_arr) > 0 else 0)
+                    ),
                     output_dir=output_dir,
                     global_step=global_step,
-                    prepared=prepared,
-                    max_scenarios=min(context_remaining, context_budget),
-                    max_agents=max(1, int(train_cfg.forward_eval.viz_max_agents)),
+                    max_visualizations=viz_remaining,
+                    max_artifacts=artifact_remaining,
                 )
-                forward_context_saved += int(saved_now)
-                context_remaining = max(0, context_remaining - int(saved_now))
+                forward_metrics_list.extend(batch_forward_metrics)
+                forward_viz_saved += int(batch_viz_saved)
+                forward_artifact_saved += int(batch_artifact_saved)
+                viz_remaining = max(0, viz_remaining - int(batch_viz_saved))
+                artifact_remaining = max(0, artifact_remaining - int(batch_artifact_saved))
 
-    out: Dict[str, float] = {}
-    if all_metrics:
-        keys = list(all_metrics[0].keys())
-        for k in keys:
-            out[k] = float(np.mean([m[k] for m in all_metrics]))
-    if forward_metrics_list:
-        forward_avg = nanmean_metrics(forward_metrics_list)
-        out.update({f"forward_approx/{k}": float(v) for k, v in forward_avg.items()})
-        out["forward_approx/scenario_count"] = float(len(forward_metrics_list))
-        out["forward_approx/visualizations_saved"] = float(forward_viz_saved)
-        out["forward_approx/artifacts_saved"] = float(forward_artifact_saved)
-        out["forward_approx/context_saved"] = float(forward_context_saved)
-    if dropped_for_pmap > 0:
-        out["eval/dropped_for_pmap"] = float(dropped_for_pmap)
-    return out
+                # Export scenario snapshots + resolved DAGs aligned with rollout exports.
+                context_budget = max(int(batch_viz_saved), int(batch_artifact_saved))
+                if context_budget > 0 and context_remaining > 0:
+                    saved_now = _export_eval_dag_context(
+                        output_dir=output_dir,
+                        global_step=global_step,
+                        prepared=prepared,
+                        max_scenarios=min(context_remaining, context_budget),
+                        max_agents=max(1, int(train_cfg.forward_eval.viz_max_agents)),
+                    )
+                    forward_context_saved += int(saved_now)
+                    context_remaining = max(0, context_remaining - int(saved_now))
+
+        out: Dict[str, float] = {}
+        if all_metrics:
+            keys = list(all_metrics[0].keys())
+            for k in keys:
+                out[k] = float(np.mean([m[k] for m in all_metrics]))
+        if forward_metrics_list:
+            forward_avg = nanmean_metrics(forward_metrics_list)
+            out.update({f"forward_approx/{k}": float(v) for k, v in forward_avg.items()})
+            out["forward_approx/scenario_count"] = float(len(forward_metrics_list))
+            out["forward_approx/visualizations_saved"] = float(forward_viz_saved)
+            out["forward_approx/artifacts_saved"] = float(forward_artifact_saved)
+            out["forward_approx/context_saved"] = float(forward_context_saved)
+        if dropped_for_pmap > 0:
+            out["eval/dropped_for_pmap"] = float(dropped_for_pmap)
+        return out
+    finally:
+        if prev_eval_dag_dropout is not None:
+            model.cfg.dag_conditioning.dag_dropout_prob = float(prev_eval_dag_dropout)
 
 
 def train_supervised_dag_latent(train_cfg: DAGLatentTrainConfig) -> Dict[str, Any]:

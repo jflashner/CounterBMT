@@ -38,7 +38,7 @@ Key options:
   - `--sample-interval-training`, `--sample-interval-test`
 - model/runtime:
   - `--model-preset {paper_like_small,paper_like_full,midgpt_parity}`
-  - `--runtime-preset {none,adv_bmt_runtime_parity}`
+  - `--runtime-preset {none,adv_bmt_runtime_parity,legacy_midgpt_recipe}`
   - `--tokenizer-mode {paper_simple,adv_bmt_parity}`
 - optimization:
   - `--batch-size`, `--max-steps`, `--lr`, `--warmup-steps`
@@ -84,6 +84,41 @@ PYTHONPATH=src .venv-v2/bin/python -m counter_bmt_v2.cli.train_nnx_bmt \
   --batch-size 8 \
   --num-train-scenarios 486992 \
   --max-steps 300000 \
+  --eval-every 2000 \
+  --eval-batches 20 \
+  --checkpoint-every 2000 \
+  --log-every 50 \
+  --forward-eval-modes 6 \
+  --forward-eval-sampling topp \
+  --forward-eval-topp 0.95 \
+  --no-forward-export-artifacts
+```
+
+### Example: closest legacy MidGPT recipe on 4 GPUs
+
+Notes:
+- `legacy_midgpt_recipe` locks the missing legacy recipe knobs that matter most:
+  - `midgpt_parity`
+  - `adv_bmt_parity`
+  - `legacy_cosine_zero`
+  - `epochs=30`
+  - `mode=forward`
+  - `reverse_prob=0.0`
+- Legacy Lightning DDP used `batch_size: 10` per process. v2 `pmap` uses a global batch size, so the closest 4-GPU match is `--batch-size 40`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+PYTHONPATH=src .venv-v2/bin/python -m counter_bmt_v2.cli.train_nnx_bmt \
+  --train-data-dir data/_scenarionet_waymo_training_full_v12 \
+  --val-data-dir data/scenarionet_waymo_training_500 \
+  --output-dir outputs/counter_bmt_v2_training_midgpt_legacy_recipe \
+  --runtime-preset legacy_midgpt_recipe \
+  --distributed-backend pmap \
+  --precision bf16-mixed \
+  --batch-size 40 \
+  --num-train-scenarios 486992 \
+  --num-val-scenarios 500 \
   --eval-every 2000 \
   --eval-batches 20 \
   --checkpoint-every 2000 \

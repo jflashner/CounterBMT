@@ -32,6 +32,9 @@ class RuntimeTrainPreset:
     grad_clip_norm: float
     skip_steps: int
     lr_schedule_mode: str
+    num_epochs: int = 3
+    mode: str = "mixed"
+    reverse_probability: float = 0.5
 
 
 def runtime_preset_none() -> RuntimeTrainPreset:
@@ -45,11 +48,19 @@ def runtime_preset_none() -> RuntimeTrainPreset:
         grad_clip_norm=1.0,
         skip_steps=5,
         lr_schedule_mode="v2_cosine_minlr",
+        num_epochs=3,
+        mode="mixed",
+        reverse_probability=0.5,
     )
 
 
 def adv_bmt_runtime_parity_preset() -> RuntimeTrainPreset:
-    """Runtime preset aligned to supervised Adv-BMT parity defaults."""
+    """Runtime preset aligned to supervised Adv-BMT parity defaults.
+
+    This preserves the historical v2 behavior of the preset. Use
+    `legacy_midgpt_recipe` when you want the closest match to the released
+    `cfgs/0202_midgpt.yaml` training recipe, including forward-only training.
+    """
     return RuntimeTrainPreset(
         model_preset="midgpt_parity",
         tokenizer_mode="adv_bmt_parity",
@@ -59,12 +70,41 @@ def adv_bmt_runtime_parity_preset() -> RuntimeTrainPreset:
         grad_clip_norm=1.0,
         skip_steps=5,
         lr_schedule_mode="legacy_cosine_zero",
+        num_epochs=3,
+        mode="mixed",
+        reverse_probability=0.5,
+    )
+
+
+def legacy_midgpt_recipe_preset() -> RuntimeTrainPreset:
+    """Closest v2 runtime match to legacy `cfgs/0202_midgpt.yaml`.
+
+    Important note:
+    - Legacy Lightning DDP treats `batch_size` as a per-process batch size.
+    - v2 `pmap` treats `batch_size` as a global batch size.
+    - This preset intentionally does not set `batch_size`; choose it explicitly
+      for the device count you are using.
+    """
+    return RuntimeTrainPreset(
+        model_preset="midgpt_parity",
+        tokenizer_mode="adv_bmt_parity",
+        learning_rate=3e-4,
+        warmup_steps=2000,
+        weight_decay=0.0,
+        grad_clip_norm=1.0,
+        skip_steps=5,
+        lr_schedule_mode="legacy_cosine_zero",
+        num_epochs=30,
+        mode="forward",
+        reverse_probability=0.0,
     )
 
 
 def get_runtime_preset(name: str) -> Dict[str, object]:
     if name == "adv_bmt_runtime_parity":
         return asdict(adv_bmt_runtime_parity_preset())
+    if name == "legacy_midgpt_recipe":
+        return asdict(legacy_midgpt_recipe_preset())
     return asdict(runtime_preset_none())
 
 

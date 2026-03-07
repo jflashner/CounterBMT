@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         "--runtime-preset",
         type=str,
         default="none",
-        choices=["none", "adv_bmt_runtime_parity"],
+        choices=["none", "adv_bmt_runtime_parity", "legacy_midgpt_recipe"],
         help="training/runtime defaults; explicit CLI flags override these values",
     )
 
@@ -293,6 +293,9 @@ def _resolve_runtime_defaults(args: argparse.Namespace, provided_flags: Set[str]
         "grad_clip_norm": 1.0,
         "skip_steps": 5,
         "lr_schedule_mode": "v2_cosine_minlr",
+        "num_epochs": 3,
+        "mode": "mixed",
+        "reverse_probability": 0.5,
     }
     runtime_defaults = get_runtime_preset(str(args.runtime_preset))
     resolved: Dict[str, object] = dict(base_defaults)
@@ -307,6 +310,9 @@ def _resolve_runtime_defaults(args: argparse.Namespace, provided_flags: Set[str]
         "--grad-clip": ("grad_clip_norm", args.grad_clip),
         "--skip-steps": ("skip_steps", args.skip_steps),
         "--lr-schedule-mode": ("lr_schedule_mode", args.lr_schedule_mode),
+        "--epochs": ("num_epochs", args.epochs),
+        "--mode": ("mode", args.mode),
+        "--reverse-prob": ("reverse_probability", args.reverse_prob),
     }
     for flag, (key, value) in explicit_map.items():
         if flag in provided_flags and value is not None:
@@ -344,7 +350,7 @@ def main() -> int:
         output_dir=args.output_dir,
         model_preset=str(resolved_runtime["model_preset"]),
         seed=args.seed,
-        num_epochs=args.epochs,
+        num_epochs=int(resolved_runtime["num_epochs"]),
         batch_size=args.batch_size,
         max_steps=(None if args.max_steps <= 0 else args.max_steps),
         learning_rate=float(resolved_runtime["learning_rate"]),
@@ -355,8 +361,8 @@ def main() -> int:
         lr_schedule_mode=str(resolved_runtime["lr_schedule_mode"]),
         distributed_backend=str(args.distributed_backend),
         precision=str(args.precision),
-        mode=args.mode,
-        reverse_probability=args.reverse_prob,
+        mode=str(resolved_runtime["mode"]),
+        reverse_probability=float(resolved_runtime["reverse_probability"]),
         skip_steps=int(resolved_runtime["skip_steps"]),
         tokenizer_mode=str(resolved_runtime["tokenizer_mode"]),
         train_fraction=args.train_fraction,

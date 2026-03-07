@@ -43,7 +43,12 @@ def main() -> int:
     parser.add_argument("--model-preset", type=str, default="midgpt_parity")
     parser.add_argument("--tokenizer-mode", type=str, default="adv_bmt_parity")
     parser.add_argument("--precision", type=str, default="fp32", choices=["fp32", "bf16-mixed"])
-    parser.add_argument("--runtime-preset", type=str, default="adv_bmt_runtime_parity", choices=["none", "adv_bmt_runtime_parity"])
+    parser.add_argument(
+        "--runtime-preset",
+        type=str,
+        default="adv_bmt_runtime_parity",
+        choices=["none", "adv_bmt_runtime_parity", "legacy_midgpt_recipe"],
+    )
     parser.add_argument("--num-train-scenarios", type=int, default=-1)
     parser.add_argument("--json-out", type=str, default="")
     args = parser.parse_args()

@@ -16,7 +16,7 @@ Target references:
 
 ## P0. Tokenizer + Bidirectional Supervision Parity
 
-Status: [x] Implemented (validation in progress)
+Status: [x] Implemented (legacy exact-match spot check passed)
 
 Dependency note:
 - P0 parity path in `counter_bmt_v2` does **not** import TensorFlow/Waymo stacks at runtime.
@@ -33,9 +33,9 @@ Acceptance tests:
 - [x] Smoke: `PYTHONPATH=src .venv/bin/python src/scripts/parity/compare_tokenization.py --data-dir data/scenarionet_waymo_training_500 --mode forward --n 2 --batch-size 1 --skip-steps 5` runs with no invalid token IDs.
 - [x] Smoke: `PYTHONPATH=src .venv/bin/python src/scripts/parity/compare_tokenization.py --data-dir data/scenarionet_waymo_training_500 --mode backward --n 2 --batch-size 1 --skip-steps 5` runs with no invalid token IDs.
 - [x] Smoke: `PYTHONPATH=src .venv/bin/python -m counter_bmt_v2.cli.train_nnx_bmt ... --tokenizer-mode adv_bmt_parity --max-steps 1` completes training/eval and writes checkpoints.
-- [ ] Legacy parity gate: `--legacy-check` forward token ID exact-match >= 99.9%.
-- [ ] Legacy parity gate: `--legacy-check` backward token ID exact-match >= 99.5% and valid-mask exact-match >= 99.9%.
-- [ ] For a fixed seed and fixed scenario subset, target sequence lengths and counts of special tokens match legacy exactly.
+- [x] Legacy parity gate: `--legacy-check` forward token ID exact-match >= 99.9% (validated locally on `n=20`, `batch_size=4`, exact 1.0 match).
+- [x] Legacy parity gate: `--legacy-check` backward token ID exact-match >= 99.5% and valid-mask exact-match >= 99.9% (validated locally on `n=20`, `batch_size=4`, exact 1.0 match).
+- [x] For a fixed seed and fixed scenario subset, target sequence lengths and counts of special tokens match legacy exactly (implied by exact prev-token match on the same `n=20` spot check).
 
 ## P1. Scene Encoder + Relation Graph Parity
 
