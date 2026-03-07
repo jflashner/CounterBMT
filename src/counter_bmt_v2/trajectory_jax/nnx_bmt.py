@@ -941,6 +941,14 @@ if HAS_NNX:
                 return h, meta
 
             p_drop = float(np.clip(self.cfg.dag_conditioning.dag_dropout_prob, 0.0, 1.0))
+            if p_drop >= 1.0:
+                # Stage-A pretraining uses full DAG dropout and should reduce to the
+                # exact no-DAG baseline. Returning early here avoids a constant
+                # residual from linear-layer biases when z_dag is zeroed.
+                zeros = jnp.zeros((bsz,), dtype=jnp.float32)
+                meta["dag_latent_norm"] = zeros
+                meta["dag_gate_mean"] = zeros
+                return h, meta
             if p_drop > 0.0:
                 keep = 1.0 - p_drop
                 # Stochastic without explicit rng threading: deterministic-ish hash by batch index.

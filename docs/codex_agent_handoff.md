@@ -390,7 +390,8 @@ Entry point:
 
 Stages:
 - Stage A:
-  - decoder pretraining with null latent / full DAG dropout
+  - decoder pretraining with full DAG dropout
+  - current implementation guarantee: when `dag_dropout_prob=1.0`, DAG conditioning is bypassed exactly, so Stage A reduces to the no-DAG baseline rather than learning a constant latent residual
 - Stage B:
   - fit DAG encoder and conditioning adapters
   - usually freeze non-DAG parameters

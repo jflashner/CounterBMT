@@ -9,6 +9,7 @@ from counter_bmt_v2.training.supervised_dag_latent import (
     _clone_with_shuffled_dag_inputs,
     _compute_dag_alignment_metrics,
 )
+from counter_bmt_v2.trajectory_jax import NNXBMTConfig, NNXBidirectionalMotionTransformer
 from counter_bmt_v2.trajectory_jax.dag_gnn_nnx import HAS_NNX, NNXDAGEncoderConfig, NNXDAGGraphEncoder
 
 
@@ -96,6 +97,42 @@ class DAGLatentAlignmentTests(unittest.TestCase):
         self.assertEqual(tuple(z_dag.shape), (2, 32))
         self.assertTrue(np.isfinite(np.asarray(node_latent)).all())
         self.assertTrue(np.isfinite(np.asarray(z_dag)).all())
+
+    @unittest.skipUnless(HAS_NNX, "flax.nnx unavailable")
+    def test_full_dag_dropout_matches_no_conditioning_baseline(self) -> None:
+        import jax.numpy as jnp
+        from flax import nnx
+
+        cfg = NNXBMTConfig(d_model=16, n_layers=1, n_heads=4, ff_mult=2)
+        cfg.dag_encoder = NNXDAGEncoderConfig(
+            enabled=True,
+            d_node_in=24,
+            d_edge_in=8,
+            d_hidden=16,
+            n_layers=2,
+            max_nodes=4,
+            max_edges=3,
+        )
+        cfg.dag_conditioning.enabled = True
+        cfg.dag_conditioning.dag_dropout_prob = 1.0
+        model = NNXBidirectionalMotionTransformer(cfg, rngs=nnx.Rngs(0))
+
+        h = jnp.arange(2 * 3 * 1 * 16, dtype=jnp.float32).reshape(2, 3, 1, 16)
+        inputs = _sample_dag_inputs()
+        out, meta = model._apply_dag_conditioning(
+            h,
+            dag_node_feat=jnp.asarray(inputs["dag_node_feat"]),
+            dag_node_mask=jnp.asarray(inputs["dag_node_mask"]),
+            dag_edge_src=jnp.asarray(inputs["dag_edge_src"]),
+            dag_edge_dst=jnp.asarray(inputs["dag_edge_dst"]),
+            dag_edge_feat=jnp.asarray(inputs["dag_edge_feat"]),
+            dag_edge_mask=jnp.asarray(inputs["dag_edge_mask"]),
+            dag_global_feat=jnp.asarray(inputs["dag_global_feat"]),
+        )
+
+        self.assertTrue(np.allclose(np.asarray(out), np.asarray(h)))
+        self.assertTrue(np.allclose(np.asarray(meta["dag_latent_norm"]), 0.0))
+        self.assertTrue(np.allclose(np.asarray(meta["dag_gate_mean"]), 0.0))
 
 
 if __name__ == "__main__":
