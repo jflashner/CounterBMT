@@ -1517,7 +1517,7 @@ def _print_metrics(prefix: str, step: int, metrics: Dict[str, float], lr: float,
         f"lr={lr:.6f} "
         f"t={elapsed_s:.2f}s"
     )
-    print(msg)
+    print(msg, flush=True)
 
 
 def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
