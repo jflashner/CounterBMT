@@ -39,3 +39,24 @@ class DenseConditioningModel(ConditioningModel):
                 "value": intervention.value,
             },
         )
+
+
+@dataclass
+class DAGAssignmentConditioningModel(ConditioningModel):
+    signal_dim: int = 0
+
+    def build(self, intervention: Intervention, dag: BayesianDAG) -> ConditioningSignal:
+        vector = np.zeros((max(0, int(self.signal_dim)),), dtype=np.float32)
+        return ConditioningSignal(
+            vector=vector,
+            metadata={
+                "intervention": intervention.description,
+                "variable": intervention.variable,
+                "value": intervention.value,
+                "assignments": dict(intervention.assignments),
+                "assignment_order": list(intervention.assignment_order),
+                "source_dag_schema": str(intervention.source_dag_schema),
+                "is_counterfactual": bool(intervention.is_counterfactual),
+                "dag_scenario_id": str(dag.scenario_id),
+            },
+        )

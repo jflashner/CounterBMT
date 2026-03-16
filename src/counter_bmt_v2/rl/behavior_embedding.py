@@ -13,10 +13,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional, Tuple
 
 import numpy as np
+import jax
+import jax.numpy as jnp
 
 from counter_bmt_v2.config import BehaviorEmbeddingConfig
 from counter_bmt_v2.contracts import BayesianDAG, Intervention, TrajectoryRollout
 from counter_bmt_v2.rl.topology import TopologyEmbeddingRunner
+from counter_bmt_v2.training.dag_cache_schema import dag_to_cache_payload
+from counter_bmt_v2.training.dag_tensorize import tensorize_dag_batch
 
 
 def _sigmoid(x: float) -> float:
@@ -164,10 +168,43 @@ def _dag_graph_embedding(
 class BehaviorManifoldEncoder:
     cfg: BehaviorEmbeddingConfig
     topology_runner: Optional[TopologyEmbeddingRunner] = None
+    dag_encoder_model: Optional[Any] = None
+    dag_encoder_cfg: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if self.topology_runner is None:
             self.topology_runner = TopologyEmbeddingRunner(out_dim=max(8, self.cfg.dim // 2))
+
+    def _encode_with_trained_dag_encoder(
+        self,
+        dag: BayesianDAG,
+        *,
+        risk_vec: np.ndarray,
+        intervention: Intervention,
+    ) -> Optional[np.ndarray]:
+        if self.dag_encoder_model is None or self.dag_encoder_cfg is None:
+            return None
+        payload = dag_to_cache_payload(dag)
+        dag_t = tensorize_dag_batch(
+            [payload],
+            max_nodes=int(self.dag_encoder_cfg.max_nodes),
+            max_edges=int(self.dag_encoder_cfg.max_edges),
+            d_node_in=int(self.dag_encoder_cfg.d_node_in),
+            d_edge_in=int(self.dag_encoder_cfg.d_edge_in),
+        )
+        _, z_cat = self.dag_encoder_model(
+            dag_node_feat=jnp.asarray(dag_t["dag_node_feat"], dtype=jnp.float32),
+            dag_node_mask=jnp.asarray(dag_t["dag_node_mask"], dtype=bool),
+            dag_edge_src=jnp.asarray(dag_t["dag_edge_src"], dtype=jnp.int32),
+            dag_edge_dst=jnp.asarray(dag_t["dag_edge_dst"], dtype=jnp.int32),
+            dag_edge_feat=jnp.asarray(dag_t["dag_edge_feat"], dtype=jnp.float32),
+            dag_edge_mask=jnp.asarray(dag_t["dag_edge_mask"], dtype=bool),
+            dag_global_feat=jnp.asarray(dag_t["dag_global_feat"], dtype=jnp.float32),
+        )
+        pooled = np.asarray(jax.device_get(z_cat), dtype=np.float32).reshape(-1)
+        iv = _text_hash_feature(f"{intervention.variable}:{intervention.value}", n=8)
+        fused = np.concatenate([pooled, risk_vec.astype(np.float32), iv], axis=0)
+        return _stable_project(fused, out_dim=int(self.cfg.dim), seed=103)
 
     @property
     def mode(self) -> Literal["risk_vector", "dag_gnn", "topology_zpi", "hybrid"]:
@@ -194,14 +231,20 @@ class BehaviorManifoldEncoder:
             meta["backend"] = "risk_vector"
             return emb, risk, meta
 
-        dag_emb = _dag_graph_embedding(
+        dag_emb = self._encode_with_trained_dag_encoder(
             dag,
             risk_vec=risk_vec,
             intervention=intervention,
-            out_dim=int(self.cfg.dim),
         )
+        if dag_emb is None:
+            dag_emb = _dag_graph_embedding(
+                dag,
+                risk_vec=risk_vec,
+                intervention=intervention,
+                out_dim=int(self.cfg.dim),
+            )
         if mode == "dag_gnn":
-            meta["backend"] = "dag_gnn"
+            meta["backend"] = "dag_gnn_trained" if self.dag_encoder_model is not None else "dag_gnn"
             return dag_emb, risk, meta
 
         topo_emb, topo_meta = self.topology_runner.encode(

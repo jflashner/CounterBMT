@@ -105,6 +105,11 @@ class Intervention:
     timestamp_s: Optional[float] = None
     aggressiveness: str = "normal"
     description: str = ""
+    assignments: Dict[str, Any] = field(default_factory=dict)
+    assignment_order: List[str] = field(default_factory=list)
+    source_dag_schema: str = ""
+    is_counterfactual: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -148,6 +153,7 @@ class RLBatchDiagnostics:
     cluster_hist: Dict[str, int] = field(default_factory=dict)
     thermostat_eta: float = 0.0
     thermostat_alpha: float = 0.0
+    extra_metrics: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

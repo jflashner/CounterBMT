@@ -1414,6 +1414,29 @@ def _load_checkpoint(
     return int(payload["train_step"]), runtime_state, payload
 
 
+def _validate_resume_compatibility(
+    *,
+    train_cfg: SupervisedTrainConfig,
+    split_hashes: Dict[str, str],
+    resume_runtime_state: Dict[str, Any],
+    resume_payload: Dict[str, Any],
+) -> None:
+    ckpt_split_hashes = resume_runtime_state.get("split_hashes", {})
+    if ckpt_split_hashes and ckpt_split_hashes != split_hashes:
+        raise ValueError(
+            "Resume strict determinism failed: split hashes differ between checkpoint and current run "
+            f"({ckpt_split_hashes} vs {split_hashes})"
+        )
+
+    ckpt_train_cfg = resume_payload.get("train_cfg", {})
+    for k in ("model_preset", "tokenizer_mode", "skip_steps", "precision"):
+        if k in ckpt_train_cfg and ckpt_train_cfg[k] != getattr(train_cfg, k):
+            raise ValueError(
+                f"Resume strict determinism failed: train_cfg[{k}] mismatch "
+                f"({ckpt_train_cfg[k]} vs {getattr(train_cfg, k)})"
+            )
+
+
 def _evaluate(
     *,
     model: NNXBidirectionalMotionTransformer,
@@ -1713,19 +1736,12 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
             print(f"Resumed checkpoint: {ckpt_path} (step={start_step})")
 
             if bool(train_cfg.resume_strict_determinism):
-                ckpt_split_hashes = resume_runtime_state.get("split_hashes", {})
-                if ckpt_split_hashes and ckpt_split_hashes != split_hashes:
-                    raise ValueError(
-                        "Resume strict determinism failed: split hashes differ between checkpoint and current run "
-                        f"({ckpt_split_hashes} vs {split_hashes})"
-                    )
-                ckpt_train_cfg = resume_payload.get("train_cfg", {})
-                for k in ("model_preset", "tokenizer_mode", "skip_steps"):
-                    if k in ckpt_train_cfg and ckpt_train_cfg[k] != getattr(train_cfg, k):
-                        raise ValueError(
-                            f"Resume strict determinism failed: train_cfg[{k}] mismatch "
-                            f"({ckpt_train_cfg[k]} vs {getattr(train_cfg, k)})"
-                        )
+                _validate_resume_compatibility(
+                    train_cfg=train_cfg,
+                    split_hashes=split_hashes,
+                    resume_runtime_state=resume_runtime_state,
+                    resume_payload=resume_payload,
+                )
             else:
                 print(
                     "Warning: resume strict determinism disabled; allowing split/config mismatch for this resumed run."

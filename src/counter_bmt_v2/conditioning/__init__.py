@@ -1,3 +1,3 @@
-from .signal import ConditioningModel, DenseConditioningModel
+from .signal import ConditioningModel, DAGAssignmentConditioningModel, DenseConditioningModel
 
-__all__ = ["ConditioningModel", "DenseConditioningModel"]
+__all__ = ["ConditioningModel", "DenseConditioningModel", "DAGAssignmentConditioningModel"]

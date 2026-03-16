@@ -1,4 +1,4 @@
-"""Train/evaluate RL behavior-manifold loop (Topo-MCPO style scaffolding)."""
+"""Train/evaluate RL behavior-manifold loop (Topo-MCPO mainline)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import List, Sequence
 
 import numpy as np
 
+from counter_bmt_v2.causal import TopologicalDAGAssignmentSampler
 from counter_bmt_v2.config import PipelineConfig
 from counter_bmt_v2.contracts import ScenarioInput
 from counter_bmt_v2.data import ScenarioNetNNXLoader
@@ -20,6 +21,7 @@ from counter_bmt_v2.rl import (
     ConsensusScorer,
     EntropyThermostat,
     GRPOTrainer,
+    NNXPolicyBackend,
     TopologyEmbeddingRunner,
     VLMAlignmentVerifier,
     build_novelty_estimator,
@@ -28,6 +30,7 @@ from counter_bmt_v2.rl import (
     grpo_update,
     summarize_reward_breakdown,
 )
+from counter_bmt_v2.training.dag_sources import DAGSourceResolver
 
 
 def _build_demo_scene(scenario_id: str, seed: int) -> ScenarioInput:
@@ -131,6 +134,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vlm-alignment-num-frames", type=int, default=6)
     p.add_argument("--vlm-alignment-max-agents-render", type=int, default=48)
 
+    p.add_argument("--policy-backend", type=str, default="nnx_checkpoint", choices=["nnx_checkpoint", "scaffold"])
+    p.add_argument("--policy-checkpoint", type=str, default="")
+    p.add_argument("--policy-model-preset", type=str, default="")
+    p.add_argument("--policy-tokenizer-mode", type=str, default="adv_bmt_parity")
+    p.add_argument("--policy-skip-steps", type=int, default=5)
+    p.add_argument("--dag-source-mode", type=str, default="dual", choices=["dual", "cache", "scene_derived"])
+    p.add_argument("--dag-cache-dir", type=str, default="")
+    p.add_argument("--dag-cache-strict", action="store_true")
+    p.add_argument("--dag-expected-schema", type=str, default="any")
+    p.add_argument("--clip-eps", type=float, default=0.2)
+    p.add_argument("--kl-beta", type=float, default=0.02)
+    p.add_argument("--policy-lr", type=float, default=1e-5)
+    p.add_argument("--trainable-scope", type=str, default="decoder_dag", choices=["decoder_dag", "all"])
+    p.add_argument("--ppo-epochs", type=int, default=1)
+    p.add_argument("--candidate-multiplier", type=int, default=2)
+    p.add_argument("--feasible-max-speed-mps", type=float, default=40.0)
+    p.add_argument("--feasible-max-accel-delta", type=float, default=4.0)
+    p.add_argument("--feasible-max-yaw-delta", type=float, default=0.75)
+    p.add_argument("--enable-feasibility-mask", action="store_true")
+    p.add_argument("--no-enable-feasibility-mask", dest="enable_feasibility_mask", action="store_false")
+    p.set_defaults(enable_feasibility_mask=True)
+
     p.add_argument("--perception-backend", type=str, default="mock", choices=["mock", "gpt4o"])
     p.add_argument("--dag-backend", type=str, default="simple", choices=["simple", "promptbn"])
     p.add_argument("--llm-model", type=str, default="gpt-4o")
@@ -169,6 +194,27 @@ def main() -> int:
     cfg.rl.novelty.ema_decay = float(args.novelty_ema_decay)
     cfg.rl.consensus.clusterer = str(args.clusterer)
     cfg.rl.consensus.k_clusters = int(args.k_clusters)
+
+    cfg.rl.policy.backend = str(args.policy_backend)  # type: ignore[assignment]
+    cfg.rl.policy.checkpoint = str(args.policy_checkpoint)
+    cfg.rl.policy.model_preset = str(args.policy_model_preset)
+    cfg.rl.policy.tokenizer_mode = str(args.policy_tokenizer_mode)
+    cfg.rl.policy.skip_steps = int(args.policy_skip_steps)
+    cfg.rl.policy.dag_source_mode = str(args.dag_source_mode)  # type: ignore[assignment]
+    cfg.rl.policy.dag_cache_dir = str(args.dag_cache_dir)
+    cfg.rl.policy.dag_cache_strict = bool(args.dag_cache_strict)
+    cfg.rl.policy.dag_expected_schema = str(args.dag_expected_schema)
+    cfg.rl.policy.clip_eps = float(args.clip_eps)
+    cfg.rl.policy.kl_beta = float(args.kl_beta)
+    cfg.rl.policy.policy_lr = float(args.policy_lr)
+    cfg.rl.policy.trainable_scope = str(args.trainable_scope)  # type: ignore[assignment]
+    cfg.rl.policy.ppo_epochs = int(args.ppo_epochs)
+    cfg.rl.policy.candidate_multiplier = int(args.candidate_multiplier)
+    cfg.rl.policy.feasible_max_speed_mps = float(args.feasible_max_speed_mps)
+    cfg.rl.policy.feasible_max_accel_delta = float(args.feasible_max_accel_delta)
+    cfg.rl.policy.feasible_max_yaw_delta = float(args.feasible_max_yaw_delta)
+    cfg.rl.policy.enable_feasibility_mask = bool(args.enable_feasibility_mask)
+
     cfg.rl.vlm_alignment.enabled = bool(args.vlm_alignment_enabled)
     cfg.rl.vlm_alignment.source_mode = str(args.alignment_source_mode)  # type: ignore[assignment]
     cfg.rl.vlm_alignment.backend = str(args.vlm_alignment_backend)  # type: ignore[assignment]
@@ -195,16 +241,34 @@ def main() -> int:
         dag_retries=int(args.dag_retries),
     )
 
+    dag_resolver = DAGSourceResolver(
+        mode=str(cfg.rl.policy.dag_source_mode),
+        cache_dir=str(cfg.rl.policy.dag_cache_dir),
+        cache_strict=bool(cfg.rl.policy.dag_cache_strict),
+        expected_schema=str(cfg.rl.policy.dag_expected_schema),
+    )
+    policy_backend = None
+    if str(cfg.rl.policy.backend) == "nnx_checkpoint":
+        if not str(cfg.rl.policy.checkpoint).strip():
+            raise ValueError("--policy-checkpoint is required for --policy-backend nnx_checkpoint")
+        policy_backend = NNXPolicyBackend.from_checkpoint(cfg=cfg.rl.policy, seed=int(args.seed))
+        pipeline.sampler = TopologicalDAGAssignmentSampler()
+
     topology_runner = TopologyEmbeddingRunner(
         out_dim=max(8, int(cfg.rl.embedding.dim) // 2),
         cache_dir=str(args.topology_cache_dir),
         prefer_zigzag=bool(args.use_topology_branch),
     )
-    encoder = BehaviorManifoldEncoder(cfg=cfg.rl.embedding, topology_runner=topology_runner)
+    encoder = BehaviorManifoldEncoder(
+        cfg=cfg.rl.embedding,
+        topology_runner=topology_runner,
+        dag_encoder_model=(policy_backend.model.dag_encoder if policy_backend is not None and getattr(policy_backend.model, "dag_encoder", None) is not None else None),
+        dag_encoder_cfg=(policy_backend.model_cfg.dag_encoder if policy_backend is not None else None),
+    )
     novelty = build_novelty_estimator(cfg.rl.novelty, dim=int(cfg.rl.embedding.dim))
     consensus = ConsensusScorer(cfg=cfg.rl.consensus)
     thermostat = EntropyThermostat.from_config(cfg.rl.train)
-    trainer = GRPOTrainer()
+    trainer = GRPOTrainer(policy_backend=policy_backend)
     vlm_aligner = VLMAlignmentVerifier(cfg=cfg.rl.vlm_alignment, output_dir=out_dir)
 
     loader = None
@@ -212,6 +276,8 @@ def main() -> int:
     if args.data_dir:
         loader = ScenarioNetNNXLoader(args.data_dir)
         scene_indices = _resolve_scene_indices(loader, max_scenes=int(args.max_scenes), seed=int(args.seed))
+    elif policy_backend is not None:
+        raise ValueError("NNX policy backend requires --data-dir so scenes have NNX tensors")
 
     vlm_alignment_cfg = asdict(cfg.rl.vlm_alignment)
     if vlm_alignment_cfg.get("api_key"):
@@ -223,8 +289,11 @@ def main() -> int:
             "scene_source": "scenarionet" if loader is not None else "demo",
             "scene_pool_size": int(len(scene_indices)) if loader is not None else 0,
             "vlm_alignment": vlm_alignment_cfg,
+            "policy": asdict(cfg.rl.policy),
         },
     }
+    if run_config["resolved"]["policy"].get("checkpoint"):
+        run_config["resolved"]["policy"]["checkpoint"] = str(cfg.rl.policy.checkpoint)
     run_config_path.write_text(json.dumps(run_config, indent=2), encoding="utf-8")
 
     rng = np.random.default_rng(int(args.seed))
@@ -248,6 +317,8 @@ def main() -> int:
                 consensus_scorer=consensus,
                 thermostat=thermostat,
                 group_size=int(cfg.rl.train.group_size),
+                dag_resolver=dag_resolver if policy_backend is not None else None,
+                policy_backend=policy_backend,
                 vlm_aligner=vlm_aligner,
                 seed=int(args.seed) + step,
                 rare=rare,
@@ -268,6 +339,7 @@ def main() -> int:
                     "diagnostics/eta": float(batch.diagnostics.thermostat_eta),
                     "diagnostics/alpha": float(batch.diagnostics.thermostat_alpha),
                     "diagnostics/num_clusters": float(len(batch.diagnostics.cluster_hist)),
+                    **{k: float(v) for k, v in batch.diagnostics.extra_metrics.items()},
                     "alignment/vlm_mean": (
                         float(np.mean(batch.alignment_scores))
                         if batch.alignment_scores.size and float(batch.alignment_diagnostics.get("source_mode_vlm_replace", 0.0)) > 0.5
@@ -305,7 +377,8 @@ def main() -> int:
                 m = rec["metrics"]
                 print(
                     "step={step} reward={reward:.4f} env={env:.4f} novelty={nov:.4f} "
-                    "consensus={cons:.4f} entropy={h:.4f} eta={eta:.4f} alpha={alpha:.4f}".format(
+                    "consensus={cons:.4f} entropy={h:.4f} eta={eta:.4f} alpha={alpha:.4f} "
+                    "policy_loss={pl:.4f} kl={kl:.4f}".format(
                         step=step,
                         reward=float(m.get("reward/total_mean", 0.0)),
                         env=float(m.get("reward/total_env_mean", 0.0)),
@@ -314,6 +387,8 @@ def main() -> int:
                         h=float(m.get("diagnostics/entropy", 0.0)),
                         eta=float(m.get("diagnostics/eta", 0.0)),
                         alpha=float(m.get("diagnostics/alpha", 0.0)),
+                        pl=float(m.get("grpo/policy/loss", 0.0)),
+                        kl=float(m.get("grpo/policy/kl_ref", 0.0)),
                     )
                 )
 

@@ -1,0 +1,90 @@
+OpenAI API Cost for DAG Cache Generation
+
+Dataset Size
+------------
+- Full training dataset size: 486,995 scenarios
+
+Current DAG Pipeline Structure
+------------------------------
+For each scenario, the current DAG cache builder performs:
+
+1. One multimodal perception call
+
+2. One DAG construction call
+   - Purpose: convert extracted scene features into a structured DAG
+
+Successful-path API call count is:
+- 2 API calls per scenario
+- 973,990 successful-path calls for the full dataset
+
+Retries:
+- Retry budget in code: up to 4 attempts total
+- 10% extra calls for retries,
+  pilot testing, and prompt iteration
+- 10% overhead call count: about 1,071,389 total calls
+
+Model Pricing
+------------------
+OpenAI pricing:
+
+- GPT-5 mini input:  $0.25 per 1M input tokens
+- GPT-5 mini output: $2.00 per 1M output tokens
+
+Image Token Pricing
+-------------------
+- Low detail:
+  - 70 base tokens per image
+- High detail:
+  - 70 base tokens + 140 tokens per 512px tile
+
+For a square image near 1024x1024 in high detail:
+- 4 tiles
+- Total high-detail image cost = 70 + 4 * 140 = 630 input tokens per image
+
+Rendering and Request Assumptions
+-----------------------------------------------
+
+gpt-5-mini full run:
+- 6 frames per scenario
+- Low image detail
+- One perception call + one DAG construction call per scenario
+
+Budget
+------
+Per scenario:
+
+Perception call:
+- 1,000 input text tokens
+- 6 low-detail images * 70 tokens/image = 420 image tokens
+- Total perception input tokens = 1,420
+- Perception output tokens = 400
+
+DAG call:
+- DAG input text tokens = 2,000
+- DAG output tokens = 600
+
+Total per scenario:
+- Input tokens = 1,420 + 2,000 = 3,420
+- Output tokens = 400 + 600 = 1,000
+
+Per-Scenario Cost Calculation
+-----------------------------
+Input cost per scenario:
+- 3,420 / 1,000,000 * $0.25
+- = $0.000855
+
+Output cost per scenario:
+- 1,000 / 1,000,000 * $2.00
+- = $0.002000
+
+Total per scenario:
+- $0.002855
+
+Full-dataset direct API cost:
+- 486,995 * $0.002855
+- = $1,390.37
+
+Budget with Contingency
+------------------------
+~30% contingency:
+- $1,390.37 * 1.30 = $1,807.48

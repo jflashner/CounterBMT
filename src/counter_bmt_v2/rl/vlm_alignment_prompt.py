@@ -70,15 +70,15 @@ You are given top-down time-ordered images. For each timestep, one base scene fr
 and one trajectory-overlay frame may be provided.
 Frame count sent: {int(num_frames)}
 
-Intervention:
+Sampled DAG assignment:
 {intervention_text}
 
 Compact DAG:
 {dag_text}
 
 Task:
-Score how well the predicted trajectory follows the causal intent represented by the intervention + DAG.
-Focus on maneuver/decision consistency and whether the rollout violates implied risk/outcome constraints.
+Score how well the predicted trajectory follows the sampled DAG assignment and the DAG structure.
+Focus on ego maneuver consistency over time and whether the rollout violates implied outcome constraints.
 
 Output JSON only with schema:
 {{
@@ -128,4 +128,3 @@ def parse_alignment_response(text: str) -> Optional[ParsedVLMAlignment]:
         reason=str(data.get("reason", "")),
         raw=data,
     )
-

@@ -63,6 +63,25 @@ Optional text entries:
 When resuming in the same `--output-dir`, TensorBoard appends to the same
 `tensorboard/` directory. This preserves a single continuous scalar history.
 
+If you resumed into a different `--output-dir`, rebuild a merged TensorBoard run
+from the two `metrics.jsonl` files:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/scripts/training/merge_tensorboard_runs.py \
+  --run-dir outputs/first_run \
+  --run-dir outputs/resumed_run \
+  --output-dir outputs/merged_tensorboard_run \
+  --overwrite
+```
+
+The merge prefers later `--run-dir` entries when both runs contain the same
+`(phase, step)` pair, which is the right default for "original run + resumed
+run". Then launch TensorBoard on the merged output:
+
+```bash
+tensorboard --logdir outputs/merged_tensorboard_run/tensorboard --port 6006
+```
+
 ## Comparing Runs
 
 For run comparison, start TensorBoard on a parent directory:
@@ -72,4 +91,3 @@ tensorboard --logdir outputs --port 6006
 ```
 
 Then select different runs in TensorBoard’s UI.
-

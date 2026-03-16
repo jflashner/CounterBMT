@@ -206,6 +206,10 @@ Tokenizer parity note:
 - This reduces tokenizer risk for MidGPT-style supervised runs significantly.
 - Remaining parity risk is more about training-runtime semantics and full-run evaluation than missing tokenization mechanics.
 
+Resume determinism note:
+- Strict supervised resume now treats `precision` as part of checkpoint compatibility.
+- Resuming an `fp32` checkpoint as `bf16-mixed` is blocked in strict mode and should be treated as a new experiment branch rather than a continuation of the same run.
+
 ### DAG-latent supervised path
 
 1. Build DAG caches from ScenarioNet + VLM + PromptBN.
@@ -337,6 +341,7 @@ Main files:
 | `src/scripts/replay/export_forward_artifact_to_scenario.py` | Convert one forward artifact to replayable ScenarioNet data | Good for checkpoint inspection |
 | `src/scripts/replay/export_forward_artifacts_batch.py` | Batch replay export | Used by head-to-head |
 | `src/scripts/replay/make_scenario_gif.py` | Make GIFs from frames or direct ScenarioNet scene IDs | Current convenient qualitative tool |
+| `src/scripts/training/merge_tensorboard_runs.py` | Merge multiple `metrics.jsonl` histories into one TensorBoard run | Use for split/resumed runs |
 | `src/scripts/parity/parity_report.py` | P6 parity harness | Writes JSON + Markdown |
 | `src/scripts/parity/*` | P0-P5 parity checks | Tokenizer, relations, masks, forward metrics, resume, throughput |
 
@@ -571,6 +576,7 @@ Useful docs:
 - `docs/parity_p4.md`
 - `docs/parity_p5.md`
 - `docs/parity_p6.md`
+- `docs/openai_dag_cost_memo.txt`
 
 One-command runner:
 - `tools/run_parity_suite.sh`
@@ -677,6 +683,10 @@ If plain `tensorboard` fails, use the pinned `uvx` workflow documented in:
 - `docs/command_reference.md`
 - `docs/training_tensorboard.md`
 
+If a run was resumed into a different output directory, rebuild one continuous
+TensorBoard history from the source `metrics.jsonl` files with:
+- `src/scripts/training/merge_tensorboard_runs.py`
+
 ## 12. Datasets and Output Conventions
 
 ### Main datasets
@@ -750,13 +760,14 @@ If you are brand new to the repo, read in this order:
 
 1. `docs/codex_agent_handoff.md`
 2. `docs/command_reference.md`
-3. `src/counter_bmt_v2/ADV_BMT_PARITY_CHECKLIST.md`
-4. `docs/dag_latent_training.md`
-5. `docs/head2head_eval.md`
-6. `docs/dag_contract_maneuver_outcome_v1.md`
-7. `docs/training_tensorboard.md`
-8. `docs/rl_behavior_manifold_integration.md`
-9. `docs/rl_vlm_alignment.md`
+3. `docs/openai_dag_cost_memo.txt`
+4. `src/counter_bmt_v2/ADV_BMT_PARITY_CHECKLIST.md`
+5. `docs/dag_latent_training.md`
+6. `docs/head2head_eval.md`
+7. `docs/dag_contract_maneuver_outcome_v1.md`
+8. `docs/training_tensorboard.md`
+9. `docs/rl_behavior_manifold_integration.md`
+10. `docs/rl_vlm_alignment.md`
 
 Then open the specific codepath you plan to edit.
 

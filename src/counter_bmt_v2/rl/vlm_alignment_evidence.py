@@ -173,10 +173,19 @@ def render_rollout_overlay(
 def build_compact_dag_text(dag: BayesianDAG, intervention: Intervention) -> str:
     nodes = list(dag.nodes.values())
     edges = list(dag.edges)
+    if intervention.assignments:
+        intervention_lines = ["Sampled DAG assignment:"]
+        for node_id in intervention.assignment_order or sorted(intervention.assignments.keys()):
+            if node_id in intervention.assignments:
+                intervention_lines.append(f"- {node_id}={intervention.assignments[node_id]}")
+    else:
+        intervention_lines = [
+            f"Intervention variable: {intervention.variable}",
+            f"Intervention value: {intervention.value}",
+        ]
     lines = [
         f"Scenario: {dag.scenario_id}",
-        f"Intervention variable: {intervention.variable}",
-        f"Intervention value: {intervention.value}",
+        *intervention_lines,
         f"Nodes ({len(nodes)}):",
     ]
     for n in nodes[:20]:
@@ -226,6 +235,13 @@ def build_alignment_evidence_bundle(
         overlay_frames=list(overlay),
         frames_for_vlm=frames_for_vlm,
         dag_text=build_compact_dag_text(dag, intervention),
-        intervention_text=f"{intervention.variable}={intervention.value}",
+        intervention_text=(
+            ", ".join(
+                f"{k}={intervention.assignments[k]}"
+                for k in (intervention.assignment_order or sorted(intervention.assignments.keys()))
+                if k in intervention.assignments
+            )
+            if intervention.assignments
+            else f"{intervention.variable}={intervention.value}"
+        ),
     )
-

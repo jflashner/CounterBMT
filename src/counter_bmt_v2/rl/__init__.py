@@ -8,6 +8,7 @@ from .loop import (
     grpo_update,
     summarize_reward_breakdown,
 )
+from .nnx_policy import NNXPolicyBackend, PolicyCandidatePool, PolicyRolloutData
 from .novelty import EMAGaussianNovelty, KNNNovelty, build_novelty_estimator
 from .reward import compose_reward
 from .thermostat import EntropyThermostat
@@ -32,6 +33,9 @@ __all__ = [
     "PHPersistenceFallbackEncoder",
     "TopologyEmbeddingRunner",
     "AlignmentBatchResult",
+    "NNXPolicyBackend",
+    "PolicyCandidatePool",
+    "PolicyRolloutData",
     "VLMAlignmentVerifier",
     "ZigzagTopologyEncoder",
     "build_novelty_estimator",

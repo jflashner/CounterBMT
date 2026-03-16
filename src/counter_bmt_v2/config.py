@@ -40,6 +40,33 @@ class RLTrainConfig:
 
 
 @dataclass
+class RLPolicyConfig:
+    backend: Literal["nnx_checkpoint", "scaffold"] = "nnx_checkpoint"
+    checkpoint: str = ""
+    model_preset: str = ""
+    tokenizer_mode: str = "adv_bmt_parity"
+    skip_steps: int = 5
+    dag_source_mode: Literal["dual", "cache", "scene_derived"] = "dual"
+    dag_cache_dir: str = ""
+    dag_cache_strict: bool = False
+    dag_expected_schema: str = "any"
+    clip_eps: float = 0.2
+    kl_beta: float = 0.02
+    policy_lr: float = 1e-5
+    trainable_scope: Literal["decoder_dag", "all"] = "decoder_dag"
+    ppo_epochs: int = 1
+    candidate_multiplier: int = 2
+    feasible_max_speed_mps: float = 40.0
+    feasible_max_accel_delta: float = 4.0
+    feasible_max_yaw_delta: float = 0.75
+    enable_feasibility_mask: bool = True
+    sampling_method: Literal["topp", "topk", "softmax", "argmax"] = "topp"
+    sampling_temperature: float = 1.0
+    sampling_topp: float = 0.95
+    sampling_topk: int = 5
+
+
+@dataclass
 class BehaviorEmbeddingConfig:
     mode: Literal["risk_vector", "dag_gnn", "topology_zpi", "hybrid"] = "dag_gnn"
     dim: int = 64
@@ -85,6 +112,7 @@ class VLMAlignmentConfig:
 @dataclass
 class RLConfig:
     train: RLTrainConfig = field(default_factory=RLTrainConfig)
+    policy: RLPolicyConfig = field(default_factory=RLPolicyConfig)
     embedding: BehaviorEmbeddingConfig = field(default_factory=BehaviorEmbeddingConfig)
     novelty: NoveltyConfig = field(default_factory=NoveltyConfig)
     consensus: ConsensusConfig = field(default_factory=ConsensusConfig)
