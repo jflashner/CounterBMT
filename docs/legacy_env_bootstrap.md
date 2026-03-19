@@ -32,7 +32,13 @@ tools/bootstrap_legacy_adv_bmt.sh
 ```
 
 `PYTHON_BIN` is optional. If unset, the bootstrap auto-detects the first
-available interpreter from `python3.10`, `python3`, then `python`.
+available compatible interpreter from `python3.10`, `python3.11`, `python3`,
+then `python`.
+
+If the host only exposes newer interpreters such as Python `3.12`, the legacy
+bootstrap will, by default, fall back to `uv` and provision a managed Python
+`3.10` interpreter automatically. That avoids source builds for older pinned
+packages like `Pillow 9.2.0`, which are much more fragile on Python `3.12`.
 
 This will:
 
@@ -51,6 +57,12 @@ rerun with a clean env:
 
 ```bash
 RECREATE_VENV=1 tools/bootstrap_legacy_adv_bmt.sh
+```
+
+If you want to force a particular legacy Python target, set:
+
+```bash
+LEGACY_PYTHON_SPEC=3.11 tools/bootstrap_legacy_adv_bmt.sh
 ```
 
 ## Optional Full Legacy Evaluator

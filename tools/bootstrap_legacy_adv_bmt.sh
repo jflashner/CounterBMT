@@ -16,6 +16,10 @@ set -euo pipefail
 #   VENV_DIR=.venv-legacy-adv-bmt
 #   RECREATE_VENV=0|1
 #   LEGACY_PROFILE=auto|linux-cu121|linux-cpu|mac-cpu
+#   LEGACY_PYTHON_SPEC=3.10|3.11
+#   ALLOW_UNSUPPORTED_LEGACY_PYTHON=0|1
+#   AUTO_INSTALL_UV=0|1
+#   UV_BIN=/path/to/uv
 #   INSTALL_SIM_STACK=0|1
 #   INSTALL_WAYMO_EVAL=0|1
 #   EXTERNAL_DEPS_DIR=.external/legacy_deps
@@ -29,6 +33,10 @@ PYTHON_BIN="${PYTHON_BIN:-}"
 VENV_DIR="${VENV_DIR:-.venv-legacy-adv-bmt}"
 RECREATE_VENV="${RECREATE_VENV:-0}"
 LEGACY_PROFILE="${LEGACY_PROFILE:-auto}"
+LEGACY_PYTHON_SPEC="${LEGACY_PYTHON_SPEC:-3.10}"
+ALLOW_UNSUPPORTED_LEGACY_PYTHON="${ALLOW_UNSUPPORTED_LEGACY_PYTHON:-0}"
+AUTO_INSTALL_UV="${AUTO_INSTALL_UV:-1}"
+UV_BIN="${UV_BIN:-}"
 INSTALL_SIM_STACK="${INSTALL_SIM_STACK:-1}"
 INSTALL_WAYMO_EVAL="${INSTALL_WAYMO_EVAL:-0}"
 EXTERNAL_DEPS_DIR="${EXTERNAL_DEPS_DIR:-.external/legacy_deps}"
@@ -50,23 +58,101 @@ run_cmd() {
 
 resolve_python_bin() {
   if [[ -n "$PYTHON_BIN" ]]; then
-    if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-      echo "$PYTHON_BIN"
-      return
+    if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+      echo "Requested PYTHON_BIN not found on PATH: $PYTHON_BIN" >&2
+      exit 1
     fi
-    echo "Requested PYTHON_BIN not found on PATH: $PYTHON_BIN" >&2
-    exit 1
+    local requested_version
+    requested_version="$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    if [[ "$ALLOW_UNSUPPORTED_LEGACY_PYTHON" != "1" ]]; then
+      case "$requested_version" in
+        3.10|3.11)
+          ;;
+        *)
+          echo "Legacy Adv-BMT bootstrap requires Python 3.10 or 3.11 for the pinned dependency stack; got $requested_version from PYTHON_BIN=$PYTHON_BIN. Set ALLOW_UNSUPPORTED_LEGACY_PYTHON=1 to override." >&2
+          exit 1
+          ;;
+      esac
+    fi
+    echo "$PYTHON_BIN"
+    return
   fi
 
   local candidate
-  for candidate in python3.10 python3 python; do
+  # Prefer 3.10/3.11 because the released legacy stack is pinned around that
+  # wheel ecosystem. Falling onto 3.12 tends to trigger source builds for
+  # older packages like Pillow, which is exactly the failure mode we want to
+  # avoid on clean H200 boxes.
+  for candidate in python3.10 python3.11 python3 python; do
     if command -v "$candidate" >/dev/null 2>&1; then
-      echo "$candidate"
-      return
+      local candidate_version
+      candidate_version="$("$candidate" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+      if [[ "$ALLOW_UNSUPPORTED_LEGACY_PYTHON" == "1" ]]; then
+        echo "$candidate"
+        return
+      fi
+      case "$candidate_version" in
+        3.10|3.11)
+          echo "$candidate"
+          return
+          ;;
+      esac
     fi
   done
 
-  echo "No suitable Python interpreter found. Checked: python3.10, python3, python" >&2
+  echo "__USE_UV__"
+}
+
+resolve_uv_bin() {
+  if [[ -n "$UV_BIN" ]]; then
+    if [[ -x "$UV_BIN" ]]; then
+      echo "$UV_BIN"
+      return
+    fi
+    if command -v "$UV_BIN" >/dev/null 2>&1; then
+      command -v "$UV_BIN"
+      return
+    fi
+    echo "Requested UV_BIN not found or not executable: $UV_BIN" >&2
+    exit 1
+  fi
+
+  if command -v uv >/dev/null 2>&1; then
+    command -v uv
+    return
+  fi
+
+  if [[ "$AUTO_INSTALL_UV" != "1" ]]; then
+    echo "No suitable Python 3.10/3.11 interpreter found, and uv is unavailable. Install python3.10/python3.11 or rerun with AUTO_INSTALL_UV=1." >&2
+    exit 1
+  fi
+
+  local bootstrap_python=""
+  local candidate
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      bootstrap_python="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$bootstrap_python" ]]; then
+    echo "Cannot auto-install uv because neither python3 nor python is available." >&2
+    exit 1
+  fi
+
+  run_cmd "$bootstrap_python" -m pip install --user uv
+
+  if [[ -x "$HOME/.local/bin/uv" ]]; then
+    echo "$HOME/.local/bin/uv"
+    return
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    command -v uv
+    return
+  fi
+
+  echo "uv installation completed, but uv is still not discoverable on PATH." >&2
   exit 1
 }
 
@@ -160,7 +246,16 @@ if [[ "$RECREATE_VENV" == "1" && -d "$VENV_DIR" ]]; then
 fi
 
 if [[ ! -d "$VENV_DIR" ]]; then
-  run_cmd "$PYTHON_BIN" -m venv "$VENV_DIR"
+  if [[ "$PYTHON_BIN" == "__USE_UV__" ]]; then
+    UV_BIN="$(resolve_uv_bin)"
+    # Use a uv-managed interpreter when the host only exposes newer Python
+    # versions such as 3.12. That keeps the legacy dependency graph on a
+    # wheel-friendly 3.10/3.11 ABI without requiring manual system setup.
+    run_cmd "$UV_BIN" python install "$LEGACY_PYTHON_SPEC"
+    run_cmd "$UV_BIN" venv --python "$LEGACY_PYTHON_SPEC" "$VENV_DIR"
+  else
+    run_cmd "$PYTHON_BIN" -m venv "$VENV_DIR"
+  fi
 fi
 
 run_cmd "$VENV_DIR/bin/python" -m ensurepip --upgrade

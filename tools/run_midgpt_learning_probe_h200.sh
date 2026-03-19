@@ -33,14 +33,14 @@ resolve_python_bin() {
   fi
 
   local candidate
-  for candidate in python3.10 python3 python; do
+  for candidate in python3.10 python3.11 python3 python; do
     if command -v "$candidate" >/dev/null 2>&1; then
       echo "$candidate"
       return
     fi
   done
 
-  echo "No suitable Python interpreter found. Checked: python3.10, python3, python" >&2
+  echo "No suitable Python interpreter found. Checked: python3.10, python3.11, python3, python" >&2
   exit 1
 }
 
@@ -60,6 +60,11 @@ PYTHON_BIN="${PYTHON_BIN:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/h200_midgpt_learning_probe}"
 V2_VENV_DIR="${V2_VENV_DIR:-.venv-v2}"
 LEGACY_VENV_DIR="${LEGACY_VENV_DIR:-.venv-legacy-adv-bmt}"
+LEGACY_BOOTSTRAP_PYTHON_BIN="${LEGACY_BOOTSTRAP_PYTHON_BIN:-}"
+LEGACY_PYTHON_SPEC="${LEGACY_PYTHON_SPEC:-3.10}"
+LEGACY_AUTO_INSTALL_UV="${LEGACY_AUTO_INSTALL_UV:-1}"
+LEGACY_ALLOW_UNSUPPORTED_PYTHON="${LEGACY_ALLOW_UNSUPPORTED_PYTHON:-0}"
+LEGACY_UV_BIN="${LEGACY_UV_BIN:-}"
 
 BOOTSTRAP_V2="${BOOTSTRAP_V2:-1}"
 BOOTSTRAP_LEGACY="${BOOTSTRAP_LEGACY:-1}"
@@ -104,13 +109,21 @@ fi
 if [[ "$BOOTSTRAP_LEGACY" == "1" ]]; then
   LEGACY_ARGS=(
     env
-    PYTHON_BIN="$PYTHON_BIN"
     VENV_DIR="$LEGACY_VENV_DIR"
     RECREATE_VENV="$RECREATE_LEGACY_VENV"
     LEGACY_PROFILE="$LEGACY_PROFILE"
+    LEGACY_PYTHON_SPEC="$LEGACY_PYTHON_SPEC"
+    AUTO_INSTALL_UV="$LEGACY_AUTO_INSTALL_UV"
+    ALLOW_UNSUPPORTED_LEGACY_PYTHON="$LEGACY_ALLOW_UNSUPPORTED_PYTHON"
     INSTALL_SIM_STACK="$LEGACY_INSTALL_SIM_STACK"
     INSTALL_WAYMO_EVAL="$LEGACY_INSTALL_WAYMO_EVAL"
   )
+  if [[ -n "$LEGACY_BOOTSTRAP_PYTHON_BIN" ]]; then
+    LEGACY_ARGS+=(PYTHON_BIN="$LEGACY_BOOTSTRAP_PYTHON_BIN")
+  fi
+  if [[ -n "$LEGACY_UV_BIN" ]]; then
+    LEGACY_ARGS+=(UV_BIN="$LEGACY_UV_BIN")
+  fi
   if [[ -n "$LEGACY_METADRIVE_SRC" ]]; then
     LEGACY_ARGS+=(METADRIVE_SRC="$LEGACY_METADRIVE_SRC")
   fi

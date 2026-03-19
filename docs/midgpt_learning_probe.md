@@ -91,9 +91,20 @@ bash tools/run_midgpt_learning_probe_h200.sh
 `PYTHON_BIN` is optional. If unset, the wrapper auto-detects the first
 available interpreter from `python3.10`, `python3`, then `python`.
 
+The legacy bootstrap is handled separately inside the wrapper. By default it
+tries to create the legacy env on Python `3.10`, then `3.11`, and if the host
+only has Python `3.12` it will use `uv` to provision a managed `3.10`
+interpreter automatically.
+
 By default the H200 wrapper sets `CUDA_VISIBLE_DEVICES=0` so the probe uses one
 GPU for a cleaner apples-to-apples learning comparison. Override
 `CUDA_VISIBLE_DEVICES` if you want to exercise a wider device set.
+
+Useful override knobs for the legacy env are:
+
+- `LEGACY_PYTHON_SPEC=3.10|3.11`
+- `LEGACY_BOOTSTRAP_PYTHON_BIN=/path/to/python3.10`
+- `LEGACY_AUTO_INSTALL_UV=0|1`
 
 Validation semantics in the probe are:
 
