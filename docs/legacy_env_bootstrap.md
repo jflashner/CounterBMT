@@ -7,6 +7,10 @@ The bootstrap script is:
 
 - [bootstrap_legacy_adv_bmt.sh](/Users/joshuaflashner/Projects/CounterBMT/tools/bootstrap_legacy_adv_bmt.sh)
 
+For GPU memory profiling of the released MidGPT trainer after bootstrap, see:
+
+- [legacy_midgpt_memory_profiling.md](/Users/joshuaflashner/Projects/CounterBMT/docs/legacy_midgpt_memory_profiling.md)
+
 ## Default Goal
 
 The default goal is a **train-only legacy environment** suitable for:
