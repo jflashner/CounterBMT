@@ -109,6 +109,10 @@ fi
 if [[ "$BOOTSTRAP_LEGACY" == "1" ]]; then
   LEGACY_ARGS=(
     env
+    # Clear any inherited generic PYTHON_BIN from the parent shell so the
+    # legacy bootstrap can apply its own stricter interpreter policy
+    # (prefer 3.10/3.11, then fall back to a uv-managed 3.10 install).
+    PYTHON_BIN=
     VENV_DIR="$LEGACY_VENV_DIR"
     RECREATE_VENV="$RECREATE_LEGACY_VENV"
     LEGACY_PROFILE="$LEGACY_PROFILE"

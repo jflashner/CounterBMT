@@ -46,7 +46,9 @@ This will:
 2. install the pinned legacy PyTorch/Lightning stack
 3. install matching PyG operator wheels
 4. install `metadrive` and `scenarionet`
-5. verify the resulting environment
+5. re-apply the pinned legacy base requirements so broad external dependency
+   ranges do not upgrade core packages like NumPy behind our backs
+6. verify the resulting environment
 
 The dedicated legacy env is intentionally pinned to `numpy==1.26.4` because the
 released editable `adv-bmt` package declares `numpy>=1.26,<2`. That keeps the

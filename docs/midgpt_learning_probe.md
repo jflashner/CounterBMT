@@ -106,6 +106,11 @@ Useful override knobs for the legacy env are:
 - `LEGACY_BOOTSTRAP_PYTHON_BIN=/path/to/python3.10`
 - `LEGACY_AUTO_INSTALL_UV=0|1`
 
+If you previously exported a generic `PYTHON_BIN=python3` in your shell, the
+wrapper now clears that for the legacy bootstrap automatically. The legacy env
+needs tighter Python selection than the v2 env, so use
+`LEGACY_BOOTSTRAP_PYTHON_BIN` if you want to override it explicitly.
+
 Validation semantics in the probe are:
 
 - `--v2-eval-batches 0`

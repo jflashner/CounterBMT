@@ -56,6 +56,14 @@ run_cmd() {
   fi
 }
 
+reapply_legacy_base_pins() {
+  # MetaDrive and ScenarioNet have broad dependency ranges, including NumPy.
+  # Installing them after the pinned legacy base can cause pip to upgrade core
+  # packages opportunistically. Re-apply the legacy base requirements so the
+  # final env matches the versions we actually verify against.
+  run_cmd "$VENV_DIR/bin/python" -m pip install -r requirements-legacy-base.txt
+}
+
 resolve_python_bin() {
   if [[ -n "$PYTHON_BIN" ]]; then
     if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
@@ -287,6 +295,7 @@ fi
 if [[ "$INSTALL_SIM_STACK" == "1" ]]; then
   clone_or_reuse_repo "metadrive" "https://github.com/metadriverse/metadrive.git" "$METADRIVE_SRC" "$METADRIVE_REF"
   clone_or_reuse_repo "scenarionet" "https://github.com/metadriverse/scenarionet.git" "$SCENARIONET_SRC" "$SCENARIONET_REF"
+  reapply_legacy_base_pins
 fi
 
 if [[ "$INSTALL_WAYMO_EVAL" == "1" ]]; then
