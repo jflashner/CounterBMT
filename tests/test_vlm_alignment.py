@@ -10,6 +10,7 @@ import numpy as np
 from counter_bmt_v2.config import VLMAlignmentConfig
 from counter_bmt_v2.contracts import BayesianDAG, ConditioningSignal, DAGEdge, DAGNode, Intervention, ScenarioInput, TrajectoryRollout
 from counter_bmt_v2.rl.vlm_alignment import VLMAlignmentVerifier
+from counter_bmt_v2.rl.vlm_alignment_evidence import build_alignment_cache_context
 from counter_bmt_v2.rl.vlm_alignment_prompt import parse_alignment_response
 
 
@@ -119,6 +120,56 @@ class VLMAlignmentTests(unittest.TestCase):
             self.assertTrue(np.allclose(res.scores, np.asarray([0.2, 0.2], dtype=np.float32), atol=1e-6))
             self.assertFalse(np.any(res.scored_mask))
             self.assertEqual(float(res.diagnostics.get("step_skipped", 0.0)), 1.0)
+
+    def test_cache_key_uses_full_assignment_and_dag_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = VLMAlignmentConfig(
+                enabled=True,
+                source_mode="vlm_replace",
+                backend="mock",
+                cache_dir=str(Path(td) / "cache"),
+                save_evidence_artifacts=False,
+            )
+            verifier = VLMAlignmentVerifier(cfg=cfg, output_dir=Path(td) / "out")
+            rollout = _dummy_rollouts(1)[0]
+            dag = _dummy_dag()
+            intervention_a = Intervention(
+                variable="decision_0",
+                value="maintain_speed",
+                assignments={"decision_0": "maintain_speed", "collision_outcome": "collision_avoided"},
+                assignment_order=["decision_0", "collision_outcome"],
+                source_dag_schema="counter_bmt_v2_dag_cache_v3_maneuver_outcome",
+                is_counterfactual=True,
+            )
+            intervention_b = Intervention(
+                variable="decision_0",
+                value="maintain_speed",
+                assignments={"decision_0": "maintain_speed", "collision_outcome": "collision_possible"},
+                assignment_order=["decision_0", "collision_outcome"],
+                source_dag_schema="counter_bmt_v2_dag_cache_v3_maneuver_outcome",
+                is_counterfactual=True,
+            )
+            dag_variant = _dummy_dag()
+            dag_variant.nodes["collision_outcome"].value = "collision_possible"
+
+            key_a = verifier._cache_key(
+                scenario_id=str(dag.scenario_id),
+                rollout=rollout,
+                cache_context=build_alignment_cache_context(dag, intervention_a),
+            )
+            key_b = verifier._cache_key(
+                scenario_id=str(dag.scenario_id),
+                rollout=rollout,
+                cache_context=build_alignment_cache_context(dag, intervention_b),
+            )
+            key_c = verifier._cache_key(
+                scenario_id=str(dag_variant.scenario_id),
+                rollout=rollout,
+                cache_context=build_alignment_cache_context(dag_variant, intervention_a),
+            )
+
+            self.assertNotEqual(key_a, key_b)
+            self.assertNotEqual(key_a, key_c)
 
 
 if __name__ == "__main__":

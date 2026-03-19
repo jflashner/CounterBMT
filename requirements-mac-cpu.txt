@@ -1,0 +1,19 @@
+# CounterBMT v2 macOS CPU pinned dependencies
+#
+# Usage:
+#   python -m pip install -r requirements-mac-cpu.txt
+#
+# This profile is intentionally scoped to local CounterBMT v2 iteration on macOS.
+# It excludes Linux CUDA wheels and heavy editable installs that are not needed for
+# the local RL/DAG unit-test loop.
+
+-e .
+numpy==2.2.6
+jax==0.6.2
+jaxlib==0.6.2
+flax==0.10.7
+optax==0.2.7
+openai==2.9.0
+matplotlib==3.9.0
+tensorboard==2.12.3
+pytest==9.0.2

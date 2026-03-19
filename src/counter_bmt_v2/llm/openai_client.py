@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class OpenAIChatClient:
-    model: str = "gpt-4o"
+    model: str = "gpt-5-mini"
     api_key: Optional[str] = None
     timeout_s: float = 60.0
     _client: Any = field(init=False, default=None)

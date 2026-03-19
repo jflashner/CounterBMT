@@ -5,7 +5,6 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax import nnx
 
 from counter_bmt_v2.causal import TopologicalDAGAssignmentSampler, payload_to_bayesian_dag
@@ -13,7 +12,13 @@ from counter_bmt_v2.config import RLPolicyConfig
 from counter_bmt_v2.contracts import BayesianDAG, DAGNode, DAGEdge, ScenarioInput
 from counter_bmt_v2.data.scenarionet import NNXBMTSceneSample
 from counter_bmt_v2.rl.grpo import categorical_kl_from_log_probs, clipped_surrogate_stats
-from counter_bmt_v2.rl.nnx_policy import NNXPolicyBackend, _build_feasibility_mask
+from counter_bmt_v2.rl.nnx_policy import (
+    NNXPolicyBackend,
+    _build_feasibility_mask,
+    _build_policy_optimizer,
+    _is_trainable_path,
+    _path_to_str,
+)
 from counter_bmt_v2.training.supervised import SupervisedTrainConfig
 from counter_bmt_v2.trajectory_jax import (
     BidirectionalMotionTokenizer,
@@ -126,8 +131,8 @@ def _dummy_dag_payload() -> dict:
     }
 
 
-def _dummy_scene_sample() -> NNXBMTSceneSample:
-    t = 6
+def _dummy_scene_sample(*, horizon: int = 6) -> NNXBMTSceneSample:
+    t = int(horizon)
     n = 2
     time = np.arange(t, dtype=np.float32)[:, None]
     ego_x = 0.5 * time
@@ -166,6 +171,75 @@ def _dummy_scene_sample() -> NNXBMTSceneSample:
         traffic_light_valid_mask=tl_valid,
         traffic_light_position=tl_pos,
     )
+
+
+def _make_policy_backend(
+    *,
+    store_rollout_traces: bool = False,
+    trainable_scope: str = "decoder_dag",
+) -> NNXPolicyBackend:
+    model_cfg = NNXBMTConfig(d_model=8, n_layers=1, n_heads=2, ff_mult=2)
+    model_cfg.dag_encoder = NNXDAGEncoderConfig(
+        enabled=True,
+        d_node_in=24,
+        d_edge_in=8,
+        d_hidden=8,
+        n_layers=1,
+        max_nodes=8,
+        max_edges=16,
+    )
+    model_cfg.dag_conditioning.enabled = True
+    train_cfg = SupervisedTrainConfig(
+        model_preset="paper_like_small",
+        tokenizer_mode="paper_simple",
+        skip_steps=1,
+        batch_size=1,
+        mode="forward",
+        reverse_probability=0.0,
+        precision="fp32",
+    )
+    tokenizer = BidirectionalMotionTokenizer(model_cfg.token_space)
+    model = NNXBidirectionalMotionTransformer(model_cfg, rngs=nnx.Rngs(0))
+    reference_model = NNXBidirectionalMotionTransformer(model_cfg, rngs=nnx.Rngs(1))
+    nnx.update(reference_model, nnx.state(model))
+    cfg = RLPolicyConfig(
+        tokenizer_mode="paper_simple",
+        skip_steps=1,
+        enable_feasibility_mask=True,
+        store_rollout_traces=store_rollout_traces,
+        trainable_scope=trainable_scope,  # type: ignore[arg-type]
+        policy_lr=1e-3,
+    )
+    return NNXPolicyBackend(
+        cfg=cfg,
+        model_cfg=model_cfg,
+        prep_train_cfg=train_cfg,
+        tokenizer=tokenizer,
+        model=model,
+        reference_model=reference_model,
+        optimizer=_build_policy_optimizer(model, cfg=cfg),
+    )
+
+
+def _make_scene_and_dag(*, horizon: int = 6) -> tuple[ScenarioInput, dict, BayesianDAG]:
+    sample = _dummy_scene_sample(horizon=horizon)
+    scene = ScenarioInput(
+        scenario_id="scene_rl",
+        ego_trajectory_xy=sample.agent_position_xy[:, 0, :],
+        metadata={"nnx_sample": sample},
+    )
+    dag_payload = _dummy_dag_payload()
+    dag = payload_to_bayesian_dag(dag_payload)
+    return scene, dag_payload, dag
+
+
+def _param_state_by_path(model: NNXBidirectionalMotionTransformer) -> dict[str, np.ndarray]:
+    state = nnx.state(model, nnx.Param)
+    leaves, _treedef = jax.tree_util.tree_flatten_with_path(state)
+    return {
+        _path_to_str(path): np.asarray(jax.device_get(value))
+        for path, value in leaves
+    }
 
 
 class TopoMCPONNXTests(unittest.TestCase):
@@ -216,46 +290,28 @@ class TopoMCPONNXTests(unittest.TestCase):
         self.assertFalse(bool(valid_np[0, 0, 2]))
         self.assertGreater(float(np.asarray(invalid_rate)[0]), 0.0)
 
+    def test_feasibility_mask_all_masked_falls_back_safely(self) -> None:
+        cfg = RLPolicyConfig(
+            feasible_max_speed_mps=0.1,
+            feasible_max_accel_delta=0.05,
+            feasible_max_yaw_delta=0.05,
+            enable_feasibility_mask=True,
+        )
+        action_table = jnp.asarray([[1.0, 1.0], [2.0, -1.0]], dtype=jnp.float32)
+        valid, invalid_rate = _build_feasibility_mask(
+            current_speed_bn=jnp.asarray([[5.0]], dtype=jnp.float32),
+            prev_action_bn2=jnp.asarray([[[0.0, 0.0]]], dtype=jnp.float32),
+            action_table_v2=action_table,
+            dt_chunk_b=jnp.asarray([1.0], dtype=jnp.float32),
+            cfg=cfg,
+        )
+        valid_np = np.asarray(valid)
+        self.assertTrue(np.all(valid_np[0, 0]))
+        self.assertAlmostEqual(float(np.asarray(invalid_rate)[0]), 0.0, places=6)
+
     def test_nnx_policy_backend_prepare_scene_smoke(self) -> None:
-        model_cfg = NNXBMTConfig(d_model=16, n_layers=1, n_heads=4, ff_mult=2)
-        model_cfg.dag_encoder = NNXDAGEncoderConfig(
-            enabled=True,
-            d_node_in=24,
-            d_edge_in=8,
-            d_hidden=16,
-            n_layers=1,
-            max_nodes=8,
-            max_edges=16,
-        )
-        model_cfg.dag_conditioning.enabled = True
-        train_cfg = SupervisedTrainConfig(
-            model_preset="paper_like_small",
-            tokenizer_mode="paper_simple",
-            skip_steps=1,
-            batch_size=1,
-            mode="forward",
-            reverse_probability=0.0,
-            precision="fp32",
-        )
-        tokenizer = BidirectionalMotionTokenizer(model_cfg.token_space)
-        model = NNXBidirectionalMotionTransformer(model_cfg, rngs=nnx.Rngs(0))
-        backend = NNXPolicyBackend(
-            cfg=RLPolicyConfig(tokenizer_mode="paper_simple", skip_steps=1, enable_feasibility_mask=True),
-            model_cfg=model_cfg,
-            prep_train_cfg=train_cfg,
-            tokenizer=tokenizer,
-            model=model,
-            reference_model=model,
-            optimizer=nnx.Optimizer(model, optax.adamw(1e-4)),
-        )
-        sample = _dummy_scene_sample()
-        scene = ScenarioInput(
-            scenario_id="scene_rl",
-            ego_trajectory_xy=sample.agent_position_xy[:, 0, :],
-            metadata={"nnx_sample": sample},
-        )
-        dag_payload = _dummy_dag_payload()
-        dag = payload_to_bayesian_dag(dag_payload)
+        backend = _make_policy_backend()
+        scene, dag_payload, dag = _make_scene_and_dag()
         prepared = backend._prepare_scene(
             scene=scene,
             sampled_dag=dag,
@@ -266,6 +322,102 @@ class TopoMCPONNXTests(unittest.TestCase):
         self.assertEqual(prepared.start_token_ids.shape[0], 1)
         self.assertIn("dag_node_feat", prepared.static_model_inputs)
         self.assertTrue(np.isfinite(prepared.init_speed_bn).all())
+
+    def test_nnx_policy_rollout_traces_smoke(self) -> None:
+        backend = _make_policy_backend(store_rollout_traces=True)
+        scene, dag_payload, dag = _make_scene_and_dag()
+        pool = backend.sample_candidate_pool(
+            scene=scene,
+            sampled_dag=dag,
+            sampled_dag_payload=dag_payload,
+            n_samples=2,
+            seed=0,
+            conditioning_metadata={"assignments": {"maneuver_0": "straight"}},
+        )
+
+        self.assertEqual(len(pool.rollouts), 2)
+        self.assertIsNotNone(pool.rollout_data.old_logprob_steps)
+        self.assertIsNotNone(pool.rollout_data.entropy_steps)
+        self.assertIsNotNone(pool.rollout_data.feasibility_mask_rate_steps)
+        self.assertIsNotNone(pool.rollout_data.ego_motion_deltas)
+        assert pool.rollout_data.old_logprob_steps is not None
+        assert pool.rollout_data.entropy_steps is not None
+        assert pool.rollout_data.feasibility_mask_rate_steps is not None
+        assert pool.rollout_data.ego_motion_deltas is not None
+        self.assertEqual(
+            pool.rollout_data.old_logprob_steps.shape,
+            (2, pool.prepared_scene.horizon_steps),
+        )
+        self.assertEqual(
+            pool.rollout_data.entropy_steps.shape,
+            (2, pool.prepared_scene.horizon_steps),
+        )
+        self.assertEqual(
+            pool.rollout_data.feasibility_mask_rate_steps.shape,
+            (2, pool.prepared_scene.horizon_steps),
+        )
+        self.assertEqual(
+            pool.rollout_data.ego_motion_deltas.shape,
+            (2, pool.prepared_scene.horizon_steps, 2),
+        )
+        self.assertIn("rollout_trace", pool.rollouts[0].metadata)
+        self.assertEqual(
+            len(pool.rollouts[0].metadata["rollout_trace"]["ego_old_logprob_steps"]),
+            pool.prepared_scene.horizon_steps,
+        )
+
+    def test_recomputed_rollout_logprobs_match_sampled_old_logprobs(self) -> None:
+        backend = _make_policy_backend(store_rollout_traces=True)
+        scene, dag_payload, dag = _make_scene_and_dag()
+        pool = backend.sample_candidate_pool(
+            scene=scene,
+            sampled_dag=dag,
+            sampled_dag_payload=dag_payload,
+            n_samples=2,
+            seed=0,
+            conditioning_metadata={"assignments": {"maneuver_0": "straight"}},
+        )
+        stats = backend._recompute_rollout_stats(model=backend.model, batch=pool.rollout_data)
+        logprob_sum = np.asarray(jax.device_get(stats["logprob_sum"]), dtype=np.float32)
+        logprob_steps = np.asarray(jax.device_get(stats["logprob_steps"]), dtype=np.float32)
+
+        self.assertTrue(np.allclose(logprob_sum, pool.rollout_data.old_logprob_sum, atol=2e-4))
+        assert pool.rollout_data.old_logprob_steps is not None
+        self.assertTrue(np.allclose(logprob_steps, pool.rollout_data.old_logprob_steps, atol=2e-4))
+
+    def test_trainable_scope_decoder_dag_leaves_frozen_params_unchanged(self) -> None:
+        backend = _make_policy_backend(store_rollout_traces=False, trainable_scope="decoder_dag")
+        scene, dag_payload, dag = _make_scene_and_dag(horizon=2)
+        pool = backend.sample_candidate_pool(
+            scene=scene,
+            sampled_dag=dag,
+            sampled_dag_payload=dag_payload,
+            n_samples=1,
+            seed=1,
+            conditioning_metadata={"assignments": {"maneuver_0": "straight"}},
+        )
+        before = _param_state_by_path(backend.model)
+        metrics = backend.update(
+            batch=pool.rollout_data,
+            advantages=np.asarray([1.0], dtype=np.float32),
+            alpha=0.0,
+        )
+        after = _param_state_by_path(backend.model)
+
+        frozen_unchanged = 0
+        trainable_changed = 0
+        for path, before_arr in before.items():
+            after_arr = after[path]
+            if _is_trainable_path(path, scope="decoder_dag"):
+                if not np.allclose(before_arr, after_arr):
+                    trainable_changed += 1
+            else:
+                np.testing.assert_array_equal(before_arr, after_arr)
+                frozen_unchanged += 1
+
+        self.assertGreater(frozen_unchanged, 0)
+        self.assertGreater(trainable_changed, 0)
+        self.assertTrue(np.isfinite(metrics["policy/loss"]))
 
     def test_clipped_surrogate_and_kl_helpers(self) -> None:
         stats = clipped_surrogate_stats(

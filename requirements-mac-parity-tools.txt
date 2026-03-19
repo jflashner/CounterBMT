@@ -1,0 +1,8 @@
+-r requirements-mac-cpu.txt
+
+# Optional legacy parity tooling for local architecture/count audits.
+# This profile adds the minimum extra packages needed to instantiate the
+# released Adv-BMT PyTorch model and compare it against the v2 NNX parity model.
+torch==2.10.0
+easydict==1.13
+shapely==2.1.2

@@ -528,10 +528,13 @@ def build_scene_token_relation_inputs_np(
             if remove_traffic_light_state:
                 light_mask = np.any(tl_valid, axis=1)  # [B,L]
                 valid_f = tl_valid.astype(np.float32)[..., None]
+                pos_num = np.sum(tl_feat[..., :3] * valid_f, axis=1)
+                pos_den = np.maximum(1.0, np.sum(valid_f, axis=1))
+                stop_point = pos_num / pos_den
                 state_scores = np.sum(tl_feat[..., 3:7] * valid_f, axis=1)  # [B,L,4]
                 cls = np.argmax(state_scores, axis=-1)
                 onehot = np.eye(4, dtype=np.float32)[cls]
-                light_feat = np.concatenate([tl_pos, onehot], axis=-1)
+                light_feat = np.concatenate([stop_point, onehot], axis=-1)
             else:
                 light_mask = np.any(tl_valid, axis=1)
                 valid_f = tl_valid.astype(np.float32)

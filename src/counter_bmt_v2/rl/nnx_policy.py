@@ -59,6 +59,10 @@ class PolicyRolloutData:
     old_logprob_sum: np.ndarray  # [K]
     entropy_mean: np.ndarray  # [K]
     feasibility_mask_rate: np.ndarray  # [K]
+    old_logprob_steps: np.ndarray | None = None  # [K,H] (ego only)
+    entropy_steps: np.ndarray | None = None  # [K,H] (ego only)
+    feasibility_mask_rate_steps: np.ndarray | None = None  # [K,H] (ego only)
+    ego_motion_deltas: np.ndarray | None = None  # [K,H,2]
 
 
 @dataclass
@@ -67,6 +71,16 @@ class PolicyCandidatePool:
     rollout_data: PolicyRolloutData
     rollouts: List[TrajectoryRollout]
     trajectory_all_xy: np.ndarray  # [K,H,N,2]
+
+
+def _slice_optional_array(arr: np.ndarray | None, idx: np.ndarray) -> np.ndarray | None:
+    if arr is None:
+        return None
+    return np.asarray(arr[idx])
+
+
+def _empty_step_matrix(batch_size: int, horizon_steps: int) -> jnp.ndarray:
+    return jnp.zeros((batch_size, horizon_steps), dtype=jnp.float32)
 
 
 def _resolve_model_cfg_for_policy(preset_name: str):
@@ -122,6 +136,41 @@ def _build_grad_scale_tree(model: NNXBidirectionalMotionTransformer, *, scope: s
         s = 1.0 if _is_trainable_path(p, scope=str(scope)) else 0.0
         scales.append(jnp.asarray(float(s), dtype=jnp.float32))
     return jax.tree_util.tree_unflatten(treedef, scales)
+
+
+def _build_trainable_label_tree(model: NNXBidirectionalMotionTransformer, *, scope: str) -> Any:
+    state = nnx.state(model, nnx.Param)
+    path_leaves, treedef = jax.tree_util.tree_flatten_with_path(state)
+    labels: List[str] = []
+    for path, _leaf in path_leaves:
+        p = _path_to_str(path)
+        labels.append("train" if _is_trainable_path(p, scope=str(scope)) else "freeze")
+    return jax.tree_util.tree_unflatten(treedef, labels)
+
+
+def _build_policy_optimizer(
+    model: NNXBidirectionalMotionTransformer,
+    *,
+    cfg: RLPolicyConfig,
+) -> nnx.Optimizer:
+    train_tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(
+            learning_rate=float(cfg.policy_lr),
+            weight_decay=0.0,
+            b1=0.9,
+            b2=0.95,
+            eps=1e-5,
+        ),
+    )
+    tx = optax.multi_transform(
+        {
+            "train": train_tx,
+            "freeze": optax.set_to_zero(),
+        },
+        _build_trainable_label_tree(model, scope=str(cfg.trainable_scope)),
+    )
+    return nnx.Optimizer(model, tx)
 
 
 def _repeat_first_axis(arr: jnp.ndarray, repeats: int) -> jnp.ndarray:
@@ -255,17 +304,7 @@ class NNXPolicyBackend:
         nnx.update(model, payload["model_state"])
         nnx.update(reference_model, payload["model_state"])
 
-        tx = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adamw(
-                learning_rate=float(cfg.policy_lr),
-                weight_decay=0.0,
-                b1=0.9,
-                b2=0.95,
-                eps=1e-5,
-            ),
-        )
-        optimizer = nnx.Optimizer(model, tx)
+        optimizer = _build_policy_optimizer(model, cfg=cfg)
         return cls(
             cfg=cfg,
             model_cfg=model_cfg,
@@ -377,6 +416,10 @@ class NNXPolicyBackend:
         old_logprob_sum = jnp.zeros((bsz,), dtype=jnp.float32)
         entropy_sum = jnp.zeros((bsz,), dtype=jnp.float32)
         mask_rate_sum = jnp.zeros((bsz,), dtype=jnp.float32)
+        old_logprob_steps = jnp.zeros((bsz, horizon_steps), dtype=jnp.float32) if bool(self.cfg.store_rollout_traces) else None
+        entropy_steps = jnp.zeros((bsz, horizon_steps), dtype=jnp.float32) if bool(self.cfg.store_rollout_traces) else None
+        mask_rate_steps = jnp.zeros((bsz, horizon_steps), dtype=jnp.float32) if bool(self.cfg.store_rollout_traces) else None
+        ego_motion_deltas = jnp.zeros((bsz, horizon_steps, 2), dtype=jnp.float32) if bool(self.cfg.store_rollout_traces) else None
         key = jax.random.PRNGKey(int(seed))
 
         for t in range(horizon_steps):
@@ -396,6 +439,7 @@ class NNXPolicyBackend:
             logits = self.model(**model_inputs).astype(jnp.float32)
             step_logits = logits[:, t, :, :]
 
+            ego_invalid_rate = jnp.zeros((bsz,), dtype=jnp.float32)
             if bool(self.cfg.enable_feasibility_mask):
                 feasible_mask, invalid_rate = _build_feasibility_mask(
                     current_speed_bn=current_speed,
@@ -406,6 +450,7 @@ class NNXPolicyBackend:
                 )
                 step_logits = jnp.where(feasible_mask, step_logits, jnp.full_like(step_logits, -1e9))
                 mask_rate_sum = mask_rate_sum + invalid_rate
+                ego_invalid_rate = 1.0 - jnp.mean(feasible_mask[:, 0, :].astype(jnp.float32), axis=-1)
 
             log_probs = jax.nn.log_softmax(step_logits, axis=-1)
             probs = jnp.exp(log_probs)
@@ -425,6 +470,11 @@ class NNXPolicyBackend:
             entropy_sum = entropy_sum + entropy_agents[:, 0]
 
             next_motion = jnp.take(self.action_table_jnp, next_tok, axis=0)
+            if old_logprob_steps is not None and entropy_steps is not None and mask_rate_steps is not None and ego_motion_deltas is not None:
+                old_logprob_steps = old_logprob_steps.at[:, t].set(next_lp[:, 0])
+                entropy_steps = entropy_steps.at[:, t].set(entropy_agents[:, 0])
+                mask_rate_steps = mask_rate_steps.at[:, t].set(ego_invalid_rate)
+                ego_motion_deltas = ego_motion_deltas.at[:, t, :].set(next_motion[:, 0, :])
             token_seq = token_seq.at[:, t, :].set(next_tok)
             motion_seq = motion_seq.at[:, t, :, :].set(next_motion)
             modeled_delta_seq = modeled_delta_seq.at[:, t, :, :].set(next_motion)
@@ -442,6 +492,13 @@ class NNXPolicyBackend:
         )
         all_xy = pos[0]
         ego_xy = all_xy[:, :, 0, :]
+        old_logprob_np = np.asarray(jax.device_get(old_logprob_sum), dtype=np.float32)
+        entropy_mean_np = (np.asarray(jax.device_get(entropy_sum), dtype=np.float32) / max(1, horizon_steps)).astype(np.float32)
+        feasibility_mask_rate_np = (np.asarray(jax.device_get(mask_rate_sum), dtype=np.float32) / max(1, horizon_steps)).astype(np.float32)
+        old_logprob_steps_np = np.asarray(jax.device_get(old_logprob_steps), dtype=np.float32) if old_logprob_steps is not None else None
+        entropy_steps_np = np.asarray(jax.device_get(entropy_steps), dtype=np.float32) if entropy_steps is not None else None
+        mask_rate_steps_np = np.asarray(jax.device_get(mask_rate_steps), dtype=np.float32) if mask_rate_steps is not None else None
+        ego_motion_deltas_np = np.asarray(jax.device_get(ego_motion_deltas), dtype=np.float32) if ego_motion_deltas is not None else None
 
         rollouts: List[TrajectoryRollout] = []
         for i in range(bsz):
@@ -449,29 +506,46 @@ class NNXPolicyBackend:
                 vector=np.zeros((0,), dtype=np.float32),
                 metadata=dict(conditioning_metadata),
             )
+            metadata = {
+                "backend": "nnx_checkpoint",
+                "trajectory_all_xy": np.asarray(all_xy[i], dtype=np.float32).tolist(),
+                "predicted_tokens": token_np[i].tolist(),
+                "old_logprob_sum": float(old_logprob_np[i]),
+                "entropy_mean": float(entropy_mean_np[i]),
+                "feasibility_mask_rate": float(feasibility_mask_rate_np[i]),
+                "conditioning_assignments": dict(conditioning_metadata.get("assignments", {})),
+            }
+            if (
+                old_logprob_steps_np is not None
+                and entropy_steps_np is not None
+                and mask_rate_steps_np is not None
+                and ego_motion_deltas_np is not None
+            ):
+                metadata["rollout_trace"] = {
+                    "ego_old_logprob_steps": old_logprob_steps_np[i].tolist(),
+                    "ego_entropy_steps": entropy_steps_np[i].tolist(),
+                    "ego_feasibility_mask_rate_steps": mask_rate_steps_np[i].tolist(),
+                    "ego_motion_deltas": ego_motion_deltas_np[i].tolist(),
+                }
             rollouts.append(
                 TrajectoryRollout(
                     trajectory_xy=np.asarray(ego_xy[i], dtype=np.float32),
                     conditioning=conditioning,
                     sample_index=i,
-                    metadata={
-                        "backend": "nnx_checkpoint",
-                        "trajectory_all_xy": np.asarray(all_xy[i], dtype=np.float32).tolist(),
-                        "predicted_tokens": token_np[i].tolist(),
-                        "old_logprob_sum": float(np.asarray(jax.device_get(old_logprob_sum))[i]),
-                        "entropy_mean": float(np.asarray(jax.device_get(entropy_sum))[i] / max(1, horizon_steps)),
-                        "feasibility_mask_rate": float(np.asarray(jax.device_get(mask_rate_sum))[i] / max(1, horizon_steps)),
-                        "conditioning_assignments": dict(conditioning_metadata.get("assignments", {})),
-                    },
+                    metadata=metadata,
                 )
             )
 
         rollout_data = PolicyRolloutData(
             prepared_scene=prepared,
             token_ids=token_np,
-            old_logprob_sum=np.asarray(jax.device_get(old_logprob_sum), dtype=np.float32),
-            entropy_mean=(np.asarray(jax.device_get(entropy_sum), dtype=np.float32) / max(1, horizon_steps)).astype(np.float32),
-            feasibility_mask_rate=(np.asarray(jax.device_get(mask_rate_sum), dtype=np.float32) / max(1, horizon_steps)).astype(np.float32),
+            old_logprob_sum=old_logprob_np,
+            entropy_mean=entropy_mean_np,
+            feasibility_mask_rate=feasibility_mask_rate_np,
+            old_logprob_steps=old_logprob_steps_np,
+            entropy_steps=entropy_steps_np,
+            feasibility_mask_rate_steps=mask_rate_steps_np,
+            ego_motion_deltas=ego_motion_deltas_np,
         )
         return PolicyCandidatePool(
             prepared_scene=prepared,
@@ -489,7 +563,111 @@ class NNXPolicyBackend:
             old_logprob_sum=data.old_logprob_sum[idx],
             entropy_mean=data.entropy_mean[idx],
             feasibility_mask_rate=data.feasibility_mask_rate[idx],
+            old_logprob_steps=_slice_optional_array(data.old_logprob_steps, idx),
+            entropy_steps=_slice_optional_array(data.entropy_steps, idx),
+            feasibility_mask_rate_steps=_slice_optional_array(data.feasibility_mask_rate_steps, idx),
+            ego_motion_deltas=_slice_optional_array(data.ego_motion_deltas, idx),
         )
+
+    def _recompute_rollout_stats(
+        self,
+        *,
+        model: NNXBidirectionalMotionTransformer,
+        batch: PolicyRolloutData,
+        reference_model: NNXBidirectionalMotionTransformer | None = None,
+    ) -> Dict[str, jnp.ndarray]:
+        tokens = jnp.asarray(batch.token_ids, dtype=jnp.int32)
+        if tokens.ndim != 3:
+            raise ValueError(f"Expected token_ids with shape [K,H,N], got {tokens.shape}")
+
+        k, horizon_steps, n_agents = tokens.shape
+        prepared = batch.prepared_scene
+        static_inputs = _repeat_model_inputs(prepared.static_model_inputs, int(k))
+        token_seq = jnp.broadcast_to(
+            jnp.asarray(prepared.start_token_ids, dtype=jnp.int32)[:, None, :],
+            (int(k), int(horizon_steps), int(n_agents)),
+        )
+        motion_seq = jnp.zeros((int(k), int(horizon_steps), int(n_agents), 2), dtype=jnp.float32)
+        modeled_delta_seq = jnp.zeros_like(motion_seq)
+        current_speed = jnp.asarray(np.repeat(prepared.init_speed_bn, int(k), axis=0), dtype=jnp.float32)
+        prev_action = jnp.zeros((int(k), int(n_agents), 2), dtype=jnp.float32)
+        dt_chunk_b = jnp.asarray(np.repeat(prepared.dt_chunk_b, int(k), axis=0), dtype=jnp.float32)
+
+        logprob_steps = _empty_step_matrix(int(k), int(horizon_steps))
+        entropy_steps = _empty_step_matrix(int(k), int(horizon_steps))
+        mask_rate_steps = _empty_step_matrix(int(k), int(horizon_steps))
+        kl_steps = _empty_step_matrix(int(k), int(horizon_steps)) if reference_model is not None else None
+
+        for t in range(int(horizon_steps)):
+            rollout_masks = _build_rollout_masks(
+                static_inputs,
+                batch_size=int(k),
+                horizon_steps=int(horizon_steps),
+                step_index=int(t),
+                n_agents=int(n_agents),
+            )
+            model_inputs = dict(static_inputs)
+            model_inputs.update(rollout_masks)
+            model_inputs["prev_token_ids"] = token_seq
+            model_inputs["continuous_motion"] = motion_seq
+            model_inputs["modeled_agent_delta"] = modeled_delta_seq
+
+            logits = model(**model_inputs).astype(jnp.float32)
+            step_logits = logits[:, t, :, :]
+            ego_invalid_rate = jnp.zeros((int(k),), dtype=jnp.float32)
+            feasible_mask = None
+            if bool(self.cfg.enable_feasibility_mask):
+                feasible_mask, _invalid_rate = _build_feasibility_mask(
+                    current_speed_bn=current_speed,
+                    prev_action_bn2=prev_action,
+                    action_table_v2=self.action_table_jnp,
+                    dt_chunk_b=dt_chunk_b,
+                    cfg=self.cfg,
+                )
+                step_logits = jnp.where(feasible_mask, step_logits, jnp.full_like(step_logits, -1e9))
+                ego_invalid_rate = 1.0 - jnp.mean(feasible_mask[:, 0, :].astype(jnp.float32), axis=-1)
+
+            log_probs = jax.nn.log_softmax(step_logits, axis=-1)
+            probs = jnp.exp(log_probs)
+            entropy_agents = -jnp.sum(probs * log_probs, axis=-1)
+            next_tok = tokens[:, t, :]
+            next_lp = jnp.take_along_axis(log_probs, next_tok[..., None], axis=-1).squeeze(-1)
+
+            logprob_steps = logprob_steps.at[:, t].set(next_lp[:, 0])
+            entropy_steps = entropy_steps.at[:, t].set(entropy_agents[:, 0])
+            mask_rate_steps = mask_rate_steps.at[:, t].set(ego_invalid_rate)
+
+            if reference_model is not None and kl_steps is not None:
+                ref_logits = reference_model(**model_inputs).astype(jnp.float32)
+                ref_step_logits = ref_logits[:, t, :, :]
+                if feasible_mask is not None:
+                    ref_step_logits = jnp.where(feasible_mask, ref_step_logits, jnp.full_like(ref_step_logits, -1e9))
+                ref_log_probs = jax.nn.log_softmax(ref_step_logits, axis=-1)
+                ego_kl = jnp.sum(
+                    probs[:, 0, :] * (log_probs[:, 0, :] - ref_log_probs[:, 0, :]),
+                    axis=-1,
+                )
+                kl_steps = kl_steps.at[:, t].set(ego_kl)
+
+            next_motion = jnp.take(self.action_table_jnp, next_tok, axis=0)
+            token_seq = token_seq.at[:, t, :].set(next_tok)
+            motion_seq = motion_seq.at[:, t, :, :].set(next_motion)
+            modeled_delta_seq = modeled_delta_seq.at[:, t, :, :].set(next_motion)
+            current_speed = jnp.maximum(0.0, current_speed + next_motion[:, :, 0] * dt_chunk_b[:, None])
+            prev_action = next_motion
+
+        stats = {
+            "logprob_steps": logprob_steps,
+            "logprob_sum": jnp.sum(logprob_steps, axis=1),
+            "entropy_steps": entropy_steps,
+            "entropy_mean": jnp.mean(entropy_steps, axis=1) if int(horizon_steps) > 0 else jnp.zeros((int(k),), dtype=jnp.float32),
+            "feasibility_mask_rate_steps": mask_rate_steps,
+            "feasibility_mask_rate": jnp.mean(mask_rate_steps, axis=1) if int(horizon_steps) > 0 else jnp.zeros((int(k),), dtype=jnp.float32),
+        }
+        if kl_steps is not None:
+            stats["kl_steps"] = kl_steps
+            stats["kl_mean"] = jnp.mean(kl_steps) if int(horizon_steps) > 0 else jnp.asarray(0.0, dtype=jnp.float32)
+        return stats
 
     def _build_teacher_forced_inputs(self, batch: PolicyRolloutData) -> Dict[str, jnp.ndarray]:
         tokens = np.asarray(batch.token_ids, dtype=np.int32)
@@ -531,25 +709,18 @@ class NNXPolicyBackend:
         last_metrics: Dict[str, float] = {}
         for _ in range(max(1, int(self.cfg.ppo_epochs))):
             def loss_fn(model: NNXBidirectionalMotionTransformer) -> tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-                logits = model(**inputs).astype(jnp.float32)
-                ego_logits = logits[:, :, 0, :]
-                ego_tokens = tokens[:, :, 0]
-                log_probs = jax.nn.log_softmax(ego_logits, axis=-1)
-                probs = jnp.exp(log_probs)
-                new_logprob = jnp.sum(
-                    jnp.take_along_axis(log_probs, ego_tokens[..., None], axis=-1).squeeze(-1),
-                    axis=1,
+                stats = self._recompute_rollout_stats(
+                    model=model,
+                    batch=batch,
+                    reference_model=self.reference_model,
                 )
+                new_logprob = stats["logprob_sum"]
                 ratio = jnp.exp(new_logprob - old_logprob)
                 unclipped = ratio * adv
                 clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
                 surrogate = jnp.mean(jnp.minimum(unclipped, clipped))
-                entropy = jnp.mean(-jnp.sum(probs * log_probs, axis=-1))
-
-                ref_logits = self.reference_model(**inputs).astype(jnp.float32)
-                ref_ego_logits = ref_logits[:, :, 0, :]
-                ref_log_probs = jax.nn.log_softmax(ref_ego_logits, axis=-1)
-                kl_ref = jnp.mean(jnp.sum(probs * (log_probs - ref_log_probs), axis=-1))
+                entropy = jnp.mean(stats["entropy_steps"])
+                kl_ref = stats.get("kl_mean", jnp.asarray(0.0, dtype=jnp.float32))
 
                 loss = -(surrogate + float(alpha) * entropy - kl_beta * kl_ref)
                 clip_fraction = jnp.mean((jnp.abs(ratio - 1.0) > clip_eps).astype(jnp.float32))

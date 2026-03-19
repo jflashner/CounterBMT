@@ -6,6 +6,7 @@ import numpy as np
 
 from counter_bmt_v2.config import RewardConfig
 from counter_bmt_v2.contracts import JudgeResult, RewardBreakdown, TrajectoryRollout
+from counter_bmt_v2.rl.behavior_embedding import extract_rollout_risk_features
 
 
 def _estimate_realism(rollout: TrajectoryRollout) -> float:
@@ -22,8 +23,13 @@ def _estimate_realism(rollout: TrajectoryRollout) -> float:
 
 
 def _estimate_safety(rollout: TrajectoryRollout) -> float:
-    # Placeholder: neutral safety prior until collision checks are integrated.
-    return 0.8
+    risk_features = rollout.metadata.get("risk_features")
+    if not isinstance(risk_features, dict):
+        risk_features = extract_rollout_risk_features(rollout)
+    collision_risk = float(risk_features.get("collision_risk_proxy", 0.5))
+    rule_violation = float(risk_features.get("rule_violation_proxy", 0.0))
+    safety = 1.0 - (0.75 * collision_risk + 0.25 * rule_violation)
+    return float(np.clip(safety, 0.0, 1.0))
 
 
 def compose_reward(judge: JudgeResult, rollout: TrajectoryRollout, cfg: RewardConfig) -> RewardBreakdown:

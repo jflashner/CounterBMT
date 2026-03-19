@@ -24,6 +24,7 @@ from counter_bmt_v2.causal.dag_contract import (
 from counter_bmt_v2.causal.dag import DAGBuilder, SimpleDAGBuilder
 from counter_bmt_v2.contracts import BayesianDAG, DAGEdge, DAGNode, ScenarioInput, VLMFeatures
 from counter_bmt_v2.llm import OpenAIChatClient
+from counter_bmt_v2.runtime_guards import coalesce_debug_fallbacks
 from counter_bmt_v2.training.dag_cache_schema import schema_version_for_contract
 
 logger = logging.getLogger(__name__)
@@ -135,32 +136,49 @@ def _normalize_cpt_rows(cpt: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str,
 
 @dataclass
 class PromptBNDAGBuilder(DAGBuilder):
-    model: str = "gpt-4o"
+    model: str = "gpt-5-mini"
     api_key: Optional[str] = None
     max_retries: int = 4
-    use_simple_fallback: bool = True
+    allow_debug_fallbacks: bool = False
+    use_simple_fallback: bool | None = None
     dag_contract: str = "maneuver_outcome_v1"
     dag_contract_mode: str = "hard"
 
     def __post_init__(self) -> None:
         self._fallback = SimpleDAGBuilder()
+        self._allow_debug_fallbacks = coalesce_debug_fallbacks(
+            allow_debug_fallbacks=bool(self.allow_debug_fallbacks),
+            legacy_fallback_flag=self.use_simple_fallback,
+        )
         self._client: Optional[OpenAIChatClient] = None
         try:
             self._client = OpenAIChatClient(model=self.model, api_key=self.api_key)
         except Exception as exc:
-            if not self.use_simple_fallback:
-                raise
-            logger.warning("PromptBNDAGBuilder fallback to simple DAG: %s", exc)
+            if not self._allow_debug_fallbacks:
+                raise RuntimeError(
+                    f"PromptBN DAG initialization failed for model={self.model!r}"
+                ) from exc
+            logger.warning("PromptBN DAG fallback to simple DAG: %s", exc)
 
     def build(self, scene: ScenarioInput, features: VLMFeatures) -> BayesianDAG:
         if self._client is None:
+            if not self._allow_debug_fallbacks:
+                raise RuntimeError(
+                    f"PromptBN DAG client unavailable for scene={scene.scenario_id} model={self.model!r}"
+                )
             return self._fallback.build(scene, features)
 
         variables = self._build_variable_schema(scene, features)
         prompt = self._build_prompt(scene, variables)
+        last_exc: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
-            raw = self._client.complete(prompt=prompt, images_base64=None, temperature=0.1, max_tokens=2500)
+            try:
+                raw = self._client.complete(prompt=prompt, images_base64=None, temperature=0.1, max_tokens=2500)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("PromptBN DAG call failed on attempt %d/%d: %s", attempt, self.max_retries, exc)
+                continue
             parsed = _extract_json_object(raw)
 
             ok, dag = self._parse_and_validate(scene, variables, parsed)
@@ -248,9 +266,16 @@ class PromptBNDAGBuilder(DAGBuilder):
 
             logger.warning("PromptBN DAG output invalid on attempt %d/%d", attempt, self.max_retries)
 
-        if self.use_simple_fallback:
+        if self._allow_debug_fallbacks:
             return self._fallback.build(scene, features)
-        raise RuntimeError("PromptBNDAGBuilder failed to produce a valid DAG within retry budget")
+        if last_exc is not None:
+            raise RuntimeError(
+                f"PromptBNDAGBuilder failed for scene={scene.scenario_id} model={self.model!r}"
+            ) from last_exc
+        raise RuntimeError(
+            f"PromptBNDAGBuilder failed to produce a valid DAG within retry budget "
+            f"for scene={scene.scenario_id} model={self.model!r}"
+        )
 
     def _build_variable_schema(self, scene: ScenarioInput, features: VLMFeatures) -> List[Dict[str, Any]]:
         vars_out: List[Dict[str, Any]] = []

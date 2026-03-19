@@ -17,11 +17,13 @@ import numpy as np
 from counter_bmt_v2.config import VLMAlignmentConfig
 from counter_bmt_v2.contracts import BayesianDAG, Intervention, ScenarioInput, TrajectoryRollout
 from counter_bmt_v2.llm import OpenAIChatClient
+from counter_bmt_v2.runtime_guards import normalize_openai_backend
 
-from .vlm_alignment_evidence import build_alignment_evidence_bundle
+from .vlm_alignment_evidence import build_alignment_cache_context, build_alignment_evidence_bundle
 from .vlm_alignment_prompt import build_alignment_prompt, parse_alignment_response
 
 logger = logging.getLogger(__name__)
+_ALIGNMENT_CACHE_VERSION = "vlm_alignment_cache_v2_full_dag_assignment"
 
 
 @dataclass
@@ -32,20 +34,23 @@ class AlignmentBatchResult:
 
 
 class VLMAlignmentVerifier:
-    """Scores rollout DAG-conformance with GPT-4o under a strict cost budget."""
+    """Scores rollout DAG-conformance with an OpenAI VLM under a strict cost budget."""
 
     def __init__(
         self,
         *,
         cfg: VLMAlignmentConfig,
         output_dir: str | Path,
+        allow_debug_fallbacks: bool = False,
     ) -> None:
         self.cfg = cfg
+        self.cfg.backend = normalize_openai_backend(str(self.cfg.backend), field_name="vlm_alignment_backend")  # type: ignore[assignment]
         self.output_dir = Path(output_dir)
         self.cache_dir = Path(str(cfg.cache_dir))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._allow_debug_fallbacks = bool(allow_debug_fallbacks)
         self._client: Optional[OpenAIChatClient] = None
-        if str(cfg.backend) == "gpt4o":
+        if bool(cfg.enabled) and str(cfg.source_mode) == "vlm_replace" and str(cfg.backend) == "openai":
             try:
                 self._client = OpenAIChatClient(
                     model=str(cfg.model),
@@ -53,7 +58,11 @@ class VLMAlignmentVerifier:
                     timeout_s=float(cfg.per_call_timeout_s),
                 )
             except Exception as exc:
-                logger.warning("VLM alignment verifier disabled (OpenAI init failed): %s", exc)
+                if not self._allow_debug_fallbacks:
+                    raise RuntimeError(
+                        f"VLM alignment initialization failed for model={cfg.model!r}"
+                    ) from exc
+                logger.warning("VLM alignment verifier falling back to mock scorer: %s", exc)
                 self._client = None
 
     def _hash_u64(self, text: str) -> int:
@@ -73,18 +82,20 @@ class VLMAlignmentVerifier:
         *,
         scenario_id: str,
         rollout: TrajectoryRollout,
-        dag_text: str,
-        intervention_text: str,
+        cache_context: Dict[str, object],
     ) -> str:
         payload = {
+            "cache_version": _ALIGNMENT_CACHE_VERSION,
             "scenario_id": str(scenario_id),
+            "backend": str(self.cfg.backend),
             "prompt_version": str(self.cfg.prompt_version),
             "model": str(self.cfg.model),
+            "num_frames": int(self.cfg.num_frames),
+            "max_agents_render": int(self.cfg.max_agents_render),
             "rollout_hash": self._rollout_hash(rollout),
-            "dag_hash": hashlib.sha256(dag_text.encode("utf-8")).hexdigest(),
-            "intervention_text": str(intervention_text),
+            "cache_context": cache_context,
         }
-        src = json.dumps(payload, sort_keys=True)
+        src = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(src.encode("utf-8")).hexdigest()
 
     def _cache_path(self, key: str) -> Path:
@@ -202,24 +213,52 @@ class VLMAlignmentVerifier:
                 "reason": "mock_alignment_score",
             }
 
-        raw = self._client.complete(
-            prompt=prompt,
-            images_base64=self._encode_images(frame_paths),
-            temperature=0.1,
-            max_tokens=800,
-        )
+        try:
+            raw = self._client.complete(
+                prompt=prompt,
+                images_base64=self._encode_images(frame_paths),
+                temperature=0.1,
+                max_tokens=800,
+            )
+        except Exception as exc:
+            if not self._allow_debug_fallbacks:
+                raise RuntimeError(
+                    f"VLM alignment OpenAI call failed for scene={scenario.scenario_id} "
+                    f"rollout_index={rollout_index} model={self.cfg.model!r}"
+                ) from exc
+            score = self._mock_score(rollout, scenario)
+            return score, {
+                "backend": "mock",
+                "rollout_index": int(rollout_index),
+                "latency_ms": 1000.0 * (time.perf_counter() - t0),
+                "conformance_score": float(score),
+                "confidence": 0.5,
+                "matched_factors": [],
+                "violations": [],
+                "reason": "mock_alignment_fallback_api_error",
+            }
         parsed = parse_alignment_response(raw)
         if bool(self.cfg.save_evidence_artifacts):
             (evidence_dir / "response_raw.txt").write_text(str(raw), encoding="utf-8")
         if parsed is None:
-            return None, {
-                "backend": "gpt4o",
+            if not self._allow_debug_fallbacks:
+                raise RuntimeError(
+                    f"VLM alignment returned an invalid response for scene={scenario.scenario_id} "
+                    f"rollout_index={rollout_index} model={self.cfg.model!r}"
+                )
+            score = self._mock_score(rollout, scenario)
+            return score, {
+                "backend": "mock",
                 "rollout_index": int(rollout_index),
                 "latency_ms": 1000.0 * (time.perf_counter() - t0),
-                "error": "invalid_response",
+                "conformance_score": float(score),
+                "confidence": 0.5,
+                "matched_factors": [],
+                "violations": [],
+                "reason": "mock_alignment_fallback_parse_error",
             }
         payload = {
-            "backend": "gpt4o",
+            "backend": "openai",
             "rollout_index": int(rollout_index),
             "latency_ms": 1000.0 * (time.perf_counter() - t0),
             "conformance_score": float(parsed.score),
@@ -271,22 +310,17 @@ class VLMAlignmentVerifier:
         else:
             step_dir = self.output_dir / ".tmp_vlm_alignment" / f"scenario_{scenario.scenario_id}"
         step_dir.mkdir(parents=True, exist_ok=True)
-        intervention_text = f"{intervention.variable}={intervention.value}"
-        dag_text = "\n".join(
-            [
-                f"nodes={len(dag.nodes)} edges={len(dag.edges)}",
-                *[f"{e.parent_id}->{e.child_id}" for e in dag.edges[:50]],
-            ]
-        )
+        cache_context = build_alignment_cache_context(dag, intervention)
 
+        cache_keys: Dict[int, str] = {}
         pending: List[int] = []
         for i in selected:
             key = self._cache_key(
                 scenario_id=str(scenario.scenario_id),
                 rollout=rollouts[i],
-                dag_text=dag_text,
-                intervention_text=intervention_text,
+                cache_context=cache_context,
             )
+            cache_keys[int(i)] = key
             cached = self._load_cached_score(key)
             if cached is not None:
                 scores[i] = float(cached)
@@ -329,6 +363,11 @@ class VLMAlignmentVerifier:
                         except Exception as exc:
                             diagnostics["errors"] += 1.0
                             logger.debug("VLM alignment call failed for rollout %d: %s", i, exc)
+                            if not self._allow_debug_fallbacks:
+                                raise RuntimeError(
+                                    f"VLM alignment scoring failed for scene={scenario.scenario_id} "
+                                    f"rollout_index={i}"
+                                ) from exc
                             continue
                         latency = float(payload.get("latency_ms", 0.0))
                         if np.isfinite(latency) and latency > 0.0:
@@ -340,19 +379,15 @@ class VLMAlignmentVerifier:
                         scores[i] = score
                         scored_mask[i] = True
                         diagnostics["calls_success"] += 1.0
-                        key = self._cache_key(
-                            scenario_id=str(scenario.scenario_id),
-                            rollout=rollouts[i],
-                            dag_text=dag_text,
-                            intervention_text=intervention_text,
-                        )
                         self._save_cache(
-                            key=key,
+                            key=cache_keys[i],
                             score=score,
                             payload={
+                                "cache_version": _ALIGNMENT_CACHE_VERSION,
                                 "scenario_id": str(scenario.scenario_id),
                                 "step": int(step),
                                 "rollout_index": int(i),
+                                "cache_context": cache_context,
                                 "payload": payload,
                             },
                         )

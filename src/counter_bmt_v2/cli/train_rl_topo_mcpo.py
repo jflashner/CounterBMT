@@ -30,6 +30,7 @@ from counter_bmt_v2.rl import (
     grpo_update,
     summarize_reward_breakdown,
 )
+from counter_bmt_v2.runtime_guards import collect_debug_violations, normalize_openai_backend, require_debug_fallbacks
 from counter_bmt_v2.training.dag_sources import DAGSourceResolver
 
 
@@ -113,12 +114,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--w-novelty", type=float, default=0.05)
     p.add_argument("--w-consensus", type=float, default=0.10)
 
-    p.add_argument("--alignment-source-mode", type=str, default="judge", choices=["judge", "vlm_replace"])
+    p.add_argument("--alignment-source-mode", type=str, default="vlm_replace", choices=["judge", "vlm_replace"])
     p.add_argument("--vlm-alignment-enabled", action="store_true")
     p.add_argument("--no-vlm-alignment-enabled", dest="vlm_alignment_enabled", action="store_false")
-    p.set_defaults(vlm_alignment_enabled=False)
-    p.add_argument("--vlm-alignment-backend", type=str, default="gpt4o", choices=["gpt4o", "mock"])
-    p.add_argument("--vlm-alignment-model", type=str, default="gpt-4o")
+    p.set_defaults(vlm_alignment_enabled=True)
+    p.add_argument("--vlm-alignment-backend", type=str, default="openai", choices=["openai", "gpt4o", "mock"])
+    p.add_argument("--vlm-alignment-model", type=str, default="gpt-5-mini")
     p.add_argument("--vlm-alignment-api-key", type=str, default=None)
     p.add_argument("--vlm-alignment-sample-rate", type=float, default=0.15)
     p.add_argument("--vlm-alignment-every-n-steps", type=int, default=5)
@@ -155,18 +156,50 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--enable-feasibility-mask", action="store_true")
     p.add_argument("--no-enable-feasibility-mask", dest="enable_feasibility_mask", action="store_false")
     p.set_defaults(enable_feasibility_mask=True)
+    p.add_argument("--store-rollout-traces", action="store_true")
+    p.add_argument("--no-store-rollout-traces", dest="store_rollout_traces", action="store_false")
+    p.set_defaults(store_rollout_traces=False)
 
-    p.add_argument("--perception-backend", type=str, default="mock", choices=["mock", "gpt4o"])
-    p.add_argument("--dag-backend", type=str, default="simple", choices=["simple", "promptbn"])
-    p.add_argument("--llm-model", type=str, default="gpt-4o")
+    p.add_argument("--perception-backend", type=str, default="openai", choices=["mock", "openai", "gpt4o"])
+    p.add_argument("--dag-backend", type=str, default="promptbn", choices=["simple", "promptbn"])
+    p.add_argument("--llm-model", type=str, default="gpt-5-mini")
     p.add_argument("--api-key", type=str, default=None)
     p.add_argument("--dag-retries", type=int, default=4)
+    p.add_argument("--allow-debug-fallbacks", action="store_true")
+    p.add_argument("--no-allow-debug-fallbacks", dest="allow_debug_fallbacks", action="store_false")
+    p.set_defaults(allow_debug_fallbacks=False)
     return p
+
+
+def _validate_runtime_args(args: argparse.Namespace) -> None:
+    args.perception_backend = normalize_openai_backend(
+        str(args.perception_backend),
+        field_name="perception_backend",
+    )
+    args.vlm_alignment_backend = normalize_openai_backend(
+        str(args.vlm_alignment_backend),
+        field_name="vlm_alignment_backend",
+    )
+    violations = collect_debug_violations(
+        [
+            ("policy_backend", str(args.policy_backend), str(args.policy_backend) == "scaffold"),
+            ("alignment_source_mode", str(args.alignment_source_mode), str(args.alignment_source_mode) == "judge"),
+            ("vlm_alignment_backend", str(args.vlm_alignment_backend), str(args.vlm_alignment_backend) == "mock"),
+            ("perception_backend", str(args.perception_backend), str(args.perception_backend) == "mock"),
+            ("dag_backend", str(args.dag_backend), str(args.dag_backend) == "simple"),
+            ("vlm_alignment_enabled", "false", not bool(args.vlm_alignment_enabled)),
+        ]
+    )
+    require_debug_fallbacks(
+        allow_debug_fallbacks=bool(args.allow_debug_fallbacks),
+        violations=violations,
+    )
 
 
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
+    _validate_runtime_args(args)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +207,7 @@ def main() -> int:
     run_config_path = out_dir / "run_config.json"
 
     cfg = PipelineConfig()
+    cfg.allow_debug_fallbacks = bool(args.allow_debug_fallbacks)
     cfg.reward.w_alignment = float(args.w_alignment)
     cfg.reward.w_safety = float(args.w_safety)
     cfg.reward.w_realism = float(args.w_realism)
@@ -214,6 +248,7 @@ def main() -> int:
     cfg.rl.policy.feasible_max_accel_delta = float(args.feasible_max_accel_delta)
     cfg.rl.policy.feasible_max_yaw_delta = float(args.feasible_max_yaw_delta)
     cfg.rl.policy.enable_feasibility_mask = bool(args.enable_feasibility_mask)
+    cfg.rl.policy.store_rollout_traces = bool(args.store_rollout_traces)
 
     cfg.rl.vlm_alignment.enabled = bool(args.vlm_alignment_enabled)
     cfg.rl.vlm_alignment.source_mode = str(args.alignment_source_mode)  # type: ignore[assignment]
@@ -269,7 +304,11 @@ def main() -> int:
     consensus = ConsensusScorer(cfg=cfg.rl.consensus)
     thermostat = EntropyThermostat.from_config(cfg.rl.train)
     trainer = GRPOTrainer(policy_backend=policy_backend)
-    vlm_aligner = VLMAlignmentVerifier(cfg=cfg.rl.vlm_alignment, output_dir=out_dir)
+    vlm_aligner = VLMAlignmentVerifier(
+        cfg=cfg.rl.vlm_alignment,
+        output_dir=out_dir,
+        allow_debug_fallbacks=bool(cfg.allow_debug_fallbacks),
+    )
 
     loader = None
     scene_indices: Sequence[int] = []
@@ -288,6 +327,7 @@ def main() -> int:
         "resolved": {
             "scene_source": "scenarionet" if loader is not None else "demo",
             "scene_pool_size": int(len(scene_indices)) if loader is not None else 0,
+            "allow_debug_fallbacks": bool(cfg.allow_debug_fallbacks),
             "vlm_alignment": vlm_alignment_cfg,
             "policy": asdict(cfg.rl.policy),
         },
@@ -327,6 +367,8 @@ def main() -> int:
             advantages = compute_group_advantages(batch)
             grpo_stats = grpo_update(trainer, batch, advantages)
             reward_stats = summarize_reward_breakdown(batch.rewards)
+            policy_metrics = {str(k): float(v) for k, v in grpo_stats.items() if str(k).startswith("policy/")}
+            grpo_only_metrics = {f"grpo/{k}": float(v) for k, v in grpo_stats.items() if not str(k).startswith("policy/")}
 
             rec = {
                 "step": int(step),
@@ -334,7 +376,8 @@ def main() -> int:
                 "rare": bool(rare),
                 "metrics": {
                     **{f"reward/{k}": v for k, v in reward_stats.items()},
-                    **{f"grpo/{k}": float(v) for k, v in grpo_stats.items()},
+                    **grpo_only_metrics,
+                    **policy_metrics,
                     "diagnostics/entropy": float(batch.diagnostics.entropy),
                     "diagnostics/eta": float(batch.diagnostics.thermostat_eta),
                     "diagnostics/alpha": float(batch.diagnostics.thermostat_alpha),
@@ -387,8 +430,8 @@ def main() -> int:
                         h=float(m.get("diagnostics/entropy", 0.0)),
                         eta=float(m.get("diagnostics/eta", 0.0)),
                         alpha=float(m.get("diagnostics/alpha", 0.0)),
-                        pl=float(m.get("grpo/policy/loss", 0.0)),
-                        kl=float(m.get("grpo/policy/kl_ref", 0.0)),
+                        pl=float(m.get("policy/loss", 0.0)),
+                        kl=float(m.get("policy/kl_ref", 0.0)),
                     )
                 )
 

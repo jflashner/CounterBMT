@@ -512,18 +512,80 @@ Command:
 - `python -m counter_bmt_v2.cli.train_rl_topo_mcpo`
 
 What it does:
-- runs RL loop with manifold embedding (`risk_vector`, `dag_gnn`, `topology_zpi`, `hybrid`)
-- supports novelty, consensus, thermostat controls
+- runs Topo-MCPO-style RL with novelty, consensus, entropy thermostat, and reward logging
+- supports the real checkpoint-backed NNX policy path (`--policy-backend nnx_checkpoint`) plus the older scaffold backend for compatibility
+- samples full DAG assignments for the NNX path and conditions rollouts on the sampled DAG tensorization
+- supports `judge` or `vlm_replace` alignment sources
 
-Example:
+Key options:
+- policy backend:
+  - `--policy-backend {nnx_checkpoint,scaffold}`
+  - `--policy-checkpoint`
+  - `--policy-model-preset`
+  - `--policy-tokenizer-mode`
+  - `--policy-skip-steps`
+- DAG source:
+  - `--dag-source-mode {dual,cache,scene_derived}`
+  - `--dag-cache-dir`
+  - `--dag-cache-strict`
+  - `--dag-expected-schema {any,v2_compact10,v3_maneuver_outcome}`
+- optimization:
+  - `--clip-eps`
+  - `--kl-beta`
+  - `--policy-lr`
+  - `--trainable-scope {decoder_dag,all}`
+  - `--ppo-epochs`
+- sampling:
+  - `--candidate-multiplier`
+  - `--enable-feasibility-mask`
+  - `--feasible-max-speed-mps`
+  - `--feasible-max-accel-delta`
+  - `--feasible-max-yaw-delta`
+  - `--store-rollout-traces`
+- alignment:
+  - `--alignment-source-mode {judge,vlm_replace}`
+  - `--vlm-alignment-enabled`
+  - `--vlm-alignment-backend {mock,gpt4o}`
+
+Example: checkpoint-backed mock smoke
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m counter_bmt_v2.cli.train_rl_topo_mcpo \
   --data-dir data/scenarionet_waymo_training_500 \
-  --output-dir outputs/rl_topo_mcpo_dag \
-  --embedding-mode dag_gnn \
+  --output-dir outputs/rl_topo_mcpo_nnx_smoke \
+  --steps 5 \
+  --log-every 1 \
+  --group-size 4 \
+  --embedding-mode risk_vector \
+  --policy-backend nnx_checkpoint \
+  --policy-checkpoint outputs/dag_latent_stage_c/checkpoints/last.pkl \
+  --policy-model-preset midgpt_dag_latent \
+  --policy-tokenizer-mode paper_simple \
+  --policy-skip-steps 1 \
+  --dag-source-mode scene_derived
+```
+
+Example: checkpoint-backed run with DAG cache + `vlm_replace`
+
+```bash
+PYTHONPATH=src .venv/bin/python -m counter_bmt_v2.cli.train_rl_topo_mcpo \
+  --data-dir data/scenarionet_waymo_training_500 \
+  --output-dir outputs/rl_topo_mcpo_vlm \
+  --steps 200 \
   --group-size 8 \
-  --steps 200
+  --embedding-mode risk_vector \
+  --policy-backend nnx_checkpoint \
+  --policy-checkpoint outputs/dag_latent_stage_c/checkpoints/last.pkl \
+  --policy-model-preset midgpt_dag_latent \
+  --policy-tokenizer-mode paper_simple \
+  --policy-skip-steps 1 \
+  --dag-source-mode cache \
+  --dag-cache-dir outputs/dag_cache_v3_mo/cache \
+  --dag-cache-strict \
+  --dag-expected-schema v3_maneuver_outcome \
+  --alignment-source-mode vlm_replace \
+  --vlm-alignment-enabled \
+  --vlm-alignment-backend gpt4o
 ```
 
 ## 9) Vertical-Slice Pipeline Runner

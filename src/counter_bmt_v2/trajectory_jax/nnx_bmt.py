@@ -67,6 +67,12 @@ class NNXSceneEncoderConfig:
     map_feature_dim: int = 27
     traffic_light_feature_dim: int = 7
     max_scene_tokens: int = 576
+    map_encoder_style: Literal["mean_pool", "legacy_pointnet"] = "mean_pool"
+    legacy_polyline_hidden_dim: int = 64
+    legacy_polyline_num_layers: int = 2
+    legacy_polyline_num_pre_layers: int = 1
+    norm_style: Literal["rmsnorm", "layernorm"] = "rmsnorm"
+    use_post_proj_head: bool = False
 
 
 @dataclass
@@ -245,12 +251,37 @@ class BidirectionalMotionTokenizer:
 if HAS_NNX:
 
     class Linear(nnx.Module):
-        def __init__(self, d_in: int, d_out: int, *, rngs: nnx.Rngs, scale: float = 0.02):
+        def __init__(
+            self,
+            d_in: int,
+            d_out: int,
+            *,
+            rngs: nnx.Rngs,
+            scale: float = 0.02,
+            use_bias: bool = True,
+        ):
             self.w = nnx.Param(jax.random.normal(rngs.params(), (d_in, d_out)) * scale)
-            self.b = nnx.Param(jnp.zeros((d_out,), dtype=jnp.float32))
+            self.use_bias = bool(use_bias)
+            self.b = nnx.Param(jnp.zeros((d_out,), dtype=jnp.float32)) if self.use_bias else None
 
         def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-            return jnp.einsum("...d,df->...f", x, self.w.value) + self.b.value
+            out = jnp.einsum("...d,df->...f", x, self.w.value)
+            if self.use_bias and self.b is not None:
+                out = out + self.b.value
+            return out
+
+
+    class LayerNorm(nnx.Module):
+        def __init__(self, d_model: int, *, eps: float = 1e-5):
+            self.scale = nnx.Param(jnp.ones((d_model,), dtype=jnp.float32))
+            self.bias = nnx.Param(jnp.zeros((d_model,), dtype=jnp.float32))
+            self.eps = eps
+
+        def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+            mean = jnp.mean(x, axis=-1, keepdims=True)
+            var = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
+            normed = (x - mean) / jnp.sqrt(var + self.eps)
+            return normed * self.scale.value + self.bias.value
 
 
     class RMSNorm(nnx.Module):
@@ -263,6 +294,137 @@ if HAS_NNX:
             return (x / rms) * self.scale.value
 
 
+    class LegacyMLPBlock(nnx.Module):
+        def __init__(
+            self,
+            d_in: int,
+            d_out: int,
+            *,
+            rngs: nnx.Rngs,
+            ret_before_act: bool = False,
+            without_norm: bool = False,
+        ):
+            if ret_before_act:
+                self.linear = Linear(d_in, d_out, rngs=rngs, use_bias=True)
+                self.norm = None
+                self.apply_relu = False
+            elif without_norm:
+                self.linear = Linear(d_in, d_out, rngs=rngs, use_bias=True)
+                self.norm = None
+                self.apply_relu = True
+            else:
+                self.linear = Linear(d_in, d_out, rngs=rngs, use_bias=False)
+                self.norm = LayerNorm(d_out)
+                self.apply_relu = True
+
+        def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+            out = self.linear(x)
+            if self.norm is not None:
+                out = self.norm(out)
+            if self.apply_relu:
+                out = jax.nn.relu(out)
+            return out
+
+
+    class LegacyMLP(nnx.Module):
+        """NNX port of legacy `build_mlps` used by Adv-BMT scene encoding."""
+
+        def __init__(
+            self,
+            c_in: int,
+            mlp_channels: Tuple[int, ...],
+            *,
+            rngs: nnx.Rngs,
+            ret_before_act: bool = False,
+            without_norm: bool = False,
+        ):
+            blocks = []
+            cur_in = int(c_in)
+            num_layers = len(mlp_channels)
+            for idx, c_out in enumerate(mlp_channels):
+                is_last = idx + 1 == num_layers
+                blocks.append(
+                    LegacyMLPBlock(
+                        cur_in,
+                        int(c_out),
+                        rngs=rngs,
+                        ret_before_act=bool(is_last and ret_before_act),
+                        without_norm=bool(without_norm and not (is_last and ret_before_act)),
+                    )
+                )
+                cur_in = int(c_out)
+            self.blocks = tuple(blocks)
+
+        def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+            out = x
+            for block in self.blocks:
+                out = block(out)
+            return out
+
+
+    class LegacyPointNetPolylineEncoder(nnx.Module):
+        """NNX port of Adv-BMT's PointNetPolylineEncoder."""
+
+        def __init__(
+            self,
+            *,
+            in_channels: int,
+            hidden_dim: int,
+            num_layers: int,
+            num_pre_layers: int,
+            out_channels: Optional[int],
+            rngs: nnx.Rngs,
+        ):
+            self.pre_mlps = LegacyMLP(
+                int(in_channels),
+                tuple([int(hidden_dim)] * int(num_pre_layers)),
+                rngs=rngs,
+                ret_before_act=False,
+                without_norm=False,
+            )
+            self.mlps = LegacyMLP(
+                int(hidden_dim) * 2,
+                tuple([int(hidden_dim)] * max(0, int(num_layers) - int(num_pre_layers))),
+                rngs=rngs,
+                ret_before_act=False,
+                without_norm=False,
+            )
+            self.out_mlps = (
+                LegacyMLP(
+                    int(hidden_dim),
+                    (int(hidden_dim), int(out_channels)),
+                    rngs=rngs,
+                    ret_before_act=True,
+                    without_norm=True,
+                )
+                if out_channels is not None
+                else None
+            )
+
+        @staticmethod
+        def _mask_points(x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+            return jnp.where(mask[..., None], x, jnp.zeros_like(x))
+
+        def __call__(self, polylines: jnp.ndarray, polylines_mask: jnp.ndarray) -> jnp.ndarray:
+            point_feat = self.pre_mlps(polylines)
+            point_feat = self._mask_points(point_feat, polylines_mask.astype(bool))
+
+            pooled_feature = jnp.max(point_feat, axis=2)
+            pooled_expanded = jnp.repeat(pooled_feature[:, :, None, :], point_feat.shape[2], axis=2)
+            point_feat = jnp.concatenate([point_feat, pooled_expanded], axis=-1)
+
+            point_feat = self.mlps(point_feat)
+            point_feat = self._mask_points(point_feat, polylines_mask.astype(bool))
+
+            polyline_feat = jnp.max(point_feat, axis=2)
+            valid_mask = jnp.any(polylines_mask.astype(bool), axis=-1)
+
+            if self.out_mlps is not None:
+                polyline_feat = self.out_mlps(polyline_feat)
+            polyline_feat = jnp.where(valid_mask[..., None], polyline_feat, jnp.zeros_like(polyline_feat))
+            return polyline_feat
+
+
     class SceneRelationSelfAttentionBlock(nnx.Module):
         """Scene self-attention block with legacy-style simple relation terms."""
 
@@ -273,9 +435,12 @@ if HAS_NNX:
             if self.d_model % self.n_heads != 0:
                 raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
             self.head_dim = self.d_model // self.n_heads
+            self.norm_style = str(cfg.scene_encoder.norm_style)
 
-            self.token_norm = RMSNorm(self.d_model)
-            self.rel_norm = None if cfg.relation.remove_rel_norm else RMSNorm(rel_dim)
+            self.token_norm = LayerNorm(self.d_model) if self.norm_style == "layernorm" else RMSNorm(self.d_model)
+            self.rel_norm = None
+            if not cfg.relation.remove_rel_norm:
+                self.rel_norm = LayerNorm(rel_dim) if self.norm_style == "layernorm" else RMSNorm(rel_dim)
 
             self.q_proj = Linear(self.d_model, self.d_model, rngs=rngs)
             self.k_proj = Linear(self.d_model, self.d_model, rngs=rngs)
@@ -286,7 +451,7 @@ if HAS_NNX:
             self.o_proj = Linear(self.d_model, self.d_model, rngs=rngs)
 
             ff_hidden = self.d_model * int(cfg.ff_mult)
-            self.ff_norm = RMSNorm(self.d_model)
+            self.ff_norm = LayerNorm(self.d_model) if self.norm_style == "layernorm" else RMSNorm(self.d_model)
             self.ff_in = Linear(self.d_model, ff_hidden, rngs=rngs)
             self.ff_out = Linear(ff_hidden, self.d_model, rngs=rngs)
 
@@ -355,7 +520,8 @@ if HAS_NNX:
             out = jnp.transpose(out, (0, 2, 1, 3)).reshape(bsz, s_len, self.d_model)
             scene_tokens = scene_tokens + self.o_proj(out)
 
-            ff = self.ff_out(jax.nn.gelu(self.ff_in(self.ff_norm(scene_tokens))))
+            ff_hidden = self.ff_in(self.ff_norm(scene_tokens))
+            ff = self.ff_out(jax.nn.gelu(ff_hidden, approximate=True))
             scene_tokens = scene_tokens + ff
             return scene_tokens
 
@@ -366,11 +532,54 @@ if HAS_NNX:
         def __init__(self, cfg: NNXBMTConfig, *, rngs: nnx.Rngs):
             self.cfg = cfg
             d_model = int(cfg.d_model)
-            self.map_vector_proj = Linear(cfg.scene_encoder.map_feature_dim, d_model, rngs=rngs)
-            self.map_token_proj = Linear(d_model, d_model, rngs=rngs)
-            self.traffic_light_proj = Linear(cfg.scene_encoder.traffic_light_feature_dim, d_model, rngs=rngs)
+            self.map_encoder_style = str(cfg.scene_encoder.map_encoder_style)
+            self.norm_style = str(cfg.scene_encoder.norm_style)
+            # Adv-BMT hard-codes 11 scene-history steps for traffic-light context.
+            self.history_steps = 11
+            if self.map_encoder_style == "legacy_pointnet":
+                self.map_vector_proj = None
+                self.map_token_proj = None
+                self.map_polyline_encoder = LegacyPointNetPolylineEncoder(
+                    in_channels=int(cfg.scene_encoder.map_feature_dim),
+                    hidden_dim=int(cfg.scene_encoder.legacy_polyline_hidden_dim),
+                    num_layers=int(cfg.scene_encoder.legacy_polyline_num_layers),
+                    num_pre_layers=int(cfg.scene_encoder.legacy_polyline_num_pre_layers),
+                    out_channels=d_model,
+                    rngs=rngs,
+                )
+            else:
+                self.map_vector_proj = Linear(cfg.scene_encoder.map_feature_dim, d_model, rngs=rngs)
+                self.map_token_proj = Linear(d_model, d_model, rngs=rngs)
+                self.map_polyline_encoder = None
             self.position_proj = Linear(3, d_model, rngs=rngs)
-            self.out_norm = RMSNorm(d_model)
+            if bool(cfg.relation.remove_traffic_light_state):
+                # Legacy MidGPT consumes one pre-collapsed 7-D traffic-light feature
+                # per token. Those 7 dimensions already contain the stop-point xyz, so
+                # we must not add a second learned position embedding here.
+                self.light_mlps = LegacyMLP(
+                    int(cfg.scene_encoder.traffic_light_feature_dim),
+                    (d_model,),
+                    rngs=rngs,
+                    ret_before_act=True,
+                    without_norm=False,
+                )
+            else:
+                # The non-collapsed legacy path flattens 11 history steps of 7-D light
+                # state/features and runs a 3-layer MLP.
+                self.light_mlps = LegacyMLP(
+                    int(cfg.scene_encoder.traffic_light_feature_dim) * self.history_steps,
+                    (d_model, d_model, d_model),
+                    rngs=rngs,
+                    ret_before_act=True,
+                    without_norm=False,
+                )
+            self.out_norm = LayerNorm(d_model) if self.norm_style == "layernorm" else RMSNorm(d_model)
+            self.post_norm = (
+                LayerNorm(d_model) if bool(cfg.scene_encoder.use_post_proj_head) else None
+            )
+            self.post_proj = (
+                Linear(d_model, d_model, rngs=rngs) if bool(cfg.scene_encoder.use_post_proj_head) else None
+            )
 
             self.relation_enabled = bool(cfg.relation.enabled)
             if self.relation_enabled:
@@ -407,19 +616,20 @@ if HAS_NNX:
             map_feature_valid_mask: jnp.ndarray,  # [B,M,V] bool
             map_position: jnp.ndarray,  # [B,M,3]
         ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-            bsz, n_map, n_vec, feat_dim = map_feature.shape
-            map_vec = self.map_vector_proj(map_feature.reshape(-1, feat_dim)).reshape(
-                bsz, n_map, n_vec, self.cfg.d_model
-            )
-            valid = map_feature_valid_mask.astype(jnp.float32)[..., None]
-            num = jnp.sum(map_vec * valid, axis=2)
-            den = jnp.maximum(1.0, jnp.sum(valid, axis=2))
-            pooled = num / den
-
-            pos_e = self.position_proj(map_position.reshape(-1, 3)).reshape(bsz, n_map, self.cfg.d_model)
-            map_tokens = self.map_token_proj(pooled + pos_e)
-
             map_token_mask = jnp.any(map_feature_valid_mask, axis=-1)
+            if self.map_encoder_style == "legacy_pointnet":
+                map_tokens = self.map_polyline_encoder(map_feature, map_feature_valid_mask.astype(bool))
+            else:
+                bsz, n_map, n_vec, feat_dim = map_feature.shape
+                map_vec = self.map_vector_proj(map_feature.reshape(-1, feat_dim)).reshape(
+                    bsz, n_map, n_vec, self.cfg.d_model
+                )
+                valid = map_feature_valid_mask.astype(jnp.float32)[..., None]
+                num = jnp.sum(map_vec * valid, axis=2)
+                den = jnp.maximum(1.0, jnp.sum(valid, axis=2))
+                pooled = num / den
+                pos_e = self.position_proj(map_position.reshape(-1, 3)).reshape(bsz, n_map, self.cfg.d_model)
+                map_tokens = self.map_token_proj(pooled + pos_e)
             map_tokens = jnp.where(map_token_mask[..., None], map_tokens, jnp.zeros_like(map_tokens))
 
             # Adv-BMT map heading is derived from polyline segment headings.
@@ -439,18 +649,22 @@ if HAS_NNX:
             if traffic_light_feature.ndim == 4:
                 # [B,T,L,7]
                 if remove_tl_state:
-                    # MidGPT parity: represent one static state per light using majority vote.
+                    # Legacy preprocessing collapses each light to a single 7-D feature:
+                    # [stop_point_xyz, one_hot(light_state)] using the majority state.
                     light_mask = jnp.any(traffic_light_valid_mask, axis=1)
                     valid = traffic_light_valid_mask.astype(jnp.float32)
+                    pos_num = jnp.sum(traffic_light_feature[..., :3] * valid[..., None], axis=1)
+                    pos_den = jnp.maximum(1.0, jnp.sum(valid[..., None], axis=1))
+                    stop_point = pos_num / pos_den
                     state_scores = jnp.sum(traffic_light_feature[..., 3:7] * valid[..., None], axis=1)
                     cls = jnp.argmax(state_scores, axis=-1)
                     onehot = jax.nn.one_hot(cls, 4, dtype=jnp.float32)
-                    light_feat = jnp.concatenate([traffic_light_position, onehot], axis=-1)
+                    light_feat = jnp.concatenate([stop_point, onehot], axis=-1)
                 else:
-                    valid = traffic_light_valid_mask.astype(jnp.float32)
-                    num = jnp.sum(traffic_light_feature * valid[..., None], axis=1)
-                    den = jnp.maximum(1.0, jnp.sum(valid[..., None], axis=1))
-                    light_feat = num / den
+                    valid = traffic_light_valid_mask[:, : self.history_steps].astype(jnp.float32)
+                    feature = traffic_light_feature[:, : self.history_steps] * valid[..., None]
+                    feature = jnp.transpose(feature, (0, 2, 1, 3))
+                    light_feat = feature.reshape(feature.shape[0], feature.shape[1], -1)
                     light_mask = jnp.any(traffic_light_valid_mask, axis=1)
             else:
                 # [B,L,7]
@@ -458,13 +672,9 @@ if HAS_NNX:
                 light_mask = traffic_light_valid_mask
 
             bsz, n_light, feat_dim = light_feat.shape
-            light_tokens = self.traffic_light_proj(light_feat.reshape(-1, feat_dim)).reshape(
+            light_tokens = self.light_mlps(light_feat.reshape(-1, feat_dim)).reshape(
                 bsz, n_light, self.cfg.d_model
             )
-            pos_e = self.position_proj(traffic_light_position.reshape(-1, 3)).reshape(
-                bsz, n_light, self.cfg.d_model
-            )
-            light_tokens = light_tokens + pos_e
             light_tokens = jnp.where(light_mask[..., None], light_tokens, jnp.zeros_like(light_tokens))
             light_heading = jnp.full(
                 (bsz, n_light),
@@ -554,6 +764,9 @@ if HAS_NNX:
                         debug_meta["scene_s2s_indices"] = rel_indices
 
             scene_tokens = self.out_norm(scene_tokens)
+            if self.post_norm is not None and self.post_proj is not None:
+                scene_tokens = self.post_proj(self.post_norm(scene_tokens))
+                scene_tokens = jnp.where(scene_mask[..., None], scene_tokens, jnp.zeros_like(scene_tokens))
             if return_metadata:
                 return scene_tokens, scene_mask, scene_position, debug_meta
             return scene_tokens, scene_mask, scene_position
@@ -596,6 +809,90 @@ if HAS_NNX:
                 self.rel_k_proj = None
                 self.rel_v_proj = None
 
+        @staticmethod
+        def _gather_kv(x: jnp.ndarray, indices: jnp.ndarray) -> jnp.ndarray:
+            """Gather [B,H,K,D] by [B,Q,R] into [B,H,Q,R,D]."""
+
+            def gather_batch(x_b: jnp.ndarray, idx_b: jnp.ndarray) -> jnp.ndarray:
+                def gather_head(x_h: jnp.ndarray) -> jnp.ndarray:
+                    return x_h[idx_b]
+
+                return jax.vmap(gather_head, in_axes=0)(x_b)
+
+            return jax.vmap(gather_batch, in_axes=(0, 0))(x, indices)
+
+        @staticmethod
+        def _gather_pairwise(x: jnp.ndarray, indices: jnp.ndarray) -> jnp.ndarray:
+            """Gather pairwise [B,Q,K,...] by [B,Q,R] into [B,Q,R,...]."""
+
+            def gather_batch(x_b: jnp.ndarray, idx_b: jnp.ndarray) -> jnp.ndarray:
+                return jax.vmap(lambda row, row_idx: row[row_idx], in_axes=(0, 0))(x_b, idx_b)
+
+            return jax.vmap(gather_batch, in_axes=(0, 0))(x, indices)
+
+        @staticmethod
+        def _full_relation_indices(*, bsz: int, q_len: int, k_len: int) -> jnp.ndarray:
+            base = jnp.arange(k_len, dtype=jnp.int32)[None, None, :]
+            return jnp.broadcast_to(base, (bsz, q_len, k_len))
+
+        @staticmethod
+        def _normalize_relation_indices(
+            rel_indices: Optional[jnp.ndarray],
+            *,
+            bsz: int,
+            q_len: int,
+            k_len: int,
+            rel_feat: Optional[jnp.ndarray],
+            mask: Optional[jnp.ndarray],
+            rel_mask: Optional[jnp.ndarray],
+        ) -> jnp.ndarray:
+            if rel_indices is not None and rel_indices.shape[-1] > 0:
+                return rel_indices.astype(jnp.int32)
+
+            for candidate, name in ((rel_feat, "rel_feat"), (mask, "mask"), (rel_mask, "rel_mask")):
+                if candidate is None:
+                    continue
+                if candidate.shape[2] != k_len:
+                    raise ValueError(
+                        f"{name} has gathered width {candidate.shape[2]} but rel_indices are missing; "
+                        f"expected full key width {k_len}"
+                    )
+
+            return MultiHeadAttention._full_relation_indices(bsz=bsz, q_len=q_len, k_len=k_len)
+
+        @staticmethod
+        def _align_pairwise_tensor(
+            tensor: Optional[jnp.ndarray],
+            *,
+            rel_indices: jnp.ndarray,
+            key_len: int,
+            kind: str,
+        ) -> Optional[jnp.ndarray]:
+            if tensor is None:
+                return None
+            if tensor.shape[2] == rel_indices.shape[2]:
+                return tensor
+            if tensor.shape[2] != key_len:
+                raise ValueError(
+                    f"{kind} width mismatch: got {tensor.shape[2]}, expected gathered width "
+                    f"{rel_indices.shape[2]} or key width {key_len}"
+                )
+            return MultiHeadAttention._gather_pairwise(tensor, rel_indices)
+
+        @staticmethod
+        def _apply_attention_mask(scores: jnp.ndarray, mask: Optional[jnp.ndarray]) -> jnp.ndarray:
+            if mask is None:
+                return scores
+            keep = mask.astype(bool)
+            any_valid = jnp.any(keep, axis=-1, keepdims=True)
+            first_slot = jax.nn.one_hot(
+                jnp.zeros(keep.shape[:2], dtype=jnp.int32),
+                keep.shape[-1],
+                dtype=jnp.bool_,
+            )
+            safe_keep = jnp.where(any_valid, keep, first_slot)
+            return jnp.where(safe_keep[:, None, :, :], scores, jnp.full_like(scores, -1e9))
+
         def __call__(
             self,
             query: jnp.ndarray,
@@ -604,6 +901,7 @@ if HAS_NNX:
             mask: Optional[jnp.ndarray] = None,   # [B,Lq,Lk] bool
             rel_feat: Optional[jnp.ndarray] = None,  # [B,Lq,Lk,R]
             rel_mask: Optional[jnp.ndarray] = None,  # [B,Lq,Lk] bool
+            rel_indices: Optional[jnp.ndarray] = None,  # [B,Lq,R] int
         ) -> jnp.ndarray:
             bsz, q_len, _ = query.shape
             _, k_len, _ = key_value.shape
@@ -616,17 +914,42 @@ if HAS_NNX:
             k = jnp.transpose(k, (0, 2, 1, 3))
             v = jnp.transpose(v, (0, 2, 1, 3))
 
+            rel_indices = self._normalize_relation_indices(
+                rel_indices,
+                bsz=bsz,
+                q_len=q_len,
+                k_len=k_len,
+                rel_feat=rel_feat,
+                mask=mask,
+                rel_mask=rel_mask,
+            )
+            k_g = self._gather_kv(k, rel_indices)
+            v_g = self._gather_kv(v, rel_indices)
+            gathered_mask = self._align_pairwise_tensor(mask, rel_indices=rel_indices, key_len=k_len, kind="mask")
+            gathered_rel_mask = self._align_pairwise_tensor(
+                rel_mask,
+                rel_indices=rel_indices,
+                key_len=k_len,
+                kind="rel_mask",
+            )
+
             scale = 1.0 / np.sqrt(float(self.head_dim))
-            scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+            scores = jnp.sum(q[:, :, :, None, :] * k_g, axis=-1) * scale
 
             rel_v = None
             if rel_feat is not None and self.relation_dim is not None:
+                rel_feat = self._align_pairwise_tensor(
+                    rel_feat,
+                    rel_indices=rel_indices,
+                    key_len=k_len,
+                    kind="rel_feat",
+                )
                 rel_in = rel_feat if self.rel_norm is None else self.rel_norm(rel_feat)
                 q_rel = self.q_rel_proj(query).reshape(bsz, q_len, self.n_heads, self.head_dim)
                 q_rel = jnp.transpose(q_rel, (0, 2, 1, 3))  # [B,H,Q,D]
 
                 rel_k = self.rel_k_proj(rel_in.reshape(-1, rel_in.shape[-1])).reshape(
-                    bsz, q_len, k_len, self.n_heads, self.head_dim
+                    bsz, q_len, rel_in.shape[2], self.n_heads, self.head_dim
                 )
                 rel_k = jnp.transpose(rel_k, (0, 3, 1, 2, 4))  # [B,H,Q,K,D]
                 score_rel = jnp.sum(q_rel[:, :, :, None, :] * rel_k, axis=-1) * scale
@@ -634,26 +957,28 @@ if HAS_NNX:
 
                 if self.add_relation_to_v:
                     rel_v = self.rel_v_proj(rel_in.reshape(-1, rel_in.shape[-1])).reshape(
-                        bsz, q_len, k_len, self.n_heads, self.head_dim
+                        bsz, q_len, rel_in.shape[2], self.n_heads, self.head_dim
                     )
                     rel_v = jnp.transpose(rel_v, (0, 3, 1, 2, 4))
                 else:
                     rel_v = rel_k
 
-            combined_mask = mask
-            if rel_mask is not None:
-                rel_mask = rel_mask.astype(bool)
-                combined_mask = rel_mask if combined_mask is None else jnp.logical_and(combined_mask, rel_mask)
-            if combined_mask is not None:
-                # mask True means keep; False means masked out.
-                scores = jnp.where(combined_mask[:, None, :, :], scores, jnp.full_like(scores, -1e9))
+            combined_mask = gathered_mask
+            if gathered_rel_mask is not None:
+                gathered_rel_mask = gathered_rel_mask.astype(bool)
+                combined_mask = (
+                    gathered_rel_mask
+                    if combined_mask is None
+                    else jnp.logical_and(combined_mask.astype(bool), gathered_rel_mask)
+                )
+            scores = self._apply_attention_mask(scores, combined_mask)
 
             attn = jax.nn.softmax(scores, axis=-1)
 
             if rel_v is None:
-                out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+                out = jnp.sum(attn[..., None] * v_g, axis=-2)
             else:
-                value = v[:, :, None, :, :] + rel_v
+                value = v_g + rel_v
                 out = jnp.sum(attn[..., None] * value, axis=-2)
 
             out = jnp.transpose(out, (0, 2, 1, 3)).reshape(bsz, q_len, self.d_model)
@@ -666,14 +991,43 @@ if HAS_NNX:
         def __init__(self, cfg: NNXBMTConfig, *, rngs: nnx.Rngs):
             self.cfg = cfg
             d_model = cfg.d_model
-
-            self.norm1 = RMSNorm(d_model)
-            self.norm2 = RMSNorm(d_model)
+            self.legacy_parity_mode = bool(cfg.decoder.enabled) and bool(cfg.decoder.use_legacy_motion_embed)
+            self.use_sparse_relation_attn = self.legacy_parity_mode and (not bool(cfg.decoder.dense_masked_relation_attn))
+            rel_factor = max(1, int(cfg.relation.simple_relation_factor))
+            legacy_rel_dim = max(1, int(d_model // rel_factor))
+            self.a2a_relation_dim = legacy_rel_dim if self.legacy_parity_mode else int(cfg.a2a_rel_dim)
+            self.a2t_relation_dim = legacy_rel_dim if self.legacy_parity_mode else int(cfg.a2t_rel_dim)
+            self.a2s_relation_dim = legacy_rel_dim if self.legacy_parity_mode else int(cfg.a2s_rel_dim)
+            if self.legacy_parity_mode:
+                self.a2t_norm = LayerNorm(d_model)
+                self.a2a_norm = LayerNorm(d_model)
+                self.a2s_norm = LayerNorm(d_model)
+                self.mlp_prenorm = LayerNorm(d_model)
+                if bool(cfg.relation.remove_rel_norm):
+                    self.a2t_rel_norm = None
+                    self.a2a_rel_norm = None
+                    self.a2s_rel_norm = None
+                else:
+                    self.a2t_rel_norm = LayerNorm(self.a2t_relation_dim)
+                    self.a2a_rel_norm = LayerNorm(self.a2a_relation_dim)
+                    self.a2s_rel_norm = LayerNorm(self.a2s_relation_dim)
+                self.norm1 = None
+                self.norm2 = None
+            else:
+                self.norm1 = RMSNorm(d_model)
+                self.norm2 = RMSNorm(d_model)
+                self.a2t_norm = None
+                self.a2a_norm = None
+                self.a2s_norm = None
+                self.mlp_prenorm = None
+                self.a2t_rel_norm = None
+                self.a2a_rel_norm = None
+                self.a2s_rel_norm = None
 
             self.a2a_attn = MultiHeadAttention(
                 d_model,
                 cfg.n_heads,
-                relation_dim=int(cfg.a2a_rel_dim),
+                relation_dim=self.a2a_relation_dim,
                 add_relation_to_v=bool(cfg.relation.add_relation_to_v),
                 remove_rel_norm=bool(cfg.relation.remove_rel_norm),
                 rngs=rngs,
@@ -681,7 +1035,7 @@ if HAS_NNX:
             self.a2t_attn = MultiHeadAttention(
                 d_model,
                 cfg.n_heads,
-                relation_dim=int(cfg.a2t_rel_dim),
+                relation_dim=self.a2t_relation_dim,
                 add_relation_to_v=bool(cfg.relation.add_relation_to_v),
                 remove_rel_norm=bool(cfg.relation.remove_rel_norm),
                 rngs=rngs,
@@ -689,7 +1043,7 @@ if HAS_NNX:
             self.a2s_attn = MultiHeadAttention(
                 d_model,
                 cfg.n_heads,
-                relation_dim=int(cfg.a2s_rel_dim),
+                relation_dim=self.a2s_relation_dim,
                 add_relation_to_v=bool(cfg.relation.add_relation_to_v),
                 remove_rel_norm=bool(cfg.relation.remove_rel_norm),
                 rngs=rngs,
@@ -704,18 +1058,27 @@ if HAS_NNX:
             h: jnp.ndarray,
             rel: Optional[jnp.ndarray],
             rel_mask: Optional[jnp.ndarray],
+            rel_indices: Optional[jnp.ndarray],
         ) -> jnp.ndarray:
             # h: [B,T,N,D] => [B*T,N,D]
             bsz, t_steps, n_agents, d_model = h.shape
             q = h.reshape(bsz * t_steps, n_agents, d_model)
             rel_bt = None
             mask_bt = None
+            indices_bt = None
             if rel is not None:
-                # rel: [B,T,N,N,R] => [B*T,N,N,R]
-                rel_bt = rel.reshape(bsz * t_steps, n_agents, n_agents, rel.shape[-1])
+                rel_bt = rel.reshape(bsz * t_steps, n_agents, rel.shape[3], rel.shape[-1])
             if rel_mask is not None:
-                mask_bt = rel_mask.reshape(bsz * t_steps, n_agents, n_agents).astype(bool)
-            out = self.a2a_attn(q, q, rel_feat=rel_bt, rel_mask=mask_bt)
+                mask_bt = rel_mask.reshape(bsz * t_steps, n_agents, rel_mask.shape[3]).astype(bool)
+            if rel_indices is not None:
+                indices_bt = rel_indices.reshape(bsz * t_steps, n_agents, rel_indices.shape[3]).astype(jnp.int32)
+            out = self.a2a_attn(
+                q,
+                q,
+                rel_feat=rel_bt,
+                rel_mask=mask_bt,
+                rel_indices=indices_bt if self.use_sparse_relation_attn else None,
+            )
             return out.reshape(bsz, t_steps, n_agents, d_model)
 
         def _a2t(
@@ -723,14 +1086,17 @@ if HAS_NNX:
             h: jnp.ndarray,
             rel: Optional[jnp.ndarray],
             rel_mask: Optional[jnp.ndarray],
+            rel_indices: Optional[jnp.ndarray],
         ) -> jnp.ndarray:
             # h: [B,T,N,D] => [B*N,T,D]
             bsz, t_steps, n_agents, d_model = h.shape
             q = jnp.transpose(h, (0, 2, 1, 3)).reshape(bsz * n_agents, t_steps, d_model)
             rel_bn = None
+            indices_bn = None
             if rel is not None:
-                # rel: [B,N,T,T,R] => [B*N,T,T,R]
-                rel_bn = rel.reshape(bsz * n_agents, t_steps, t_steps, rel.shape[-1])
+                rel_bn = rel.reshape(bsz * n_agents, t_steps, rel.shape[3], rel.shape[-1])
+            if rel_indices is not None:
+                indices_bn = rel_indices.reshape(bsz * n_agents, t_steps, rel_indices.shape[3]).astype(jnp.int32)
 
             # Temporal causality mask:
             # token at step t can only attend to [0..t]. This prevents future
@@ -739,9 +1105,16 @@ if HAS_NNX:
             causal = jnp.broadcast_to(causal[None, :, :], (bsz * n_agents, t_steps, t_steps))
             rel_mask_bn = None
             if rel_mask is not None:
-                rel_mask_bn = rel_mask.reshape(bsz * n_agents, t_steps, t_steps).astype(bool)
+                rel_mask_bn = rel_mask.reshape(bsz * n_agents, t_steps, rel_mask.shape[3]).astype(bool)
 
-            out = self.a2t_attn(q, q, mask=causal, rel_feat=rel_bn, rel_mask=rel_mask_bn)
+            out = self.a2t_attn(
+                q,
+                q,
+                mask=causal,
+                rel_feat=rel_bn,
+                rel_mask=rel_mask_bn,
+                rel_indices=indices_bn if self.use_sparse_relation_attn else None,
+            )
             out = out.reshape(bsz, n_agents, t_steps, d_model)
             return jnp.transpose(out, (0, 2, 1, 3))
 
@@ -751,6 +1124,7 @@ if HAS_NNX:
             scene_tokens: jnp.ndarray,
             rel: Optional[jnp.ndarray],
             rel_mask: Optional[jnp.ndarray],
+            rel_indices: Optional[jnp.ndarray],
             scene_token_mask: Optional[jnp.ndarray] = None,  # [B,S]
         ) -> jnp.ndarray:
             # h: [B,T,N,D] => [B,T*N,D], scene_tokens: [B,S,D]
@@ -758,9 +1132,11 @@ if HAS_NNX:
             q = h.reshape(bsz, t_steps * n_agents, d_model)
 
             rel_qs = None
+            indices_qs = None
             if rel is not None:
-                # rel: [B,T,N,S,R] => [B,T*N,S,R]
-                rel_qs = rel.reshape(bsz, t_steps * n_agents, scene_tokens.shape[1], rel.shape[-1])
+                rel_qs = rel.reshape(bsz, t_steps * n_agents, rel.shape[3], rel.shape[-1])
+            if rel_indices is not None:
+                indices_qs = rel_indices.reshape(bsz, t_steps * n_agents, rel_indices.shape[3]).astype(jnp.int32)
 
             attn_mask = None
             if scene_token_mask is not None:
@@ -769,9 +1145,16 @@ if HAS_NNX:
                 )
             rel_mask_qs = None
             if rel_mask is not None:
-                rel_mask_qs = rel_mask.reshape(bsz, t_steps * n_agents, scene_tokens.shape[1]).astype(bool)
+                rel_mask_qs = rel_mask.reshape(bsz, t_steps * n_agents, rel_mask.shape[3]).astype(bool)
 
-            out = self.a2s_attn(q, scene_tokens, mask=attn_mask, rel_feat=rel_qs, rel_mask=rel_mask_qs)
+            out = self.a2s_attn(
+                q,
+                scene_tokens,
+                mask=attn_mask,
+                rel_feat=rel_qs,
+                rel_mask=rel_mask_qs,
+                rel_indices=indices_qs if self.use_sparse_relation_attn else None,
+            )
             return out.reshape(bsz, t_steps, n_agents, d_model)
 
         def __call__(
@@ -786,12 +1169,40 @@ if HAS_NNX:
             a2a_mask: Optional[jnp.ndarray] = None,  # [B,T,N,N]
             a2t_mask: Optional[jnp.ndarray] = None,  # [B,N,T,T]
             a2s_mask: Optional[jnp.ndarray] = None,  # [B,T,N,S]
+            a2a_indices: Optional[jnp.ndarray] = None,  # [B,T,N,K]
+            a2t_indices: Optional[jnp.ndarray] = None,  # [B,N,T,K]
+            a2s_indices: Optional[jnp.ndarray] = None,  # [B,T,N,K]
         ) -> jnp.ndarray:
+            if self.legacy_parity_mode:
+                h_t = self.a2t_norm(x)
+                rel_t = a2t_rel if self.a2t_rel_norm is None or a2t_rel is None else self.a2t_rel_norm(a2t_rel)
+                x = x + self._a2t(h_t, rel_t, a2t_mask, a2t_indices)
+
+                h_a = self.a2a_norm(x)
+                rel_a = a2a_rel if self.a2a_rel_norm is None or a2a_rel is None else self.a2a_rel_norm(a2a_rel)
+                x = x + self._a2a(h_a, rel_a, a2a_mask, a2a_indices)
+
+                h_s = self.a2s_norm(x)
+                rel_s = a2s_rel if self.a2s_rel_norm is None or a2s_rel is None else self.a2s_rel_norm(a2s_rel)
+                x = x + self._a2s(
+                    h_s,
+                    scene_tokens,
+                    rel_s,
+                    a2s_mask,
+                    a2s_indices,
+                    scene_token_mask=scene_token_mask,
+                )
+
+                y = self.ff_in(self.mlp_prenorm(x))
+                y = self.ff_out(jax.nn.gelu(y, approximate=True))
+                x = x + y
+                return x
+
             h = self.norm1(x)
 
-            a2a_out = self._a2a(h, a2a_rel, a2a_mask)
-            a2t_out = self._a2t(h, a2t_rel, a2t_mask)
-            a2s_out = self._a2s(h, scene_tokens, a2s_rel, a2s_mask, scene_token_mask=scene_token_mask)
+            a2a_out = self._a2a(h, a2a_rel, a2a_mask, None)
+            a2t_out = self._a2t(h, a2t_rel, a2t_mask, None)
+            a2s_out = self._a2s(h, scene_tokens, a2s_rel, a2s_mask, None, scene_token_mask=scene_token_mask)
 
             x = x + (a2a_out + a2t_out + a2s_out) / 3.0
 
@@ -816,23 +1227,39 @@ if HAS_NNX:
             self.cfg = cfg
             d_model = cfg.d_model
             n_tokens = cfg.token_space.n_tokens
+            self.legacy_parity_mode = bool(cfg.decoder.enabled) and bool(cfg.decoder.use_legacy_motion_embed)
 
             # Non-parity/default embedding path.
-            self.motion_token_embed = nnx.Param(
-                jax.random.normal(rngs.params(), (n_tokens + cfg.n_special_tokens, d_model)) * 0.02
-            )
+            if self.legacy_parity_mode:
+                self.motion_token_embed = None
+                self.continuous_motion_proj = None
+            else:
+                self.motion_token_embed = nnx.Param(
+                    jax.random.normal(rngs.params(), (n_tokens + cfg.n_special_tokens, d_model)) * 0.02
+                )
+                self.continuous_motion_proj = Linear(2, d_model, rngs=rngs)
             self.agent_type_embed = nnx.Param(
                 jax.random.normal(rngs.params(), (cfg.n_agent_types, d_model)) * 0.02
             )
             self.agent_id_embed = nnx.Param(
                 jax.random.normal(rngs.params(), (cfg.max_agent_id, d_model)) * 0.02
             )
-            self.reverse_indicator_embed = nnx.Param(
-                jax.random.normal(rngs.params(), (2, d_model)) * 0.02
+            self.reverse_indicator_embed = (
+                nnx.Param(jax.random.normal(rngs.params(), (2, d_model)) * 0.02)
+                if (not self.legacy_parity_mode) or bool(cfg.decoder.use_backward_indicator_embed)
+                else None
             )
 
-            self.agent_shape_proj = Linear(3, d_model, rngs=rngs)
-            self.continuous_motion_proj = Linear(2, d_model, rngs=rngs)
+            if self.legacy_parity_mode:
+                self.agent_shape_proj = LegacyMLP(
+                    3,
+                    (d_model, d_model),
+                    rngs=rngs,
+                    ret_before_act=True,
+                    without_norm=False,
+                )
+            else:
+                self.agent_shape_proj = Linear(3, d_model, rngs=rngs)
 
             # MidGPT parity decoder-input composition path.
             self.action_embed = nnx.Param(
@@ -847,9 +1274,6 @@ if HAS_NNX:
                 num_freq_bands=64,
                 rngs=rngs,
             )
-            self.step_embed = nnx.Param(
-                jax.random.normal(rngs.params(), (512, d_model)) * 0.02
-            )
             tok = BidirectionalMotionTokenizer(cfg.token_space)
             motion_feat = tok.action_table_np()  # [V,2] => (acc, yaw)
             motion_dist = np.linalg.norm(motion_feat, axis=-1, keepdims=True).astype(np.float32)
@@ -857,6 +1281,39 @@ if HAS_NNX:
             motion_feat = np.concatenate([motion_feat, motion_dist, motion_heading], axis=-1).astype(np.float32)
             motion_feat = np.concatenate([motion_feat, np.zeros((1, 4), dtype=np.float32)], axis=0)
             self.motion_feature_table = jnp.asarray(motion_feat, dtype=jnp.float32)
+            rel_factor = max(1, int(cfg.relation.simple_relation_factor))
+            decoder_relation_dim = (
+                max(1, int(d_model // rel_factor)) if bool(cfg.relation.simple_relation) else int(d_model)
+            )
+            if self.legacy_parity_mode:
+                # Legacy MotionDecoderGPT learns separate Fourier embedders for raw
+                # A2A/A2T/A2S relation features before attention. The raw bundle
+                # dimensions are 12/12/3, while the decoder attends over the embedded
+                # hidden width (128 for the released MidGPT recipe).
+                self.relation_embed_a2a = FourierEmbeddingNNX(
+                    input_dim=int(cfg.a2a_rel_dim),
+                    hidden_dim=decoder_relation_dim,
+                    num_freq_bands=64,
+                    rngs=rngs,
+                )
+                self.relation_embed_a2t = FourierEmbeddingNNX(
+                    input_dim=int(cfg.a2t_rel_dim),
+                    hidden_dim=decoder_relation_dim,
+                    num_freq_bands=64,
+                    rngs=rngs,
+                )
+                self.relation_embed_a2s = FourierEmbeddingNNX(
+                    input_dim=int(cfg.a2s_rel_dim),
+                    hidden_dim=decoder_relation_dim,
+                    num_freq_bands=64,
+                    rngs=rngs,
+                )
+                self.decoder_relation_hidden_dim = decoder_relation_dim
+            else:
+                self.relation_embed_a2a = None
+                self.relation_embed_a2t = None
+                self.relation_embed_a2s = None
+                self.decoder_relation_hidden_dim = None
 
             self.scene_encoder = NNXSceneTokenEncoder(cfg, rngs=rngs)
 
@@ -885,8 +1342,18 @@ if HAS_NNX:
             self.decoder_blocks = tuple(
                 RelationAwareDecoderBlock(cfg, rngs=rngs) for _ in range(cfg.n_layers)
             )
-            self.final_norm = RMSNorm(d_model)
-            self.token_head = Linear(d_model, n_tokens, rngs=rngs)
+            self.final_norm = None if self.legacy_parity_mode else RMSNorm(d_model)
+            self.prediction_prenorm = LayerNorm(d_model) if self.legacy_parity_mode else None
+            if self.legacy_parity_mode:
+                self.token_head = LegacyMLP(
+                    d_model,
+                    (d_model, n_tokens),
+                    rngs=rngs,
+                    ret_before_act=True,
+                    without_norm=False,
+                )
+            else:
+                self.token_head = Linear(d_model, n_tokens, rngs=rngs)
 
         def _apply_dag_conditioning(
             self,
@@ -1060,6 +1527,37 @@ if HAS_NNX:
                 return jnp.where(invalid, max_id - 1, agent_ids).astype(jnp.int32)
             return jnp.mod(agent_ids, self.cfg.max_agent_id).astype(jnp.int32)
 
+        def _embed_decoder_relation_tensor(
+            self,
+            rel: Optional[jnp.ndarray],
+            mask: Optional[jnp.ndarray],
+            *,
+            embedder: Optional[FourierEmbeddingNNX],
+            expected_raw_dim: int,
+            expected_emb_dim: int,
+            label: str,
+        ) -> Optional[jnp.ndarray]:
+            """Apply legacy decoder relation Fourier embedding to raw relation tensors."""
+            if rel is None or embedder is None:
+                return rel
+
+            if rel.shape[-1] == expected_emb_dim:
+                rel_emb = rel
+            else:
+                if rel.shape[-1] != expected_raw_dim:
+                    raise ValueError(
+                        f"{label} last dim mismatch: expected raw dim {expected_raw_dim} or embedded dim "
+                        f"{expected_emb_dim}, got {rel.shape[-1]}"
+                    )
+                flat = rel.reshape(-1, rel.shape[-1])
+                rel_emb = embedder(flat).reshape(*rel.shape[:-1], expected_emb_dim)
+
+            # Legacy unwrap/wrap logic leaves invalid edges at zero. We mirror that
+            # explicitly so masked relation slots cannot leak arbitrary values.
+            if mask is not None:
+                rel_emb = jnp.where(mask[..., None].astype(bool), rel_emb, jnp.zeros_like(rel_emb))
+            return rel_emb
+
         def _compose_decoder_tokens_parity(
             self,
             *,
@@ -1119,6 +1617,8 @@ if HAS_NNX:
 
             categorical = [special_emb, id_emb, type_emb, shape_emb, action_emb]
             if bool(self.cfg.decoder.use_backward_indicator_embed):
+                if self.reverse_indicator_embed is None:
+                    raise RuntimeError("reverse_indicator_embed is required when use_backward_indicator_embed=True")
                 rev_ids = jnp.clip(reverse_indicator, 0, 1)
                 rev_emb = self.reverse_indicator_embed.value[rev_ids][:, None, None, :]
                 rev_emb = jnp.broadcast_to(rev_emb, (bsz, t_steps, n_agents, d_model))
@@ -1128,12 +1628,6 @@ if HAS_NNX:
                 continuous_inputs=motion6,
                 categorical_embs=categorical,
             )
-
-            if bool(self.cfg.decoder.add_pe_for_token):
-                step_ids = jnp.arange(t_steps, dtype=jnp.int32)
-                step_ids = jnp.clip(step_ids, 0, self.step_embed.value.shape[0] - 1)
-                step_emb = self.step_embed.value[step_ids][None, :, None, :]
-                token = token + step_emb
 
             token = jnp.where(valid_mask[..., None], token, jnp.zeros_like(token))
             return token, valid_mask
@@ -1148,6 +1642,8 @@ if HAS_NNX:
             continuous_motion: jnp.ndarray,
             reverse_indicator: jnp.ndarray,
         ) -> jnp.ndarray:
+            if self.motion_token_embed is None or self.continuous_motion_proj is None or self.reverse_indicator_embed is None:
+                raise RuntimeError("Simple decoder token path requires simple-path embeddings to be initialized")
             token_e = self.motion_token_embed.value[prev_token_ids]  # [B,T,N,D]
 
             type_ids = jnp.mod(agent_type_ids, self.cfg.n_agent_types)
@@ -1195,6 +1691,9 @@ if HAS_NNX:
             a2a_mask: Optional[jnp.ndarray] = None,  # [B,T,N,N]
             a2t_mask: Optional[jnp.ndarray] = None,  # [B,N,T,T]
             a2s_mask: Optional[jnp.ndarray] = None,  # [B,T,N,S]
+            a2a_indices: Optional[jnp.ndarray] = None,  # [B,T,N,K]
+            a2t_indices: Optional[jnp.ndarray] = None,  # [B,N,T,K]
+            a2s_indices: Optional[jnp.ndarray] = None,  # [B,T,N,K]
             dag_node_feat: Optional[jnp.ndarray] = None,  # [B,G,Fn]
             dag_node_mask: Optional[jnp.ndarray] = None,  # [B,G]
             dag_edge_src: Optional[jnp.ndarray] = None,  # [B,E]
@@ -1264,6 +1763,32 @@ if HAS_NNX:
                 dag_global_feat=dag_global_feat,
             )
 
+            if self.legacy_parity_mode:
+                a2a_rel = self._embed_decoder_relation_tensor(
+                    a2a_rel,
+                    a2a_mask,
+                    embedder=self.relation_embed_a2a,
+                    expected_raw_dim=int(self.cfg.a2a_rel_dim),
+                    expected_emb_dim=int(self.decoder_relation_hidden_dim),
+                    label="a2a_rel",
+                )
+                a2t_rel = self._embed_decoder_relation_tensor(
+                    a2t_rel,
+                    a2t_mask,
+                    embedder=self.relation_embed_a2t,
+                    expected_raw_dim=int(self.cfg.a2t_rel_dim),
+                    expected_emb_dim=int(self.decoder_relation_hidden_dim),
+                    label="a2t_rel",
+                )
+                a2s_rel = self._embed_decoder_relation_tensor(
+                    a2s_rel,
+                    a2s_mask,
+                    embedder=self.relation_embed_a2s,
+                    expected_raw_dim=int(self.cfg.a2s_rel_dim),
+                    expected_emb_dim=int(self.decoder_relation_hidden_dim),
+                    label="a2s_rel",
+                )
+
             for block in self.decoder_blocks:
                 h = block(
                     h,
@@ -1275,10 +1800,18 @@ if HAS_NNX:
                     a2a_mask=a2a_mask,
                     a2t_mask=a2t_mask,
                     a2s_mask=a2s_mask,
+                    a2a_indices=a2a_indices,
+                    a2t_indices=a2t_indices,
+                    a2s_indices=a2s_indices,
                 )
 
             h = jnp.where(token_valid_mask[..., None], h, jnp.zeros_like(h))
-            h = self.final_norm(h)
+            if self.legacy_parity_mode:
+                if self.prediction_prenorm is None:
+                    raise RuntimeError("prediction_prenorm is required in legacy parity mode")
+                h = self.prediction_prenorm(h)
+            else:
+                h = self.final_norm(h)
             logits = self.token_head(h)  # [B,T,N,|A|]
             if return_metadata:
                 md: Dict[str, Dict[str, jnp.ndarray]] = {"scene": scene_meta}
@@ -1410,6 +1943,9 @@ def autoregressive_token_rollout(
     a2a_mask: Optional[Any] = None,
     a2t_mask: Optional[Any] = None,
     a2s_mask: Optional[Any] = None,
+    a2a_indices: Optional[Any] = None,
+    a2t_indices: Optional[Any] = None,
+    a2s_indices: Optional[Any] = None,
     sampling_method: str = "topp",
     temperature: float = 1.0,
     topp: float = 0.95,
@@ -1484,6 +2020,12 @@ def autoregressive_token_rollout(
             model_kwargs["a2t_mask"] = a2t_mask[:, :, :cur_t, :cur_t]
         if a2s_mask is not None:
             model_kwargs["a2s_mask"] = a2s_mask[:, :cur_t, ...]
+        if a2a_indices is not None:
+            model_kwargs["a2a_indices"] = a2a_indices[:, :cur_t, ...]
+        if a2t_indices is not None:
+            model_kwargs["a2t_indices"] = a2t_indices[:, :, :cur_t, ...]
+        if a2s_indices is not None:
+            model_kwargs["a2s_indices"] = a2s_indices[:, :cur_t, ...]
         if scene_token_mask is not None:
             model_kwargs["scene_token_mask"] = scene_token_mask
         if scene_map_feature is not None:

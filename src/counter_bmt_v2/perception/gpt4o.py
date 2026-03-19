@@ -1,7 +1,7 @@
-"""GPT-4o perception adapter.
+"""OpenAI perception adapter.
 
-Implements a principled structured extraction step for maneuvers and decisions
-from scene frames, producing v2 contracts.
+Implements a structured extraction step for maneuvers and decisions from scene
+frames, producing v2 contracts.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from counter_bmt_v2.contracts import (
 from counter_bmt_v2.llm import OpenAIChatClient
 from counter_bmt_v2.perception.base import PerceptionModel
 from counter_bmt_v2.perception.mock import MockPerceptionModel
+from counter_bmt_v2.runtime_guards import coalesce_debug_fallbacks
 
 logger = logging.getLogger(__name__)
 
@@ -111,21 +112,28 @@ def _decision_type_from_str(s: str) -> DecisionType:
 
 
 @dataclass
-class GPT4oPerceptionModel(PerceptionModel):
-    model: str = "gpt-4o"
+class OpenAIPerceptionModel(PerceptionModel):
+    model: str = "gpt-5-mini"
     api_key: Optional[str] = None
     max_frames: int = 10
-    use_mock_fallback: bool = True
+    allow_debug_fallbacks: bool = False
+    use_mock_fallback: bool | None = None
 
     def __post_init__(self) -> None:
         self._fallback = MockPerceptionModel()
+        self._allow_debug_fallbacks = coalesce_debug_fallbacks(
+            allow_debug_fallbacks=bool(self.allow_debug_fallbacks),
+            legacy_fallback_flag=self.use_mock_fallback,
+        )
         self._client: Optional[OpenAIChatClient] = None
         try:
             self._client = OpenAIChatClient(model=self.model, api_key=self.api_key)
         except Exception as exc:
-            if not self.use_mock_fallback:
-                raise
-            logger.warning("GPT4oPerceptionModel fallback to mock: %s", exc)
+            if not self._allow_debug_fallbacks:
+                raise RuntimeError(
+                    f"OpenAI perception initialization failed for model={self.model!r}"
+                ) from exc
+            logger.warning("OpenAI perception fallback to mock: %s", exc)
 
     def _encode_images(self, scene: ScenarioInput) -> List[str]:
         encoded: List[str] = []
@@ -220,9 +228,20 @@ Rules:
 - Base conclusions only on visible evidence and supplied context text.
 """.strip()
 
+    def _fallback_extract(self, scene: ScenarioInput, *, reason: str, exc: Exception | None = None) -> VLMFeatures:
+        if not self._allow_debug_fallbacks:
+            detail = f" scene={scene.scenario_id} model={self.model!r} reason={reason}"
+            raise RuntimeError(f"OpenAI perception failed:{detail}") from exc
+        logger.warning("OpenAI perception fallback to mock (%s): %s", reason, exc or "no exception")
+        features = self._fallback.extract(scene)
+        features.raw = dict(features.raw)
+        features.raw["fallback_reason"] = str(reason)
+        features.raw["backend"] = "mock"
+        return features
+
     def extract(self, scene: ScenarioInput) -> VLMFeatures:
         if self._client is None:
-            return self._fallback.extract(scene)
+            return self._fallback_extract(scene, reason="client_unavailable")
 
         meta = scene.metadata if isinstance(scene.metadata, dict) else {}
         ego_color_hint = str(meta.get("ego_color_hint", "green"))
@@ -239,13 +258,11 @@ Rules:
                 max_tokens=1800,
             )
         except Exception as exc:
-            logger.warning("Perception call failed, using mock fallback: %s", exc)
-            return self._fallback.extract(scene)
+            return self._fallback_extract(scene, reason="api_call_failed", exc=exc)
 
         data = _extract_json(raw)
         if not data:
-            logger.warning("Perception parse failed, using mock fallback")
-            return self._fallback.extract(scene)
+            return self._fallback_extract(scene, reason="json_parse_failed")
 
         maneuvers: List[ManeuverSegment] = []
         for m in data.get("maneuvers", []):
@@ -282,7 +299,6 @@ Rules:
             except Exception:
                 continue
 
-        # Keep time-ordered output.
         maneuvers.sort(key=lambda x: (x.start_s, x.end_s))
         decisions.sort(key=lambda x: x.timestamp_s)
 
@@ -291,7 +307,7 @@ Rules:
             maneuvers=maneuvers,
             decisions=decisions,
             raw={
-                "backend": "gpt4o",
+                "backend": "openai",
                 "summary": data.get("summary", ""),
                 "raw_response": raw,
                 "n_images_sent": len(images),
@@ -302,3 +318,6 @@ Rules:
                 "frame_count_sent": len(images),
             },
         )
+
+
+GPT4oPerceptionModel = OpenAIPerceptionModel

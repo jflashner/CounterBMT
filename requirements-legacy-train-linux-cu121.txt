@@ -1,0 +1,7 @@
+-r requirements-legacy-base.txt
+
+# Legacy Adv-BMT training profile for Linux CUDA 12.1 boxes.
+# The bootstrap script installs the matching PyG wheels from data.pyg.org.
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+torch-geometric==2.7.0

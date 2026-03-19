@@ -1,0 +1,8 @@
+-r requirements-legacy-base.txt
+
+# CPU/debug profile for legacy Adv-BMT.
+# On macOS we intentionally stop at torch + torch-geometric because the
+# compiled PyG extension family is not consistently available there.
+torch==2.5.1
+torchvision==0.20.1
+torch-geometric==2.7.0

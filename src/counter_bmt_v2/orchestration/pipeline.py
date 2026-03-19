@@ -10,8 +10,9 @@ from counter_bmt_v2.conditioning import ConditioningModel, DenseConditioningMode
 from counter_bmt_v2.config import PipelineConfig
 from counter_bmt_v2.contracts import PipelineResult, ScenarioInput
 from counter_bmt_v2.judge import MockTrajectoryJudge, TrajectoryJudge
-from counter_bmt_v2.perception import GPT4oPerceptionModel, MockPerceptionModel, PerceptionModel
+from counter_bmt_v2.perception import MockPerceptionModel, OpenAIPerceptionModel, PerceptionModel
 from counter_bmt_v2.rl import compose_reward
+from counter_bmt_v2.runtime_guards import collect_debug_violations, normalize_openai_backend, require_debug_fallbacks
 from counter_bmt_v2.trajectory_jax import JaxTrajectoryGenerator, TrajectoryGenerator
 
 
@@ -43,16 +44,31 @@ class CounterBMTPipeline:
         cls,
         *,
         config: Optional[PipelineConfig] = None,
-        perception_backend: str = "mock",
-        dag_backend: str = "simple",
-        llm_model: str = "gpt-4o",
+        perception_backend: str = "openai",
+        dag_backend: str = "promptbn",
+        llm_model: str = "gpt-5-mini",
         api_key: Optional[str] = None,
         dag_retries: int = 4,
     ) -> "CounterBMTPipeline":
         cfg = config or PipelineConfig()
+        perception_backend = normalize_openai_backend(str(perception_backend), field_name="perception_backend")
+        violations = collect_debug_violations(
+            [
+                ("perception_backend", str(perception_backend), str(perception_backend) == "mock"),
+                ("dag_backend", str(dag_backend), str(dag_backend) == "simple"),
+            ]
+        )
+        require_debug_fallbacks(
+            allow_debug_fallbacks=bool(cfg.allow_debug_fallbacks),
+            violations=violations,
+        )
 
-        if perception_backend == "gpt4o":
-            perception: PerceptionModel = GPT4oPerceptionModel(model=llm_model, api_key=api_key)
+        if perception_backend == "openai":
+            perception: PerceptionModel = OpenAIPerceptionModel(
+                model=llm_model,
+                api_key=api_key,
+                allow_debug_fallbacks=bool(cfg.allow_debug_fallbacks),
+            )
         else:
             perception = MockPerceptionModel()
 
@@ -61,6 +77,7 @@ class CounterBMTPipeline:
                 model=llm_model,
                 api_key=api_key,
                 max_retries=dag_retries,
+                allow_debug_fallbacks=bool(cfg.allow_debug_fallbacks),
             )
         else:
             dag_builder = SimpleDAGBuilder()

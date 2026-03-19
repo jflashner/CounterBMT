@@ -14,6 +14,25 @@ def _sigmoid(x: np.ndarray | float) -> np.ndarray | float:
     return 1.0 / (1.0 + np.exp(-np.asarray(x)))
 
 
+def mean_cluster_quality(cluster_ids: np.ndarray, quality_scores: np.ndarray) -> float:
+    labels = np.asarray(cluster_ids, dtype=np.int32).reshape(-1)
+    q_i = np.asarray(quality_scores, dtype=np.float32).reshape(-1)
+    if labels.size == 0 or q_i.size == 0 or labels.size != q_i.size:
+        return 0.0
+    unique = np.unique(labels)
+    if unique.size == 0:
+        return 0.0
+    cluster_means = []
+    for label in unique.tolist():
+        idx = np.where(labels == int(label))[0]
+        if idx.size <= 0:
+            continue
+        cluster_means.append(float(np.mean(q_i[idx])))
+    if not cluster_means:
+        return 0.0
+    return float(np.mean(np.asarray(cluster_means, dtype=np.float32)))
+
+
 def _kmeans_assign(x: np.ndarray, k: int, seed: int = 0, iters: int = 20) -> np.ndarray:
     n = x.shape[0]
     if n == 0:
@@ -121,4 +140,3 @@ class ConsensusScorer:
             dtype=np.float32,
         )
         return cluster_ids.astype(np.int32), consensus, hist, q_i
-

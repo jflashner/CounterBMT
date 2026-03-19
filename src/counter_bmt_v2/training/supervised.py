@@ -450,8 +450,14 @@ def _prepare_supervised_batch(
         "scene_tl_valid_mask": jnp.asarray(batch["traffic_light_valid_mask"], dtype=bool),
         "scene_tl_position": jnp.asarray(batch["traffic_light_position"], dtype=jnp.float32),
     }
+    decoder_valid_mask = None
+    relation_sample_steps = np.asarray(token_batch["sample_steps"], dtype=np.int32)
     if "input_mask" in token_batch:
-        model_inputs["input_action_valid_mask"] = jnp.asarray(token_batch["input_mask"], dtype=bool)
+        decoder_valid_mask = np.asarray(token_batch["input_mask"], dtype=bool)
+        model_inputs["input_action_valid_mask"] = jnp.asarray(decoder_valid_mask, dtype=bool)
+    else:
+        relation_sample_steps = relation_sample_steps[:-1]
+        decoder_valid_mask = np.asarray(batch["agent_valid_mask"], dtype=bool)[:, relation_sample_steps, :]
     if "modeled_agent_delta" in token_batch:
         model_inputs["modeled_agent_delta"] = jnp.asarray(token_batch["modeled_agent_delta"], dtype=jnp.float32)
 
@@ -484,9 +490,9 @@ def _prepare_supervised_batch(
             agent_position_xy=np.asarray(batch["agent_position_xy"], dtype=np.float32),
             agent_heading=np.asarray(batch["agent_heading"], dtype=np.float32),
             agent_valid_mask=np.asarray(batch["agent_valid_mask"], dtype=bool),
-            decoder_valid_mask=np.asarray(token_batch["input_mask"], dtype=bool),
+            decoder_valid_mask=decoder_valid_mask,
             agent_shape=np.asarray(batch["agent_shape"], dtype=np.float32),
-            sample_steps=np.asarray(token_batch["sample_steps"], dtype=np.int32),
+            sample_steps=relation_sample_steps,
             scene_position=scene_inputs["scene_position"],
             scene_heading=scene_inputs["scene_heading"],
             scene_valid_mask=scene_inputs["scene_valid_mask"],
@@ -500,6 +506,9 @@ def _prepare_supervised_batch(
                 "a2a_mask": jnp.asarray(relation_bundle["a2a_mask"], dtype=bool),
                 "a2t_mask": jnp.asarray(relation_bundle["a2t_mask"], dtype=bool),
                 "a2s_mask": jnp.asarray(relation_bundle["a2s_mask"], dtype=bool),
+                "a2a_indices": jnp.asarray(relation_bundle["a2a_indices"], dtype=jnp.int32),
+                "a2t_indices": jnp.asarray(relation_bundle["a2t_indices"], dtype=jnp.int32),
+                "a2s_indices": jnp.asarray(relation_bundle["a2s_indices"], dtype=jnp.int32),
             }
         )
 

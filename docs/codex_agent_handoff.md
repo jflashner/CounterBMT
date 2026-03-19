@@ -124,14 +124,17 @@ Core equations from the paper:
 - group-relative advantages and PPO/GRPO-style clipping
 
 What is implemented:
-- behavior manifold scaffolding
+- checkpoint-backed NNX RL on the supervised DAG-latent policy
+- full DAG-assignment sampling and DAG-conditioned rollout prep
 - novelty / consensus / thermostat
-- RL VLM alignment replacement mode
+- clipped PPO-style updates with frozen-reference KL
+- minimal feasibility masking during rollout sampling
+- RL VLM alignment replacement mode on sampled DAG assignments
 
 What is not fully implemented:
-- real policy optimization on the NNX trajectory model
-- true clipped PPO/GRPO update over a trainable policy
-- hard feasibility-constrained sampling
+- full zigzag/ZPI topology backend
+- any feasibility engine beyond the current minimal token mask
+- unified LLM+trajectory backbone
 
 Key code:
 - `src/counter_bmt_v2/rl/`
@@ -316,12 +319,12 @@ Main files:
 | `rl/thermostat.py` | Entropy thermostat | Adaptive novelty/consensus weights |
 | `rl/reward.py` | RL reward composition | Environment + augmented terms |
 | `rl/loop.py` | RL rollout collection logic | Includes VLM alignment replace mode |
-| `rl/grpo.py` | GRPO stats/update scaffold | Not yet a true policy optimizer |
+| `rl/grpo.py` | Group-relative advantage helpers | Used alongside the real NNX PPO update path |
 | `rl/topology.py` | RL topology branch | Interface + fallback descriptors |
 | `rl/vlm_alignment.py` | RL VLM DAG-conformance scorer | Cost-bounded, cached, RL-only |
 | `cli/train_nnx_bmt.py` | Base training CLI | Most common training entrypoint |
 | `cli/train_nnx_bmt_dag_latent.py` | DAG-latent training CLI | Opt-in DAG path |
-| `cli/train_rl_topo_mcpo.py` | RL CLI | Experimental/scaffold |
+| `cli/train_rl_topo_mcpo.py` | RL CLI | Topo-MCPO training entrypoint with `nnx_checkpoint` mainline |
 | `ADV_BMT_PARITY_CHECKLIST.md` | P0-P6 parity status | Source of truth for parity work |
 | `ROADMAP.md` | Early roadmap notes | Useful historical context |
 
@@ -601,12 +604,9 @@ This is a critical distinction for new agents.
 
 - `src/counter_bmt_v2/trajectory_jax/model.py`
   - lightweight autoregressive trajectory generator for RL scaffolding
-  - not the supervised NNX motion transformer
-- `src/counter_bmt_v2/rl/grpo.py`
-  - statistics/update scaffold, not true clipped policy optimization
+  - kept only for the explicit `scaffold` backend
 - `src/counter_bmt_v2/rl/behavior_embedding.py`
-  - RL `dag_gnn` path is not the same as the supervised NNX DAG encoder
-  - it is still a handcrafted/fixed embedding path
+  - `dag_gnn` remains a handcrafted embedding path when you are not using the supervised DAG encoder reuse
 - `src/counter_bmt_v2/rl/topology.py`
   - topology branch is interface-ready but still uses fallback descriptors rather than a real zigzag persistence backend
 - `src/counter_bmt_v2/trajectory_jax/unified_stub.py`
@@ -614,7 +614,8 @@ This is a critical distinction for new agents.
 
 Bottom line:
 - the supervised DAG-latent path is real and trainable
-- the RL path is still an experimental scaffold
+- the RL mainline now reuses that supervised DAG-latent policy through `rl/nnx_policy.py`
+- the old scaffold path is still present, but it is no longer the intended mainline
 
 ## 11. Environments and Machine Layout
 
@@ -844,7 +845,7 @@ As of this document update, noteworthy implemented work includes:
 9. Head-to-head multi-model evaluation harness for v2 and legacy models.
 10. Explore/exploit sample export with replay packages and GIF generation.
 11. `make_scenario_gif.py` support for direct ScenarioNet scene IDs.
-12. RL VLM DAG-conformance replacement mode, but only inside the RL scaffold.
+12. RL VLM DAG-conformance replacement mode on the checkpoint-backed NNX RL path.
 
 ## 18. Practical Rule Of Thumb
 
@@ -854,4 +855,4 @@ When deciding where to work:
 - If the task is about DAG generation quality, stay in `src/scripts/dag_cache/`, `src/counter_bmt_v2/perception/`, and `src/counter_bmt_v2/causal/`.
 - If the task is about comparing models or producing figures, stay in `src/counter_bmt_v2/eval/` and `src/scripts/replay/`.
 - If the task is about legacy parity or reproducing paper numbers, use `src/Adv-BMT/` only as a reference or subprocess target.
-- If the task is about RL, assume you are improving an experimental scaffold unless you explicitly wire the supervised NNX model into it.
+- If the task is about RL, start in `src/counter_bmt_v2/rl/nnx_policy.py`, `src/counter_bmt_v2/rl/loop.py`, and `src/counter_bmt_v2/cli/train_rl_topo_mcpo.py`; only drop into the scaffold code if the backend is explicitly `scaffold`.

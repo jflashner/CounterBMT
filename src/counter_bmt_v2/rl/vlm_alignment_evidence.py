@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
 
@@ -21,6 +21,79 @@ class AlignmentEvidenceBundle:
     frames_for_vlm: List[TimestampedFrame]
     dag_text: str
     intervention_text: str
+
+
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    return value
+
+
+def _assignment_items(intervention: Intervention) -> List[tuple[str, Any]]:
+    ordered: List[tuple[str, Any]] = []
+    seen: set[str] = set()
+    for node_id in intervention.assignment_order or []:
+        if node_id in intervention.assignments and node_id not in seen:
+            ordered.append((str(node_id), intervention.assignments[node_id]))
+            seen.add(str(node_id))
+    for node_id in sorted(intervention.assignments.keys()):
+        node_id = str(node_id)
+        if node_id not in seen:
+            ordered.append((node_id, intervention.assignments[node_id]))
+    return ordered
+
+
+def build_intervention_text(intervention: Intervention) -> str:
+    if intervention.assignments:
+        return ", ".join(f"{node_id}={value}" for node_id, value in _assignment_items(intervention))
+    return f"{intervention.variable}={intervention.value}"
+
+
+def build_alignment_cache_context(dag: BayesianDAG, intervention: Intervention) -> Dict[str, Any]:
+    return {
+        "dag_prompt_text": build_compact_dag_text(dag, intervention),
+        "intervention_prompt_text": build_intervention_text(intervention),
+        "dag_snapshot": {
+            "scenario_id": str(dag.scenario_id),
+            "nodes": [
+                {
+                    "node_id": str(node.node_id),
+                    "node_type": str(node.node_type),
+                    "timestamp_s": None if node.timestamp_s is None else float(node.timestamp_s),
+                    "value": _to_jsonable(node.value),
+                }
+                for node in sorted(dag.nodes.values(), key=lambda x: str(x.node_id))
+            ],
+            "edges": [
+                {
+                    "parent_id": str(edge.parent_id),
+                    "child_id": str(edge.child_id),
+                    "confidence": float(edge.confidence),
+                    "mechanism": str(edge.mechanism),
+                }
+                for edge in sorted(
+                    dag.edges,
+                    key=lambda x: (str(x.parent_id), str(x.child_id), str(x.mechanism), float(x.confidence)),
+                )
+            ],
+            "cpt_nodes": [str(node_id) for node_id in sorted(dag.cpts.keys())],
+        },
+        "intervention_snapshot": {
+            "variable": str(intervention.variable),
+            "value": _to_jsonable(intervention.value),
+            "description": str(intervention.description),
+            "assignments": {node_id: _to_jsonable(value) for node_id, value in sorted(intervention.assignments.items())},
+            "assignment_order": [str(node_id) for node_id, _ in _assignment_items(intervention)],
+            "source_dag_schema": str(intervention.source_dag_schema),
+            "is_counterfactual": bool(intervention.is_counterfactual),
+        },
+    }
 
 
 def _time_indices(total: int, count: int) -> np.ndarray:
@@ -171,13 +244,15 @@ def render_rollout_overlay(
 
 
 def build_compact_dag_text(dag: BayesianDAG, intervention: Intervention) -> str:
-    nodes = list(dag.nodes.values())
-    edges = list(dag.edges)
+    nodes = sorted(dag.nodes.values(), key=lambda x: str(x.node_id))
+    edges = sorted(
+        dag.edges,
+        key=lambda x: (str(x.parent_id), str(x.child_id), str(x.mechanism), float(x.confidence)),
+    )
     if intervention.assignments:
         intervention_lines = ["Sampled DAG assignment:"]
-        for node_id in intervention.assignment_order or sorted(intervention.assignments.keys()):
-            if node_id in intervention.assignments:
-                intervention_lines.append(f"- {node_id}={intervention.assignments[node_id]}")
+        for node_id, value in _assignment_items(intervention):
+            intervention_lines.append(f"- {node_id}={value}")
     else:
         intervention_lines = [
             f"Intervention variable: {intervention.variable}",
@@ -235,13 +310,5 @@ def build_alignment_evidence_bundle(
         overlay_frames=list(overlay),
         frames_for_vlm=frames_for_vlm,
         dag_text=build_compact_dag_text(dag, intervention),
-        intervention_text=(
-            ", ".join(
-                f"{k}={intervention.assignments[k]}"
-                for k in (intervention.assignment_order or sorted(intervention.assignments.keys()))
-                if k in intervention.assignments
-            )
-            if intervention.assignments
-            else f"{intervention.variable}={intervention.value}"
-        ),
+        intervention_text=build_intervention_text(intervention),
     )

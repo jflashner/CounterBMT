@@ -5,6 +5,7 @@ This mode replaces RL alignment reward with GPT-4o DAG-conformance scoring.
 ## What Changes
 - Default mode (`judge`) is unchanged.
 - In `vlm_replace` mode, RL uses VLM conformance score as `JudgeResult.reward`.
+- The prompt/evidence path summarizes the full sampled DAG assignment rather than only a single edited node.
 - `w_alignment` still controls alignment weight in reward composition.
 - Safety/realism/novelty/consensus terms stay unchanged.
 
@@ -61,6 +62,12 @@ PYTHONPATH=src .venv/bin/python -m counter_bmt_v2.cli.train_rl_topo_mcpo \
 ## Evidence + Cache
 - Evidence (if enabled): `output_dir/vlm_alignment_evidence/step_x/scenario_y/rollout_z`
 - Cache: `--vlm-alignment-cache-dir` (default `outputs/rl_vlm_alignment_cache`)
+- Cache hits require the same rollout plus the same prompt-visible DAG context:
+  - backend/model/prompt version,
+  - compact DAG text,
+  - intervention text,
+  - canonical node/edge snapshot,
+  - canonical intervention payload (`assignments`, `assignment_order`, schema, counterfactual flag).
 
 ## Failure Behavior
 - API parse/timeouts/errors do not crash training.

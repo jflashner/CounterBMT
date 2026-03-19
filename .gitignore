@@ -1,6 +1,7 @@
 outputs/
 src/outputs/
 checkpoints/
+.cache/
 __pycache__/
 *.py[oc]
 .vscode/

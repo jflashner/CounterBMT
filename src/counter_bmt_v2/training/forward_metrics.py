@@ -500,6 +500,9 @@ def _rollout_tokens_fixed_horizon(
     a2a_mask: jnp.ndarray | None = None,
     a2t_mask: jnp.ndarray | None = None,
     a2s_mask: jnp.ndarray | None = None,
+    a2a_indices: jnp.ndarray | None = None,
+    a2t_indices: jnp.ndarray | None = None,
+    a2s_indices: jnp.ndarray | None = None,
     modeled_agent_delta_init: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """Static-shape rollout for JIT-friendly forward-pass validation.
@@ -542,6 +545,12 @@ def _rollout_tokens_fixed_horizon(
         model_kwargs["a2t_rel"] = a2t_rel
     if a2s_rel is not None:
         model_kwargs["a2s_rel"] = a2s_rel
+    if a2a_indices is not None:
+        model_kwargs["a2a_indices"] = a2a_indices
+    if a2t_indices is not None:
+        model_kwargs["a2t_indices"] = a2t_indices
+    if a2s_indices is not None:
+        model_kwargs["a2s_indices"] = a2s_indices
 
     for t in range(horizon_steps):
         prefix_t = (jnp.arange(horizon_steps, dtype=jnp.int32) <= int(t))[None, :, None]
@@ -905,6 +914,9 @@ def compute_forward_pass_metrics_for_batch(
     a2a_mask_eval = None if model_inputs.get("a2a_mask") is None else model_inputs["a2a_mask"][:, :horizon_eval, ...]
     a2t_mask_eval = None if model_inputs.get("a2t_mask") is None else model_inputs["a2t_mask"][:, :, :horizon_eval, :horizon_eval]
     a2s_mask_eval = None if model_inputs.get("a2s_mask") is None else model_inputs["a2s_mask"][:, :horizon_eval, ...]
+    a2a_indices_eval = None if model_inputs.get("a2a_indices") is None else model_inputs["a2a_indices"][:, :horizon_eval, ...]
+    a2t_indices_eval = None if model_inputs.get("a2t_indices") is None else model_inputs["a2t_indices"][:, :, :horizon_eval, ...]
+    a2s_indices_eval = None if model_inputs.get("a2s_indices") is None else model_inputs["a2s_indices"][:, :horizon_eval, ...]
     modeled_delta_eval = (
         None if model_inputs.get("modeled_agent_delta") is None else model_inputs["modeled_agent_delta"][:, :horizon_eval, ...]
     )
@@ -932,6 +944,9 @@ def compute_forward_pass_metrics_for_batch(
             a2a_mask=a2a_mask_eval,
             a2t_mask=a2t_mask_eval,
             a2s_mask=a2s_mask_eval,
+            a2a_indices=a2a_indices_eval,
+            a2t_indices=a2t_indices_eval,
+            a2s_indices=a2s_indices_eval,
             modeled_agent_delta_init=modeled_delta_eval,
             sampling_method=eval_cfg.sampling_method,
             temperature=float(eval_cfg.temperature),

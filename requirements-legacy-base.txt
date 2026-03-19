@@ -1,0 +1,26 @@
+# Shared base for the separate Adv-BMT legacy environment.
+#
+# This is intentionally independent from the v2 JAX environment so legacy
+# PyTorch/Lightning dependencies do not fight with the main repo workflow.
+
+-e ./src/Adv-BMT
+
+lightning==2.4.0
+gradio==5.0.1
+numpy==2.2.6
+tensorboard==2.12.3
+tensorboardX==2.6.4
+easydict==1.13
+pyyaml==6.0.3
+scikit-image==0.24.0
+tqdm==4.67.1
+yapf==0.30.0
+wandb==0.23.1
+chardet==5.2.0
+charset-normalizer==3.4.4
+tabulate==0.9.0
+hydra-core==1.3.2
+omegaconf==2.3.0
+pillow==9.2.0
+sympy==1.13.1
+shapely==2.1.2

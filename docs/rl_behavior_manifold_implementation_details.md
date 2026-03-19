@@ -36,8 +36,10 @@ Primary references:
   - Adaptive `eta` and `alpha`.
 - GRPO helper: `src/counter_bmt_v2/rl/grpo.py`
   - Group-standardized advantages + statistics update scaffold.
+- NNX checkpoint policy backend: `src/counter_bmt_v2/rl/nnx_policy.py`
+  - Loads supervised DAG-latent checkpoints, samples rollouts, applies feasibility masking, and performs clipped PPO-style updates with frozen-reference KL.
 - RL loop orchestrator: `src/counter_bmt_v2/rl/loop.py`
-  - `collect_group_rollouts`, `compute_group_advantages`, `grpo_update`.
+  - candidate oversampling, novelty-weighted resampling, consensus scoring, alignment replacement, and reward assembly.
 
 ### 1.3 Reward composition and CLI
 - Reward composition updated in `src/counter_bmt_v2/rl/reward.py`:
@@ -90,16 +92,26 @@ Code mapping:
 ### F) PPO/GRPO clipped optimization
 Paper concept:
 - Clipped surrogate + optional KL regularization.
-Code status:
-- Not fully implemented yet.
-- `GRPOTrainer.update(...)` currently logs surrogate-style stats and entropy term but does not update a learned policy head.
+Code mapping:
+- `NNXPolicyBackend.update(...)` in `src/counter_bmt_v2/rl/nnx_policy.py`:
+  - replays sampled ego token sequences,
+  - recomputes rollout log-probs on the current policy,
+  - applies clipped PPO-style surrogate,
+  - adds entropy bonus weighted by `alpha`,
+  - adds frozen-reference KL penalty weighted by `kl_beta`,
+  - updates only the configured trainable scope.
 
 ### G) Feasibility-constrained sampling
 Paper concept:
 - Hard feasibility support `F(x_t,u_t)` during sampling.
-Code status:
-- Not implemented yet as hard constraints in trajectory sampling.
-- Current path uses reward shaping and rollout scoring, not constrained action support.
+Code mapping:
+- `NNXPolicyBackend.sample_candidate_pool(...)` applies a minimal token-level feasibility mask before sampling.
+- `_build_feasibility_mask(...)` in `src/counter_bmt_v2/rl/nnx_policy.py` masks:
+  - negative next speed,
+  - speed above configured maximum,
+  - excessive accel jump,
+  - excessive yaw-rate jump.
+- All-masked rows fall back safely to the unmasked support.
 
 ---
 
@@ -215,16 +227,21 @@ To match the paper more closely:
 
 ## 5) End-to-end RL flow in this repo
 
-1. Pipeline generates rollouts (`CounterBMTPipeline.run`, `n_samples=group_size`).
-2. Each rollout gets `psi` embedding + risk features.
-3. Novelty estimator computes surprisal in `psi` space.
-4. Consensus scorer clusters `psi` and computes quality-gated consensus score.
-5. Thermostat computes adaptive `eta`/`alpha` from group entropy.
-6. Rollout metadata updated:
+1. Resolve or build a DAG for the scenario, then sample a full counterfactual DAG assignment in topological order.
+2. Apply the sampled assignment back onto the DAG payload and tensorize it for the policy backend.
+3. `NNXPolicyBackend.sample_candidate_pool(...)` loads the supervised DAG-latent checkpoint path, prepares scene tensors through `_prepare_supervised_batch(...)`, and samples a candidate pool of rollouts.
+4. During token sampling, the backend logs old ego log-probs, entropy, optional rollout traces, and feasibility-mask statistics.
+5. Each candidate rollout gets `psi` embedding + risk features.
+6. Novelty estimator computes surprisal in `psi` space before any novelty-model update.
+7. Candidate oversampling + novelty-weighted resampling produce the final group.
+8. Consensus scorer clusters only the final group and computes `rho(C|s) * mean_Q(C)`.
+9. Thermostat computes adaptive `eta`/`alpha` from final-group entropy.
+10. Rollout metadata updated:
    - `risk_features`, `behavior_embedding`, `novelty_score`, `cluster_id`, `consensus_score`.
-7. Reward recomputed with augmented terms.
-8. Group advantages computed and GRPO statistics updated.
-9. Metrics logged by `train_rl_topo_mcpo.py` (`metrics.jsonl`, `summary.json`).
+11. Reward is recomputed with environment, novelty, consensus, and optional `vlm_replace` alignment terms.
+12. Group advantages are computed on the selected group.
+13. `NNXPolicyBackend.update(...)` performs the clipped PPO-style parameter update against the collected trajectories.
+14. Metrics are logged by `train_rl_topo_mcpo.py` (`metrics.jsonl`, `summary.json`).
 
 ---
 
@@ -232,38 +249,62 @@ To match the paper more closely:
 
 Implemented:
 - Behavior-manifold scaffolding and APIs.
+- Real NNX checkpoint policy backend for the mainline RL path.
+- Full DAG-assignment intervention sampling and DAG-conditioned rollout prep.
+- Candidate oversampling + novelty-weighted resampling.
+- Consensus on final-group cluster mass times mean cluster quality.
+- Clipped PPO-style policy updates with frozen-reference KL and trainable-scope masking.
+- Minimal token-level feasibility masking during rollout sampling.
 - DAG-aware embedding branch.
 - Topology branch with cache + fallback.
 - Novelty/consensus/thermostat mechanics.
 - Group-relative advantage computation.
+- `vlm_replace` alignment on sampled DAG assignments with cache keyed by the full assignment-visible context.
 - RL training CLI and diagnostics.
 
 Deferred:
-- True clipped PPO/GRPO policy parameter updates.
-- Hard feasibility support in sampling.
 - Full cubical zigzag persistence + ZPI vectorization backend.
 - Unified LLM+trajectory conditioning head.
+- Any feasibility engine beyond the current minimal token mask.
 
 ---
 
 ## 7) Practical usage
 
-Baseline (`dag_gnn`):
+Checkpoint-backed mock smoke:
 ```bash
 PYTHONPATH=src .venv/bin/python -m counter_bmt_v2.cli.train_rl_topo_mcpo \
   --data-dir data/scenarionet_waymo_training_500 \
-  --output-dir outputs/rl_topo_mcpo_dag \
-  --steps 200 --group-size 8 --embedding-mode dag_gnn
+  --output-dir outputs/rl_topo_mcpo_nnx_smoke \
+  --steps 5 --group-size 4 \
+  --embedding-mode risk_vector \
+  --policy-backend nnx_checkpoint \
+  --policy-checkpoint outputs/dag_latent_stage_c/checkpoints/last.pkl \
+  --policy-model-preset midgpt_dag_latent \
+  --policy-tokenizer-mode paper_simple \
+  --policy-skip-steps 1 \
+  --dag-source-mode scene_derived
 ```
 
-Hybrid with topology branch:
+Recommended real-run alignment setup:
 ```bash
 PYTHONPATH=src .venv/bin/python -m counter_bmt_v2.cli.train_rl_topo_mcpo \
   --data-dir data/scenarionet_waymo_training_500 \
-  --output-dir outputs/rl_topo_mcpo_hybrid \
+  --output-dir outputs/rl_topo_mcpo_vlm \
   --steps 200 --group-size 8 \
-  --embedding-mode hybrid --use-topology-branch \
-  --topology-cache-dir outputs/topology_cache
+  --embedding-mode risk_vector \
+  --policy-backend nnx_checkpoint \
+  --policy-checkpoint outputs/dag_latent_stage_c/checkpoints/last.pkl \
+  --policy-model-preset midgpt_dag_latent \
+  --policy-tokenizer-mode paper_simple \
+  --policy-skip-steps 1 \
+  --dag-source-mode cache \
+  --dag-cache-dir outputs/dag_cache_v3_mo/cache \
+  --dag-cache-strict \
+  --dag-expected-schema v3_maneuver_outcome \
+  --alignment-source-mode vlm_replace \
+  --vlm-alignment-enabled \
+  --vlm-alignment-backend gpt4o
 ```
 
 Ablation suggestions:
@@ -275,13 +316,8 @@ Ablation suggestions:
 
 ## 8) Recommended next engineering steps
 
-1. Replace `GRPOTrainer` scaffold with real policy optimization on trajectory/LLM policy parameters.
-2. Add feasibility checks directly into rollout/action proposal layer.
-3. Implement a real zigzag/ZPI backend behind `ZigzagTopologyEncoder`.
-4. Add unit tests for:
-   - entropy thermostat directionality,
-   - consensus quality score monotonicity,
-   - novelty estimator update behavior,
-   - cache correctness in topology runner.
-5. Add offline evaluation script comparing diversity-realism tradeoff curves across embedding modes.
-
+1. Implement a real zigzag/ZPI backend behind `ZigzagTopologyEncoder`.
+2. Add richer integration coverage for larger checkpoint-backed runs and multi-step resume behavior.
+3. Expand rollout tracing and offline diagnostics for long-run PPO debugging.
+4. Add offline evaluation comparing diversity-realism tradeoff curves across embedding modes and policy backends.
+5. Keep the unified LLM+trajectory backbone deferred until the current DAG-latent RL path is stable.

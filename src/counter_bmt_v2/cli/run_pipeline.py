@@ -8,8 +8,10 @@ from pathlib import Path
 
 import numpy as np
 
+from counter_bmt_v2.config import PipelineConfig
 from counter_bmt_v2.contracts import ScenarioInput, TimestampedFrame, make_demo_frames
 from counter_bmt_v2.orchestration import CounterBMTPipeline
+from counter_bmt_v2.runtime_guards import collect_debug_violations, normalize_openai_backend, require_debug_fallbacks
 
 
 def build_demo_scene(scenario_id: str, num_frames: int) -> ScenarioInput:
@@ -70,7 +72,7 @@ def build_scenarionet_scene(
     )
 
 
-def main() -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run CounterBMT v2 pipeline (vertical slice)")
     parser.add_argument("--scenario-id", type=str, default="demo_000")
     parser.add_argument("--num-frames", type=int, default=8)
@@ -80,20 +82,23 @@ def main() -> int:
     parser.add_argument(
         "--perception-backend",
         type=str,
-        default="mock",
-        choices=["mock", "gpt4o"],
+        default="openai",
+        choices=["mock", "openai", "gpt4o"],
         help="perception extractor backend",
     )
     parser.add_argument(
         "--dag-backend",
         type=str,
-        default="simple",
+        default="promptbn",
         choices=["simple", "promptbn"],
         help="DAG builder backend",
     )
-    parser.add_argument("--llm-model", type=str, default="gpt-4o")
+    parser.add_argument("--llm-model", type=str, default="gpt-5-mini")
     parser.add_argument("--api-key", type=str, default=None, help="optional OpenAI API key")
     parser.add_argument("--dag-retries", type=int, default=4, help="max PromptBN retry count")
+    parser.add_argument("--allow-debug-fallbacks", action="store_true")
+    parser.add_argument("--no-allow-debug-fallbacks", dest="allow_debug_fallbacks", action="store_false")
+    parser.set_defaults(allow_debug_fallbacks=False)
     parser.add_argument(
         "--scene-source",
         type=str,
@@ -120,7 +125,25 @@ def main() -> int:
         help="Optional output directory for extracted frames",
     )
     parser.add_argument("--json-out", type=str, default="", help="optional output JSON path")
+    return parser
+
+
+def main() -> int:
+    parser = _build_parser()
     args = parser.parse_args()
+    args.perception_backend = normalize_openai_backend(
+        str(args.perception_backend),
+        field_name="perception_backend",
+    )
+    require_debug_fallbacks(
+        allow_debug_fallbacks=bool(args.allow_debug_fallbacks),
+        violations=collect_debug_violations(
+            [
+                ("perception_backend", str(args.perception_backend), str(args.perception_backend) == "mock"),
+                ("dag_backend", str(args.dag_backend), str(args.dag_backend) == "simple"),
+            ]
+        ),
+    )
 
     if args.scene_source == "scenarionet":
         if not args.data_dir:
@@ -143,7 +166,10 @@ def main() -> int:
     else:
         scene = build_demo_scene(args.scenario_id, args.num_frames)
 
+    cfg = PipelineConfig()
+    cfg.allow_debug_fallbacks = bool(args.allow_debug_fallbacks)
     pipeline = CounterBMTPipeline.from_backends(
+        config=cfg,
         perception_backend=args.perception_backend,
         dag_backend=args.dag_backend,
         llm_model=args.llm_model,

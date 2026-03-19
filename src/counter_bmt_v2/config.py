@@ -60,6 +60,7 @@ class RLPolicyConfig:
     feasible_max_accel_delta: float = 4.0
     feasible_max_yaw_delta: float = 0.75
     enable_feasibility_mask: bool = True
+    store_rollout_traces: bool = False
     sampling_method: Literal["topp", "topk", "softmax", "argmax"] = "topp"
     sampling_temperature: float = 1.0
     sampling_topp: float = 0.95
@@ -87,10 +88,10 @@ class ConsensusConfig:
 
 @dataclass
 class VLMAlignmentConfig:
-    enabled: bool = False
-    source_mode: Literal["judge", "vlm_replace"] = "judge"
-    backend: Literal["gpt4o", "mock"] = "gpt4o"
-    model: str = "gpt-4o"
+    enabled: bool = True
+    source_mode: Literal["judge", "vlm_replace"] = "vlm_replace"
+    backend: Literal["openai", "gpt4o", "mock"] = "openai"
+    model: str = "gpt-5-mini"
     api_key: str | None = None
     sample_rate: float = 0.15
     every_n_steps: int = 5
@@ -125,3 +126,4 @@ class PipelineConfig:
     trajectory: TrajectoryModelConfig = field(default_factory=TrajectoryModelConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     rl: RLConfig = field(default_factory=RLConfig)
+    allow_debug_fallbacks: bool = False

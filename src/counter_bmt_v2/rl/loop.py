@@ -20,7 +20,7 @@ from counter_bmt_v2.contracts import (
     VLMFeatures,
 )
 from counter_bmt_v2.rl.behavior_embedding import BehaviorManifoldEncoder
-from counter_bmt_v2.rl.consensus import ConsensusScorer
+from counter_bmt_v2.rl.consensus import ConsensusScorer, mean_cluster_quality
 from counter_bmt_v2.rl.grpo import GRPOTrainer, compute_group_advantages as _compute_group_advantages
 from counter_bmt_v2.rl.nnx_policy import NNXPolicyBackend
 from counter_bmt_v2.rl.novelty import NoveltyEstimator
@@ -312,7 +312,7 @@ def _collect_group_rollouts_nnx(
         "sampling/selected_rank_mean": float(np.mean(novelty_ranks[selected_idx])) if selected_idx.size else 0.0,
         "sampling/novelty_weight_mean": float(np.mean(novelty_weights[selected_idx])) if selected_idx.size else 0.0,
         "sampling/feasibility_mask_rate": float(np.mean(policy_rollout_data.feasibility_mask_rate)) if policy_rollout_data.feasibility_mask_rate.size else 0.0,
-        "consensus/mean_cluster_quality": float(np.mean(quality_scores)) if quality_scores.size else 0.0,
+        "consensus/mean_cluster_quality": mean_cluster_quality(cluster_ids, quality_scores),
         "novelty/surprisal_mean": float(np.mean(surprisal)) if surprisal.size else 0.0,
         "dag/source_cache": 1.0 if dag_source == "cache" else 0.0,
         "dag/source_scene_derived": 1.0 if dag_source == "scene_derived" else 0.0,
@@ -484,7 +484,7 @@ def collect_group_rollouts(
             "sampling/selected_rank_mean": 0.0,
             "sampling/novelty_weight_mean": 0.0,
             "sampling/feasibility_mask_rate": 0.0,
-            "consensus/mean_cluster_quality": float(np.mean(quality_scores)) if quality_scores.size else 0.0,
+            "consensus/mean_cluster_quality": mean_cluster_quality(cluster_ids, quality_scores),
             "novelty/surprisal_mean": float(np.mean(surprisal)) if surprisal.size else 0.0,
         },
     )
@@ -538,6 +538,9 @@ def summarize_reward_breakdown(rewards: Sequence[RewardBreakdown]) -> Dict[str, 
         return {"n": 0}
     total = np.asarray([float(r.total) for r in rewards], dtype=np.float32)
     env_total = np.asarray([float(r.total_env) for r in rewards], dtype=np.float32)
+    alignment = np.asarray([float(r.alignment) for r in rewards], dtype=np.float32)
+    safety = np.asarray([float(r.safety) for r in rewards], dtype=np.float32)
+    realism = np.asarray([float(r.realism) for r in rewards], dtype=np.float32)
     novelty = np.asarray([float(r.novelty) for r in rewards], dtype=np.float32)
     consensus = np.asarray([float(r.consensus) for r in rewards], dtype=np.float32)
     vlm_align = np.asarray([float(r.vlm_dag_conformance) for r in rewards], dtype=np.float32)
@@ -546,6 +549,9 @@ def summarize_reward_breakdown(rewards: Sequence[RewardBreakdown]) -> Dict[str, 
         "total_mean": float(np.mean(total)),
         "total_std": float(np.std(total)),
         "total_env_mean": float(np.mean(env_total)),
+        "alignment_mean": float(np.mean(alignment)),
+        "safety_mean": float(np.mean(safety)),
+        "realism_mean": float(np.mean(realism)),
         "novelty_mean": float(np.mean(novelty)),
         "consensus_mean": float(np.mean(consensus)),
         "vlm_dag_conformance_mean": float(np.mean(vlm_align)),

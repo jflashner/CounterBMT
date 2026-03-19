@@ -9,7 +9,12 @@ This script checks:
 
 Profiles:
 - v2: requirements.txt
+- mac-cpu: requirements-mac-cpu.txt
+- mac-parity: requirements-mac-parity-tools.txt
 - legacy: requirements-legacy.txt
+- legacy-train-linux-cu121: requirements-legacy-train-linux-cu121.txt
+- legacy-train-cpu: requirements-legacy-train-cpu.txt
+- legacy-waymo-eval: requirements-legacy-waymo-eval.txt
 - full: requirements-installed-freeze.txt
 """
 
@@ -20,11 +25,16 @@ import re
 import sys
 from importlib import import_module, metadata, util
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 REQ_FILES = {
     "v2": "requirements.txt",
+    "mac-cpu": "requirements-mac-cpu.txt",
+    "mac-parity": "requirements-mac-parity-tools.txt",
     "legacy": "requirements-legacy.txt",
+    "legacy-train-linux-cu121": "requirements-legacy-train-linux-cu121.txt",
+    "legacy-train-cpu": "requirements-legacy-train-cpu.txt",
+    "legacy-waymo-eval": "requirements-legacy-waymo-eval.txt",
     "full": "requirements-installed-freeze.txt",
 }
 
@@ -41,7 +51,65 @@ CRITICAL_IMPORTS = {
         "metadrive",
         "scenarionet",
     ],
+    "mac-cpu": [
+        "counter_bmt_v2",
+        "counter_bmt_v2.data",
+        "numpy",
+        "jax",
+        "flax",
+        "optax",
+        "openai",
+        "matplotlib",
+        "tensorboard",
+        "pytest",
+    ],
+    "mac-parity": [
+        "counter_bmt_v2",
+        "counter_bmt_v2.data",
+        "numpy",
+        "jax",
+        "flax",
+        "optax",
+        "openai",
+        "matplotlib",
+        "tensorboard",
+        "pytest",
+        "torch",
+        "easydict",
+        "shapely",
+    ],
     "legacy": ["torch", "torchvision", "torch_geometric", "hydra", "lightning"],
+    "legacy-train-linux-cu121": [
+        "bmt",
+        "torch",
+        "torchvision",
+        "torch_geometric",
+        "hydra",
+        "lightning",
+        "wandb",
+        "shapely",
+        "metadrive",
+        "scenarionet",
+    ],
+    "legacy-train-cpu": [
+        "bmt",
+        "torch",
+        "torchvision",
+        "torch_geometric",
+        "hydra",
+        "lightning",
+        "wandb",
+        "shapely",
+        "metadrive",
+        "scenarionet",
+    ],
+    "legacy-waymo-eval": [
+        "tensorflow",
+        "tensorflow_addons",
+        "tensorflow_datasets",
+        "tensorflow_probability",
+        "waymo_open_dataset",
+    ],
     "full": ["numpy", "jax", "torch", "tensorflow"],
 }
 
@@ -50,13 +118,28 @@ def _normalize_name(name: str) -> str:
     return name.strip().lower().replace("_", "-")
 
 
-def parse_requirements(path: Path) -> Tuple[Dict[str, str], List[str]]:
+def parse_requirements(path: Path, seen: Set[Path] | None = None) -> Tuple[Dict[str, str], List[str]]:
+    if seen is None:
+        seen = set()
+    path = path.resolve()
+    if path in seen:
+        return {}, []
+    seen.add(path)
+
     pinned: Dict[str, str] = {}
     editable_paths: List[str] = []
 
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("-r ") or line.startswith("--requirement "):
+            _, include = line.split(None, 1)
+            include_path = (path.parent / include.strip()).resolve()
+            child_pinned, child_editables = parse_requirements(include_path, seen=seen)
+            pinned.update(child_pinned)
+            editable_paths.extend(child_editables)
             continue
 
         if line.startswith("-e "):
@@ -118,7 +201,20 @@ def check_imports(modules: List[str], mode: str = "spec") -> List[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify pinned CounterBMT environment")
-    parser.add_argument("--profile", choices=["v2", "legacy", "full"], default="v2")
+    parser.add_argument(
+        "--profile",
+        choices=[
+            "v2",
+            "mac-cpu",
+            "mac-parity",
+            "legacy",
+            "legacy-train-linux-cu121",
+            "legacy-train-cpu",
+            "legacy-waymo-eval",
+            "full",
+        ],
+        default="v2",
+    )
     parser.add_argument("--repo-root", type=str, default=".")
     parser.add_argument("--min-python", type=str, default="3.10")
     parser.add_argument("--import-mode", choices=["spec", "import"], default="spec")
