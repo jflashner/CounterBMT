@@ -7,7 +7,10 @@
 
 lightning==2.4.0
 gradio==5.0.1
-numpy==2.2.6
+# The released Adv-BMT package metadata requires numpy>=1.26,<2.
+# Keep the legacy env on a 1.26 pin so pip does not try to solve against the
+# main v2 JAX stack's newer NumPy line.
+numpy==1.26.4
 tensorboard==2.12.3
 tensorboardX==2.6.4
 easydict==1.13

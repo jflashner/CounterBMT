@@ -88,6 +88,9 @@ export OUTPUT_DIR=outputs/h200_midgpt_learning_probe
 bash tools/run_midgpt_learning_probe_h200.sh
 ```
 
+`PYTHON_BIN` is optional. If unset, the wrapper auto-detects the first
+available interpreter from `python3.10`, `python3`, then `python`.
+
 By default the H200 wrapper sets `CUDA_VISIBLE_DEVICES=0` so the probe uses one
 GPU for a cleaner apples-to-apples learning comparison. Override
 `CUDA_VISIBLE_DEVICES` if you want to exercise a wider device set.

@@ -24,13 +24,15 @@ opt in.
 On a Linux H200 box:
 
 ```bash
-PYTHON_BIN=python3.10 \
 VENV_DIR=.venv-legacy-adv-bmt \
 LEGACY_PROFILE=linux-cu121 \
 INSTALL_SIM_STACK=1 \
 INSTALL_WAYMO_EVAL=0 \
 tools/bootstrap_legacy_adv_bmt.sh
 ```
+
+`PYTHON_BIN` is optional. If unset, the bootstrap auto-detects the first
+available interpreter from `python3.10`, `python3`, then `python`.
 
 This will:
 
@@ -39,6 +41,17 @@ This will:
 3. install matching PyG operator wheels
 4. install `metadrive` and `scenarionet`
 5. verify the resulting environment
+
+The dedicated legacy env is intentionally pinned to `numpy==1.26.4` because the
+released editable `adv-bmt` package declares `numpy>=1.26,<2`. That keeps the
+legacy stack separate from the main v2 JAX environment's newer NumPy line.
+
+If a previous bootstrap attempt failed partway through dependency resolution,
+rerun with a clean env:
+
+```bash
+RECREATE_VENV=1 tools/bootstrap_legacy_adv_bmt.sh
+```
 
 ## Optional Full Legacy Evaluator
 

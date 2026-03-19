@@ -12,7 +12,7 @@ set -euo pipefail
 #   tools/bootstrap_legacy_adv_bmt.sh
 #
 # Important env vars:
-#   PYTHON_BIN=python3.10
+#   PYTHON_BIN=python3.10 (or leave unset for auto-detection)
 #   VENV_DIR=.venv-legacy-adv-bmt
 #   RECREATE_VENV=0|1
 #   LEGACY_PROFILE=auto|linux-cu121|linux-cpu|mac-cpu
@@ -25,7 +25,7 @@ set -euo pipefail
 #   SCENARIONET_REF=<git ref>
 #   DRY_RUN=0|1
 
-PYTHON_BIN="${PYTHON_BIN:-python3.10}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 VENV_DIR="${VENV_DIR:-.venv-legacy-adv-bmt}"
 RECREATE_VENV="${RECREATE_VENV:-0}"
 LEGACY_PROFILE="${LEGACY_PROFILE:-auto}"
@@ -46,6 +46,28 @@ run_cmd() {
   if [[ "$DRY_RUN" != "1" ]]; then
     "$@"
   fi
+}
+
+resolve_python_bin() {
+  if [[ -n "$PYTHON_BIN" ]]; then
+    if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+      echo "$PYTHON_BIN"
+      return
+    fi
+    echo "Requested PYTHON_BIN not found on PATH: $PYTHON_BIN" >&2
+    exit 1
+  fi
+
+  local candidate
+  for candidate in python3.10 python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      echo "$candidate"
+      return
+    fi
+  done
+
+  echo "No suitable Python interpreter found. Checked: python3.10, python3, python" >&2
+  exit 1
 }
 
 detect_profile() {
@@ -109,6 +131,7 @@ clone_or_reuse_repo() {
 }
 
 PROFILE="$(detect_profile)"
+PYTHON_BIN="$(resolve_python_bin)"
 
 case "$PROFILE" in
   linux-cu121)

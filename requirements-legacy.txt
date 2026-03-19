@@ -10,7 +10,10 @@
 # Core
 lightning==2.4.0
 gradio==5.0.1
-numpy==2.2.6
+# The released Adv-BMT package metadata requires numpy>=1.26,<2.
+# Keep this legacy snapshot on the same NumPy line as the dedicated legacy
+# bootstrap so direct installs do not fail resolver checks.
+numpy==1.26.4
 tensorboardx==2.6.4
 easydict==1.13
 pyyaml==6.0.3

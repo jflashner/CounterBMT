@@ -13,11 +13,35 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+PYTHON_BIN="${PYTHON_BIN:-}"
+
 run_cmd() {
   echo "+ $*"
   if [[ "${DRY_RUN:-0}" != "1" ]]; then
     "$@"
   fi
+}
+
+resolve_python_bin() {
+  if [[ -n "$PYTHON_BIN" ]]; then
+    if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+      echo "$PYTHON_BIN"
+      return
+    fi
+    echo "Requested PYTHON_BIN not found on PATH: $PYTHON_BIN" >&2
+    exit 1
+  fi
+
+  local candidate
+  for candidate in python3.10 python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      echo "$candidate"
+      return
+    fi
+  done
+
+  echo "No suitable Python interpreter found. Checked: python3.10, python3, python" >&2
+  exit 1
 }
 
 if [[ -z "${TRAIN_DATA_DIR:-}" ]]; then
@@ -30,7 +54,9 @@ if [[ -z "${VAL_DATA_DIR:-}" ]]; then
   exit 1
 fi
 
-PYTHON_BIN="${PYTHON_BIN:-python3.10}"
+PYTHON_BIN="$(resolve_python_bin)"
+
+PYTHON_BIN="${PYTHON_BIN:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/h200_midgpt_learning_probe}"
 V2_VENV_DIR="${V2_VENV_DIR:-.venv-v2}"
 LEGACY_VENV_DIR="${LEGACY_VENV_DIR:-.venv-legacy-adv-bmt}"
