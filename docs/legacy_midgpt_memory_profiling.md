@@ -31,7 +31,16 @@ The key measurements are:
   - modeled agents
   - decoder token steps
   - valid map tokens
-  - active traffic lights
+- active traffic lights
+
+The profiler also applies a small profiling-only collate sanitizer for legacy
+metadata fields:
+
+- NumPy scalars are converted to plain Python scalars
+- unsupported non-array metadata objects are converted to `repr(...)` strings
+
+This does not change the model inputs. It only prevents the legacy collate
+assertion from tripping on metadata-like fields the model never reads.
 
 ## Recommended First Run
 

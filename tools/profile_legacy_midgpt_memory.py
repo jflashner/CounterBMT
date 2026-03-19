@@ -31,6 +31,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 import lightning.pytorch as pl
+import numpy as np
 import torch
 
 
@@ -97,6 +98,60 @@ def _safe_int_list(values: Any) -> List[int]:
         return [int(v) for v in values]
     except Exception:
         return []
+
+
+def _patch_legacy_collate_for_profiling(datamodule: Any) -> List[Dict[str, str]]:
+    """Wrap legacy collate functions so profiling is resilient to object metadata.
+
+    The released legacy `collate_batch` asserts that every non-array value is a
+    Python scalar or string. Some real ScenarioNet samples carry metadata-like
+    values that violate that assumption even though the model never reads them.
+    For profiling we would rather preserve training behavior on model inputs and
+    sanitize only those non-model extras.
+    """
+
+    patched: List[Dict[str, str]] = []
+
+    def _wrap_dataset(ds: Any, split: str) -> None:
+        if ds is None or not hasattr(ds, "collate_batch"):
+            return
+
+        original = ds.collate_batch
+        seen_keys: set[str] = set()
+
+        def wrapped(batch_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+            sanitized_batch: List[Dict[str, Any]] = []
+            for sample in batch_list:
+                if not isinstance(sample, dict):
+                    sanitized_batch.append(sample)
+                    continue
+                out = dict(sample)
+                for key, value in list(out.items()):
+                    if isinstance(value, np.generic):
+                        out[key] = value.item()
+                        if key not in seen_keys:
+                            patched.append(
+                                {"split": split, "key": str(key), "action": "numpy_scalar_to_python", "type": type(value).__name__}
+                            )
+                            seen_keys.add(str(key))
+                    elif isinstance(value, (int, float, bool, str, np.ndarray)):
+                        continue
+                    else:
+                        out[key] = repr(value)
+                        if key not in seen_keys:
+                            patched.append(
+                                {"split": split, "key": str(key), "action": "object_repr_fallback", "type": type(value).__name__}
+                            )
+                            seen_keys.add(str(key))
+                sanitized_batch.append(out)
+            return original(sanitized_batch)
+
+        ds.collate_batch = wrapped
+
+    datamodule.setup("fit")
+    _wrap_dataset(getattr(datamodule, "train_dataset", None), "train")
+    _wrap_dataset(getattr(datamodule, "val_dataset", None), "val")
+    return patched
 
 
 class LegacyMemoryTraceCallback(pl.Callback):
@@ -319,6 +374,7 @@ def main() -> int:
         val_num_workers=int(args.val_num_workers),
         val_prefetch_factor=int(args.prefetch_factor),
     )
+    collate_patches = _patch_legacy_collate_for_profiling(datamodule)
     model = MotionLMLightning(config=config)
     callback = LegacyMemoryTraceCallback(
         output_dir=output_dir,
@@ -355,6 +411,7 @@ def main() -> int:
         "overrides": overrides,
         "trainer_kwargs": _jsonable(trainer_meta),
         "output_dir": str(output_dir),
+        "collate_sanitization": collate_patches,
     }
     (output_dir / "run_meta.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
 
