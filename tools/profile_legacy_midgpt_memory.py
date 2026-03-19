@@ -100,8 +100,8 @@ def _safe_int_list(values: Any) -> List[int]:
         return []
 
 
-def _patch_legacy_collate_for_profiling(datamodule: Any) -> List[Dict[str, str]]:
-    """Wrap legacy collate functions so profiling is resilient to object metadata.
+def _patch_legacy_collate_for_profiling(dataset_cls: Any) -> List[Dict[str, str]]:
+    """Wrap legacy collate globally so profiling is resilient to object metadata.
 
     The released legacy `collate_batch` asserts that every non-array value is a
     Python scalar or string. Some real ScenarioNet samples carry metadata-like
@@ -111,46 +111,52 @@ def _patch_legacy_collate_for_profiling(datamodule: Any) -> List[Dict[str, str]]
     """
 
     patched: List[Dict[str, str]] = []
+    if getattr(dataset_cls, "_counterbmt_profile_collate_patched", False):
+        return patched
 
-    def _wrap_dataset(ds: Any, split: str) -> None:
-        if ds is None or not hasattr(ds, "collate_batch"):
-            return
+    original = dataset_cls.collate_batch
+    seen_keys: set[str] = set()
 
-        original = ds.collate_batch
-        seen_keys: set[str] = set()
-
-        def wrapped(batch_list: List[Dict[str, Any]]) -> Dict[str, Any]:
-            sanitized_batch: List[Dict[str, Any]] = []
-            for sample in batch_list:
-                if not isinstance(sample, dict):
-                    sanitized_batch.append(sample)
+    def wrapped(self: Any, batch_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+        sanitized_batch: List[Dict[str, Any]] = []
+        split = str(getattr(self, "mode", "unknown"))
+        for sample in batch_list:
+            if not isinstance(sample, dict):
+                sanitized_batch.append(sample)
+                continue
+            out = dict(sample)
+            for key, value in list(out.items()):
+                if isinstance(value, np.generic):
+                    out[key] = value.item()
+                    if key not in seen_keys:
+                        patched.append(
+                            {
+                                "split": split,
+                                "key": str(key),
+                                "action": "numpy_scalar_to_python",
+                                "type": type(value).__name__,
+                            }
+                        )
+                        seen_keys.add(str(key))
+                elif isinstance(value, (int, float, bool, str, np.ndarray)):
                     continue
-                out = dict(sample)
-                for key, value in list(out.items()):
-                    if isinstance(value, np.generic):
-                        out[key] = value.item()
-                        if key not in seen_keys:
-                            patched.append(
-                                {"split": split, "key": str(key), "action": "numpy_scalar_to_python", "type": type(value).__name__}
-                            )
-                            seen_keys.add(str(key))
-                    elif isinstance(value, (int, float, bool, str, np.ndarray)):
-                        continue
-                    else:
-                        out[key] = repr(value)
-                        if key not in seen_keys:
-                            patched.append(
-                                {"split": split, "key": str(key), "action": "object_repr_fallback", "type": type(value).__name__}
-                            )
-                            seen_keys.add(str(key))
-                sanitized_batch.append(out)
-            return original(sanitized_batch)
+                else:
+                    out[key] = repr(value)
+                    if key not in seen_keys:
+                        patched.append(
+                            {
+                                "split": split,
+                                "key": str(key),
+                                "action": "object_repr_fallback",
+                                "type": type(value).__name__,
+                            }
+                        )
+                        seen_keys.add(str(key))
+            sanitized_batch.append(out)
+        return original(self, sanitized_batch)
 
-        ds.collate_batch = wrapped
-
-    datamodule.setup("fit")
-    _wrap_dataset(getattr(datamodule, "train_dataset", None), "train")
-    _wrap_dataset(getattr(datamodule, "val_dataset", None), "val")
+    dataset_cls.collate_batch = wrapped
+    dataset_cls._counterbmt_profile_collate_patched = True
     return patched
 
 
@@ -350,6 +356,7 @@ def main() -> int:
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
+    from bmt.dataset import dataset as legacy_dataset_module
     from bmt.dataset.datamodule import InfgenDataModule
     from bmt.models.motionlm_lightning import MotionLMLightning
 
@@ -365,6 +372,8 @@ def main() -> int:
     config.ROOT_DIR = legacy_root
     OmegaConf.set_struct(config, True)
 
+    collate_patches = _patch_legacy_collate_for_profiling(legacy_dataset_module.InfgenDataset)
+
     datamodule = InfgenDataModule(
         config,
         train_batch_size=int(args.batch_size),
@@ -374,7 +383,6 @@ def main() -> int:
         val_num_workers=int(args.val_num_workers),
         val_prefetch_factor=int(args.prefetch_factor),
     )
-    collate_patches = _patch_legacy_collate_for_profiling(datamodule)
     model = MotionLMLightning(config=config)
     callback = LegacyMemoryTraceCallback(
         output_dir=output_dir,
