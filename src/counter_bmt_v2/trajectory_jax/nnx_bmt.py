@@ -899,9 +899,9 @@ if HAS_NNX:
             key_value: jnp.ndarray,
             *,
             mask: Optional[jnp.ndarray] = None,   # [B,Lq,Lk] bool
-            rel_feat: Optional[jnp.ndarray] = None,  # [B,Lq,Lk,R]
-            rel_mask: Optional[jnp.ndarray] = None,  # [B,Lq,Lk] bool
-            rel_indices: Optional[jnp.ndarray] = None,  # [B,Lq,R] int
+            rel_feat: Optional[jnp.ndarray] = None,  # [B,Lq,Lk_or_K,R]
+            rel_mask: Optional[jnp.ndarray] = None,  # [B,Lq,Lk_or_K] bool
+            rel_indices: Optional[jnp.ndarray] = None,  # [B,Lq,K] int
         ) -> jnp.ndarray:
             bsz, q_len, _ = query.shape
             _, k_len, _ = key_value.shape
@@ -1163,12 +1163,12 @@ if HAS_NNX:
             *,
             scene_tokens: jnp.ndarray,  # [B,S,D]
             scene_token_mask: Optional[jnp.ndarray] = None,  # [B,S]
-            a2a_rel: Optional[jnp.ndarray] = None,  # [B,T,N,N,Ra2a]
+            a2a_rel: Optional[jnp.ndarray] = None,  # [B,T,N,K_or_N,Ra2a]
             a2t_rel: Optional[jnp.ndarray] = None,  # [B,N,T,T,Ra2t]
-            a2s_rel: Optional[jnp.ndarray] = None,  # [B,T,N,S,Ra2s]
-            a2a_mask: Optional[jnp.ndarray] = None,  # [B,T,N,N]
+            a2s_rel: Optional[jnp.ndarray] = None,  # [B,T,N,K_or_S,Ra2s]
+            a2a_mask: Optional[jnp.ndarray] = None,  # [B,T,N,K_or_N]
             a2t_mask: Optional[jnp.ndarray] = None,  # [B,N,T,T]
-            a2s_mask: Optional[jnp.ndarray] = None,  # [B,T,N,S]
+            a2s_mask: Optional[jnp.ndarray] = None,  # [B,T,N,K_or_S]
             a2a_indices: Optional[jnp.ndarray] = None,  # [B,T,N,K]
             a2t_indices: Optional[jnp.ndarray] = None,  # [B,N,T,K]
             a2s_indices: Optional[jnp.ndarray] = None,  # [B,T,N,K]
@@ -1685,12 +1685,12 @@ if HAS_NNX:
             scene_tl_feature: Optional[jnp.ndarray] = None,  # [B,T,L,7] or [B,L,7]
             scene_tl_valid_mask: Optional[jnp.ndarray] = None,  # [B,T,L] or [B,L]
             scene_tl_position: Optional[jnp.ndarray] = None,  # [B,L,3]
-            a2a_rel: Optional[jnp.ndarray] = None,  # [B,T,N,N,Ra2a]
+            a2a_rel: Optional[jnp.ndarray] = None,  # [B,T,N,K_or_N,Ra2a]
             a2t_rel: Optional[jnp.ndarray] = None,  # [B,N,T,T,Ra2t]
-            a2s_rel: Optional[jnp.ndarray] = None,  # [B,T,N,S,Ra2s]
-            a2a_mask: Optional[jnp.ndarray] = None,  # [B,T,N,N]
+            a2s_rel: Optional[jnp.ndarray] = None,  # [B,T,N,K_or_S,Ra2s]
+            a2a_mask: Optional[jnp.ndarray] = None,  # [B,T,N,K_or_N]
             a2t_mask: Optional[jnp.ndarray] = None,  # [B,N,T,T]
-            a2s_mask: Optional[jnp.ndarray] = None,  # [B,T,N,S]
+            a2s_mask: Optional[jnp.ndarray] = None,  # [B,T,N,K_or_S]
             a2a_indices: Optional[jnp.ndarray] = None,  # [B,T,N,K]
             a2t_indices: Optional[jnp.ndarray] = None,  # [B,N,T,K]
             a2s_indices: Optional[jnp.ndarray] = None,  # [B,T,N,K]

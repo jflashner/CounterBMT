@@ -668,7 +668,15 @@ def build_relation_bundle(
     agent_length = agent_shape[..., 0]
     agent_width = agent_shape[..., 1]
 
-    # A2A: [B,T,N,N,12] for MidGPT simple+contour path.
+    # A2A: legacy MotionDecoderGPT uses the default relation gather path here.
+    # That means the raw relation tensor is already reduced to KNN width before
+    # Fourier embedding and sparse edge extraction. Keeping this gathered in the
+    # parity path is important both for shape fidelity and to avoid paying full
+    # [N x N] memory when the legacy model is only operating on the KNN subset.
+    #
+    # Legacy reference:
+    #   motion_decoder_gpt.py -> relation_func(...) for a2a without gather=False
+    #   relation.py -> compute_relation(..., gather=True by default)
     a2a_q_pos = agent_position_xy.reshape(B * T, N, 2)
     a2a_q_heading = agent_heading.reshape(B * T, N)
     a2a_q_mask = agent_valid_mask.reshape(B * T, N)
@@ -695,7 +703,7 @@ def build_relation_bundle(
         causal_valid_mask=None,
         knn=cfg.a2a_knn,
         max_distance=cfg.a2a_distance,
-        gather=False,
+        gather=True,
         return_pe=False,
         non_agent_relation=False,
         per_contour_point_relation=cfg.per_contour_point_relation,
@@ -704,7 +712,8 @@ def build_relation_bundle(
     a2a_rel = a2a_rel_bt.reshape(B, T, N, a2a_rel_bt.shape[2], a2a_rel_bt.shape[3])
     a2a_mask = a2a_mask_bt.reshape(B, T, N, a2a_mask_bt.shape[2])
 
-    # A2T: [B,N,T,T,12]
+    # A2T: legacy uses knn=None, so this remains full temporal width. The
+    # gather flag is therefore irrelevant for parity in this branch.
     a2t_q_pos = np.transpose(agent_position_xy, (0, 2, 1, 3)).reshape(B * N, T, 2)
     a2t_q_heading = np.transpose(agent_heading, (0, 2, 1)).reshape(B * N, T)
     a2t_q_mask = np.transpose(agent_valid_mask, (0, 2, 1)).reshape(B * N, T)
@@ -740,7 +749,10 @@ def build_relation_bundle(
     a2t_rel = a2t_rel_bn.reshape(B, N, T, a2t_rel_bn.shape[2], a2t_rel_bn.shape[3])
     a2t_mask = a2t_mask_bn.reshape(B, N, T, a2t_mask_bn.shape[2])
 
-    # A2S: [B,T,N,S,3]
+    # A2S: legacy explicitly passes gather=False, then converts the masked dense
+    # [query x scene] relation tensor into sparse edge lists. We keep that exact
+    # shape behavior here for parity, even though it is still a major memory hot
+    # spot in both implementations.
     S = scene_position.shape[1]
     a2s_q_pos = agent_position_xy.reshape(B, T * N, 2)
     a2s_q_heading = agent_heading.reshape(B, T * N)

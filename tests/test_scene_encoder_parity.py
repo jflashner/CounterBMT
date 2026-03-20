@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover
 
 from counter_bmt_v2.trajectory_jax.nnx_bmt import NNXBidirectionalMotionTransformer
 from counter_bmt_v2.trajectory_jax.presets import midgpt_dag_latent_config, midgpt_parity_config
+from counter_bmt_v2.trajectory_jax.relation_parity import RelationBundleConfig, build_relation_bundle
 
 
 @unittest.skipUnless(HAS_NNX, "jax/flax nnx required")
@@ -274,6 +275,72 @@ class SceneEncoderParityTests(unittest.TestCase):
             atol=1e-6,
             rtol=1e-6,
         )
+
+    def test_relation_bundle_matches_legacy_decoder_gather_behavior(self) -> None:
+        # Legacy MidGPT relation preparation is asymmetric:
+        # - A2A uses the default gathered KNN relation tensor.
+        # - A2T keeps full temporal width because knn=None.
+        # - A2S explicitly disables gather and remains full scene width.
+        #
+        # This test protects that exact shape contract so future memory fixes do
+        # not accidentally drift away from the legacy forward path we are trying
+        # to match.
+        cfg = RelationBundleConfig(
+            simple_relation=True,
+            per_contour_point_relation=False,
+            include_contour=True,
+            a2a_knn=2,
+            a2s_knn=3,
+            strict_non_agent_relation=False,
+        )
+
+        batch = 1
+        t_steps = 2
+        n_agents = 3
+        n_scene = 5
+
+        agent_position_xy = np.array(
+            [
+                [
+                    [[0.0, 0.0], [3.0, 0.0], [8.0, 0.0]],
+                    [[0.5, 0.0], [3.5, 0.1], [8.5, -0.1]],
+                ]
+            ],
+            dtype=np.float32,
+        )
+        agent_heading = np.zeros((batch, t_steps, n_agents), dtype=np.float32)
+        agent_valid_mask = np.ones((batch, t_steps, n_agents), dtype=bool)
+        agent_shape = np.ones((batch, n_agents, 3), dtype=np.float32)
+
+        scene_position = np.array(
+            [[[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [10.0, 0.0, 0.0], [15.0, 0.0, 0.0], [20.0, 0.0, 0.0]]],
+            dtype=np.float32,
+        )
+        scene_heading = np.full((batch, n_scene), -100.0, dtype=np.float32)
+        scene_valid_mask = np.ones((batch, n_scene), dtype=bool)
+
+        bundle = build_relation_bundle(
+            agent_position_xy=agent_position_xy,
+            agent_heading=agent_heading,
+            agent_valid_mask=agent_valid_mask,
+            decoder_valid_mask=agent_valid_mask,
+            agent_shape=agent_shape,
+            scene_position=scene_position,
+            scene_heading=scene_heading,
+            scene_valid_mask=scene_valid_mask,
+            cfg=cfg,
+        )
+
+        self.assertEqual(bundle["a2a_rel_feat"].shape, (batch, t_steps, n_agents, 2, 12))
+        self.assertEqual(bundle["a2a_mask"].shape, (batch, t_steps, n_agents, 2))
+        self.assertEqual(bundle["a2a_indices"].shape, (batch, t_steps, n_agents, 2))
+
+        self.assertEqual(bundle["a2t_rel_feat"].shape, (batch, n_agents, t_steps, t_steps, 12))
+        self.assertEqual(bundle["a2t_mask"].shape, (batch, n_agents, t_steps, t_steps))
+
+        self.assertEqual(bundle["a2s_rel_feat"].shape, (batch, t_steps, n_agents, n_scene, 3))
+        self.assertEqual(bundle["a2s_mask"].shape, (batch, t_steps, n_agents, n_scene))
+        self.assertEqual(bundle["a2s_indices"].shape, (batch, t_steps, n_agents, 3))
 
 
 if __name__ == "__main__":
