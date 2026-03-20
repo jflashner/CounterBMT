@@ -216,10 +216,20 @@ class LegacyMemoryTraceCallback(pl.Callback):
             summary["decoder_valid_cells_per_sample"] = _safe_int_list(valid_decoder_cells)
         if map_valid is not None:
             summary["encoder_map_valid_mask_shape"] = list(map_valid.shape)
-            summary["valid_map_tokens_per_sample"] = _safe_int_list(map_valid.sum(dim=1).detach().cpu().tolist())
+            if map_valid.ndim >= 2:
+                summary["valid_map_tokens_per_sample"] = _safe_int_list(map_valid.sum(dim=1).detach().cpu().tolist())
+            elif map_valid.ndim == 1:
+                summary["valid_map_tokens_per_sample"] = _safe_int_list(map_valid.detach().cpu().tolist())
         if tl_valid is not None:
             summary["encoder_traffic_light_valid_mask_shape"] = list(tl_valid.shape)
-            tl_counts = tl_valid.any(dim=1).sum(dim=1).detach().cpu().tolist()
+            if tl_valid.ndim >= 3:
+                tl_counts = tl_valid.any(dim=1).sum(dim=1).detach().cpu().tolist()
+            elif tl_valid.ndim == 2:
+                tl_counts = tl_valid.sum(dim=1).detach().cpu().tolist()
+            elif tl_valid.ndim == 1:
+                tl_counts = tl_valid.detach().cpu().tolist()
+            else:
+                tl_counts = []
             summary["active_traffic_lights_per_sample"] = _safe_int_list(tl_counts)
         return summary
 
