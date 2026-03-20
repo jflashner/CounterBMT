@@ -40,6 +40,8 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+import numpy as np
+
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Profile v2 MidGPT GPU memory on short supervised training runs.")
@@ -366,7 +368,6 @@ def main() -> int:
 
     import jax
     import jax.numpy as jnp
-    import numpy as np
     import optax
     from flax import nnx
 
