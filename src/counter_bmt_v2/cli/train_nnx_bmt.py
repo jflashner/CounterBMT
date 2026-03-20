@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         "--runtime-preset",
         type=str,
         default="none",
-        choices=["none", "adv_bmt_runtime_parity", "legacy_midgpt_recipe"],
+        choices=["none", "adv_bmt_runtime_parity", "legacy_midgpt_recipe", "legacy_midgpt_speed_recipe"],
         help="training/runtime defaults; explicit CLI flags override these values",
     )
 
@@ -179,12 +179,26 @@ def parse_args() -> argparse.Namespace:
         "--collate-padding-mode",
         type=str,
         default=None,
-        choices=["fixed", "batch_local"],
+        choices=["fixed", "batch_local", "bucketed"],
         help=(
             "batch padding policy: 'fixed' pads to configured ceilings, "
-            "'batch_local' pads to per-batch maxima under those ceilings"
+            "'batch_local' pads to per-batch maxima under those ceilings, "
+            "'bucketed' rounds per-batch maxima up to reusable compile-friendly buckets"
         ),
     )
+    parser.add_argument(
+        "--decoder-edge-sparse-attn",
+        dest="decoder_edge_sparse_attn",
+        action="store_true",
+        help="enable the opt-in edge-sparse decoder attention path for speed experiments",
+    )
+    parser.add_argument(
+        "--no-decoder-edge-sparse-attn",
+        dest="decoder_edge_sparse_attn",
+        action="store_false",
+        help="disable the opt-in edge-sparse decoder attention path",
+    )
+    parser.set_defaults(decoder_edge_sparse_attn=False)
 
     parser.add_argument(
         "--no-center-to-map",
@@ -400,6 +414,7 @@ def main() -> int:
         max_vectors_per_map_feature=args.max_vectors,
         max_traffic_lights=args.max_traffic_lights,
         collate_padding_mode=str(resolved_runtime["collate_padding_mode"]),
+        decoder_edge_sparse_attn=bool(args.decoder_edge_sparse_attn),
         center_to_map=(not args.no_center_to_map),
         resume_checkpoint=args.resume_checkpoint,
         resume_strict_determinism=bool(args.resume_strict_determinism),

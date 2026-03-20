@@ -68,7 +68,7 @@ TokenizerModeType = Literal["paper_simple", "adv_bmt_parity"]
 DistributedBackendType = Literal["none", "pmap"]
 PrecisionType = Literal["fp32", "bf16-mixed"]
 LRScheduleModeType = Literal["v2_cosine_minlr", "legacy_cosine_zero"]
-CollatePaddingModeType = Literal["fixed", "batch_local"]
+CollatePaddingModeType = Literal["fixed", "batch_local", "bucketed"]
 
 
 @dataclass
@@ -135,12 +135,19 @@ class SupervisedTrainConfig:
     max_vectors_per_map_feature: int = 128
     max_traffic_lights: int = 64
     collate_padding_mode: CollatePaddingModeType = "fixed"
+    # Bucketed padding is a compromise between legacy-like batch-local memory
+    # efficiency and JAX-friendly static shapes. We round each batch up to the
+    # next coarse bucket so many batches can share the same compiled step.
+    collate_agent_buckets: Tuple[int, ...] = (16, 24, 32, 48, 64, 80, 96, 112, 128)
+    collate_map_feature_buckets: Tuple[int, ...] = (128, 192, 256, 320, 384, 448, 512)
+    collate_traffic_light_buckets: Tuple[int, ...] = (8, 16, 24, 32, 48, 64)
 
     center_to_map: bool = True
     resume_checkpoint: str = ""
     relation_debug_dump_dir: str = ""
     relation_debug_dump_every_steps: int = 0
     relation_debug_max_batches: int = 1
+    decoder_edge_sparse_attn: bool = False
     runtime_preset: str = "none"
     runtime_resolved_overrides: Dict[str, Any] = field(default_factory=dict)
 
@@ -414,7 +421,7 @@ def _prepare_supervised_batch(
     rng: np.random.Generator,
     is_training: bool,
 ) -> Dict[str, Any]:
-    collate_limits = _resolve_collate_padding_limits(train_cfg)
+    collate_limits = _resolve_collate_padding_limits(train_cfg, samples=samples)
     batch = collate_nnx_scene_samples(
         samples,
         max_time_steps=collate_limits["max_time_steps"],
@@ -534,7 +541,21 @@ def _prepare_supervised_batch(
     }
 
 
-def _resolve_collate_padding_limits(train_cfg: SupervisedTrainConfig) -> Dict[str, Optional[int]]:
+def _bucket_up(value: int, buckets: Tuple[int, ...], *, ceiling: int) -> int:
+    value_i = int(value)
+    if value_i <= 0:
+        return 0
+    for bucket in sorted(int(x) for x in buckets if int(x) > 0):
+        if value_i <= bucket <= int(ceiling):
+            return int(bucket)
+    return int(ceiling)
+
+
+def _resolve_collate_padding_limits(
+    train_cfg: SupervisedTrainConfig,
+    *,
+    samples: Optional[Sequence[NNXBMTSceneSample]] = None,
+) -> Dict[str, Optional[int]]:
     """Resolve batch padding limits from the training config.
 
     Legacy Adv-BMT keeps `MAX_*` values as per-sample ceilings, but with
@@ -545,10 +566,10 @@ def _resolve_collate_padding_limits(train_cfg: SupervisedTrainConfig) -> Dict[st
     """
 
     mode = str(train_cfg.collate_padding_mode).strip().lower()
-    if mode not in {"fixed", "batch_local"}:
+    if mode not in {"fixed", "batch_local", "bucketed"}:
         raise ValueError(
             "Unsupported collate_padding_mode: "
-            f"{train_cfg.collate_padding_mode!r}. Expected 'fixed' or 'batch_local'."
+            f"{train_cfg.collate_padding_mode!r}. Expected 'fixed', 'batch_local', or 'bucketed'."
         )
 
     if mode == "fixed":
@@ -565,12 +586,48 @@ def _resolve_collate_padding_limits(train_cfg: SupervisedTrainConfig) -> Dict[st
     # budget fixed because individual map tokens are already extracted at that
     # shape. The large memory savings come from letting agent/map/light counts
     # follow the batch-local maxima instead of the global ceilings.
+    if mode == "batch_local":
+        return {
+            "max_time_steps": int(train_cfg.max_time_steps),
+            "max_agents": None,
+            "max_map_features": None,
+            "max_vectors_per_map_feature": int(train_cfg.max_vectors_per_map_feature),
+            "max_traffic_lights": None,
+        }
+
+    # Bucketed mode is the speed-oriented compromise for JAX training. It uses
+    # the batch-local maxima, but rounds them up to a small set of reusable
+    # shapes so XLA can amortize compilation across many steps.
+    if not samples:
+        return {
+            "max_time_steps": int(train_cfg.max_time_steps),
+            "max_agents": int(train_cfg.max_agents),
+            "max_map_features": int(train_cfg.max_map_features),
+            "max_vectors_per_map_feature": int(train_cfg.max_vectors_per_map_feature),
+            "max_traffic_lights": int(train_cfg.max_traffic_lights),
+        }
+
+    inferred_n = max(int(s.agent_position_xy.shape[1]) for s in samples)
+    inferred_m = max(int(s.map_feature.shape[0]) for s in samples)
+    inferred_l = max(int(s.traffic_light_feature.shape[1]) for s in samples)
     return {
         "max_time_steps": int(train_cfg.max_time_steps),
-        "max_agents": None,
-        "max_map_features": None,
+        "max_agents": _bucket_up(
+            inferred_n,
+            tuple(train_cfg.collate_agent_buckets),
+            ceiling=int(train_cfg.max_agents),
+        ),
+        "max_map_features": _bucket_up(
+            inferred_m,
+            tuple(train_cfg.collate_map_feature_buckets),
+            ceiling=int(train_cfg.max_map_features),
+        ),
         "max_vectors_per_map_feature": int(train_cfg.max_vectors_per_map_feature),
-        "max_traffic_lights": None,
+        "max_traffic_lights": _bucket_up(
+            inferred_l,
+            tuple(train_cfg.collate_traffic_light_buckets),
+            ceiling=int(train_cfg.max_traffic_lights),
+        ),
     }
 
 
@@ -1484,7 +1541,14 @@ def _validate_resume_compatibility(
         )
 
     ckpt_train_cfg = resume_payload.get("train_cfg", {})
-    for k in ("model_preset", "tokenizer_mode", "skip_steps", "precision", "collate_padding_mode"):
+    for k in (
+        "model_preset",
+        "tokenizer_mode",
+        "skip_steps",
+        "precision",
+        "collate_padding_mode",
+        "decoder_edge_sparse_attn",
+    ):
         if k in ckpt_train_cfg and ckpt_train_cfg[k] != getattr(train_cfg, k):
             raise ValueError(
                 f"Resume strict determinism failed: train_cfg[{k}] mismatch "
@@ -1623,6 +1687,8 @@ def train_supervised(train_cfg: SupervisedTrainConfig) -> Dict[str, Any]:
         raise ValueError(f"sample_interval_test must be >= 1, got {train_cfg.sample_interval_test}")
 
     model_cfg = _resolve_model_preset(train_cfg.model_preset)
+    if bool(getattr(train_cfg, "decoder_edge_sparse_attn", False)):
+        model_cfg.decoder.edge_sparse_relation_attn = True
     if train_cfg.tokenizer_mode == "adv_bmt_parity":
         tokenizer = AdvBMTParityTokenizer(
             ParityTokenizerConfig(num_skipped_steps=int(train_cfg.skip_steps))

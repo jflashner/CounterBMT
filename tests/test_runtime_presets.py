@@ -71,6 +71,18 @@ class RuntimePresetTests(unittest.TestCase):
         self.assertEqual(resolved["reverse_probability"], 0.0)
         self.assertEqual(resolved["collate_padding_mode"], "batch_local")
 
+    def test_speed_recipe_uses_bucketed_padding(self) -> None:
+        preset = get_runtime_preset("legacy_midgpt_speed_recipe")
+        self.assertEqual(preset["model_preset"], "midgpt_parity")
+        self.assertEqual(preset["tokenizer_mode"], "adv_bmt_parity")
+        self.assertEqual(preset["collate_padding_mode"], "bucketed")
+
+        resolved = resolve_supervised_runtime(
+            _base_runtime_args(runtime_preset="legacy_midgpt_speed_recipe"),
+            provided_flags=set(),
+        )
+        self.assertEqual(resolved["collate_padding_mode"], "bucketed")
+
 
 if __name__ == "__main__":
     unittest.main()

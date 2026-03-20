@@ -14,13 +14,36 @@ except Exception:  # pragma: no cover
     nnx = None
     HAS_NNX = False
 
-from counter_bmt_v2.trajectory_jax.nnx_bmt import NNXBidirectionalMotionTransformer
+from counter_bmt_v2.trajectory_jax.nnx_bmt import (
+    NNXBidirectionalMotionTransformer,
+    MultiHeadAttention,
+    SparseEdgeMultiHeadAttention,
+)
 from counter_bmt_v2.trajectory_jax.presets import midgpt_dag_latent_config, midgpt_parity_config
 from counter_bmt_v2.trajectory_jax.relation_parity import RelationBundleConfig, build_relation_bundle
 
 
 @unittest.skipUnless(HAS_NNX, "jax/flax nnx required")
 class SceneEncoderParityTests(unittest.TestCase):
+    @staticmethod
+    def _copy_linear(dst, src) -> None:
+        dst.w.value = jnp.array(src.w.value)
+        if getattr(dst, "b", None) is not None and getattr(src, "b", None) is not None:
+            dst.b.value = jnp.array(src.b.value)
+
+    @staticmethod
+    def _copy_attention_weights(dst, src) -> None:
+        SceneEncoderParityTests._copy_linear(dst.q_proj, src.q_proj)
+        SceneEncoderParityTests._copy_linear(dst.k_proj, src.k_proj)
+        SceneEncoderParityTests._copy_linear(dst.v_proj, src.v_proj)
+        SceneEncoderParityTests._copy_linear(dst.o_proj, src.o_proj)
+        if getattr(src, "q_rel_proj", None) is not None and getattr(dst, "q_rel_proj", None) is not None:
+            SceneEncoderParityTests._copy_linear(dst.q_rel_proj, src.q_rel_proj)
+            SceneEncoderParityTests._copy_linear(dst.rel_k_proj, src.rel_k_proj)
+            SceneEncoderParityTests._copy_linear(dst.rel_v_proj, src.rel_v_proj)
+        if getattr(src, "rel_norm", None) is not None and getattr(dst, "rel_norm", None) is not None:
+            dst.rel_norm.scale.value = jnp.array(src.rel_norm.scale.value)
+
     def _dummy_scene_inputs(self) -> dict[str, np.ndarray]:
         batch = 1
         n_map = 3
@@ -275,6 +298,60 @@ class SceneEncoderParityTests(unittest.TestCase):
             atol=1e-6,
             rtol=1e-6,
         )
+
+    def test_edge_sparse_attention_matches_dense_attention_on_small_example(self) -> None:
+        d_model = 8
+        n_heads = 2
+        rel_dim = 4
+
+        dense = MultiHeadAttention(
+            d_model,
+            n_heads,
+            relation_dim=rel_dim,
+            add_relation_to_v=False,
+            remove_rel_norm=False,
+            rngs=nnx.Rngs(0),
+        )
+        sparse = SparseEdgeMultiHeadAttention(
+            d_model,
+            n_heads,
+            relation_dim=rel_dim,
+            add_relation_to_v=False,
+            remove_rel_norm=False,
+            rngs=nnx.Rngs(1),
+        )
+        self._copy_attention_weights(sparse, dense)
+
+        query = jnp.asarray(
+            [[[0.1, 0.2, 0.3, 0.4, -0.2, 0.0, 0.1, 0.5], [0.0, -0.1, 0.2, 0.3, 0.4, 0.5, -0.4, 0.2]]],
+            dtype=jnp.float32,
+        )
+        key_value = jnp.asarray(
+            [[[0.3, 0.1, 0.2, 0.0, -0.2, 0.2, 0.4, 0.1], [0.2, -0.2, 0.5, 0.1, 0.1, 0.0, 0.3, -0.1], [0.7, 0.2, -0.1, 0.4, 0.2, 0.3, -0.2, 0.0]]],
+            dtype=jnp.float32,
+        )
+        rel_indices = jnp.asarray([[[0, 2], [1, 2]]], dtype=jnp.int32)
+        rel_feat = jnp.asarray(
+            [[[[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]], [[-0.2, 0.1, 0.0, 0.3], [0.2, -0.1, 0.5, 0.0]]]],
+            dtype=jnp.float32,
+        )
+        rel_mask = jnp.asarray([[[True, True], [True, True]]], dtype=bool)
+
+        dense_out = dense(
+            query,
+            key_value,
+            rel_feat=rel_feat,
+            rel_mask=rel_mask,
+            rel_indices=rel_indices,
+        )
+        sparse_out = sparse(
+            query,
+            key_value,
+            rel_feat=rel_feat,
+            rel_mask=rel_mask,
+            rel_indices=rel_indices,
+        )
+        np.testing.assert_allclose(np.asarray(dense_out), np.asarray(sparse_out), atol=1e-5, rtol=1e-5)
 
     def test_relation_bundle_matches_legacy_decoder_gather_behavior(self) -> None:
         # Legacy MidGPT relation preparation is asymmetric:

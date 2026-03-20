@@ -109,6 +109,11 @@ class NNXDecoderParityConfig:
     randomize_agent_id: bool = False
     use_backward_indicator_embed: bool = False
     dense_masked_relation_attn: bool = True
+    # Opt-in speed path: execute decoder relation attention on flattened padded
+    # edge lists instead of large gathered [B,H,Q,K,D] tensors. This is kept
+    # off by default so the existing parity path remains unchanged unless a run
+    # explicitly enables it.
+    edge_sparse_relation_attn: bool = False
 
 
 @dataclass
@@ -985,6 +990,170 @@ if HAS_NNX:
             return self.o_proj(out)
 
 
+    class SparseEdgeMultiHeadAttention(nnx.Module):
+        """Relation-aware attention executed over flattened padded edge lists.
+
+        This is an opt-in speed path for JAX/XLA training. It preserves the
+        same relation score/value math as `MultiHeadAttention`, but avoids
+        forming several large [B,H,Q,K,D] intermediates by working over a flat
+        edge axis and aggregating back to queries with segment reductions.
+        """
+
+        def __init__(
+            self,
+            d_model: int,
+            n_heads: int,
+            *,
+            relation_dim: Optional[int] = None,
+            add_relation_to_v: bool = False,
+            remove_rel_norm: bool = False,
+            rngs: nnx.Rngs,
+        ):
+            if d_model % n_heads != 0:
+                raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+            self.d_model = d_model
+            self.n_heads = n_heads
+            self.head_dim = d_model // n_heads
+            self.relation_dim = relation_dim
+            self.add_relation_to_v = bool(add_relation_to_v)
+
+            self.q_proj = Linear(d_model, d_model, rngs=rngs)
+            self.k_proj = Linear(d_model, d_model, rngs=rngs)
+            self.v_proj = Linear(d_model, d_model, rngs=rngs)
+            self.o_proj = Linear(d_model, d_model, rngs=rngs)
+            if relation_dim is not None and int(relation_dim) > 0:
+                rel_dim = int(relation_dim)
+                self.rel_norm = None if remove_rel_norm else RMSNorm(rel_dim)
+                self.q_rel_proj = Linear(d_model, d_model, rngs=rngs)
+                self.rel_k_proj = Linear(rel_dim, d_model, rngs=rngs)
+                self.rel_v_proj = Linear(rel_dim, d_model, rngs=rngs)
+            else:
+                self.rel_norm = None
+                self.q_rel_proj = None
+                self.rel_k_proj = None
+                self.rel_v_proj = None
+
+        @staticmethod
+        def _segment_softmax(
+            scores: jnp.ndarray,  # [E,H]
+            segment_ids: jnp.ndarray,  # [E]
+            *,
+            num_segments: int,
+            valid_mask: jnp.ndarray,  # [E]
+        ) -> jnp.ndarray:
+            valid = valid_mask.astype(bool)
+            masked_scores = jnp.where(valid[:, None], scores, jnp.full_like(scores, -1e9))
+            seg_max = jax.ops.segment_max(masked_scores, segment_ids, num_segments=num_segments)
+            stable = jnp.exp(masked_scores - seg_max[segment_ids]) * valid[:, None].astype(scores.dtype)
+            seg_sum = jax.ops.segment_sum(stable, segment_ids, num_segments=num_segments)
+            denom = jnp.maximum(seg_sum[segment_ids], jnp.asarray(1e-9, dtype=scores.dtype))
+            return stable / denom
+
+        def __call__(
+            self,
+            query: jnp.ndarray,
+            key_value: jnp.ndarray,
+            *,
+            mask: Optional[jnp.ndarray] = None,   # [B,Lq,Lk] bool
+            rel_feat: Optional[jnp.ndarray] = None,  # [B,Lq,Lk_or_K,R]
+            rel_mask: Optional[jnp.ndarray] = None,  # [B,Lq,Lk_or_K] bool
+            rel_indices: Optional[jnp.ndarray] = None,  # [B,Lq,K] int
+        ) -> jnp.ndarray:
+            bsz, q_len, _ = query.shape
+            _, k_len, _ = key_value.shape
+
+            rel_indices = MultiHeadAttention._normalize_relation_indices(
+                rel_indices,
+                bsz=bsz,
+                q_len=q_len,
+                k_len=k_len,
+                rel_feat=rel_feat,
+                mask=mask,
+                rel_mask=rel_mask,
+            )
+            width = int(rel_indices.shape[2])
+
+            gathered_mask = MultiHeadAttention._align_pairwise_tensor(
+                mask, rel_indices=rel_indices, key_len=k_len, kind="mask"
+            )
+            gathered_rel_mask = MultiHeadAttention._align_pairwise_tensor(
+                rel_mask, rel_indices=rel_indices, key_len=k_len, kind="rel_mask"
+            )
+            combined_mask = gathered_mask
+            if gathered_rel_mask is not None:
+                gathered_rel_mask = gathered_rel_mask.astype(bool)
+                combined_mask = (
+                    gathered_rel_mask
+                    if combined_mask is None
+                    else jnp.logical_and(combined_mask.astype(bool), gathered_rel_mask)
+                )
+            if combined_mask is None:
+                combined_mask = jnp.ones((bsz, q_len, width), dtype=jnp.bool_)
+            else:
+                keep = combined_mask.astype(bool)
+                any_valid = jnp.any(keep, axis=-1, keepdims=True)
+                first_slot = jax.nn.one_hot(
+                    jnp.zeros(keep.shape[:2], dtype=jnp.int32),
+                    keep.shape[-1],
+                    dtype=jnp.bool_,
+                )
+                combined_mask = jnp.where(any_valid, keep, first_slot)
+
+            q_node = self.q_proj(query).reshape(bsz, q_len, self.n_heads, self.head_dim)
+            k_node = self.k_proj(key_value).reshape(bsz, k_len, self.n_heads, self.head_dim)
+            v_node = self.v_proj(key_value).reshape(bsz, k_len, self.n_heads, self.head_dim)
+
+            q_flat = q_node.reshape(bsz * q_len, self.n_heads, self.head_dim)
+            q_edge = jnp.repeat(q_flat, width, axis=0)
+
+            batch_offsets = (jnp.arange(bsz, dtype=jnp.int32)[:, None, None] * int(k_len))
+            flat_key_indices = (rel_indices.astype(jnp.int32) + batch_offsets).reshape(-1)
+            k_flat = k_node.reshape(bsz * k_len, self.n_heads, self.head_dim)
+            v_flat = v_node.reshape(bsz * k_len, self.n_heads, self.head_dim)
+            k_edge = k_flat[flat_key_indices]
+            v_edge = v_flat[flat_key_indices]
+
+            scale = 1.0 / np.sqrt(float(self.head_dim))
+            scores = jnp.sum(q_edge * k_edge, axis=-1) * scale
+
+            rel_v_edge = None
+            if rel_feat is not None and self.relation_dim is not None:
+                rel_feat = MultiHeadAttention._align_pairwise_tensor(
+                    rel_feat,
+                    rel_indices=rel_indices,
+                    key_len=k_len,
+                    kind="rel_feat",
+                )
+                rel_in = rel_feat if self.rel_norm is None else self.rel_norm(rel_feat)
+                rel_flat = rel_in.reshape(-1, rel_in.shape[-1])
+
+                q_rel_node = self.q_rel_proj(query).reshape(bsz * q_len, self.n_heads, self.head_dim)
+                q_rel_edge = jnp.repeat(q_rel_node, width, axis=0)
+
+                rel_k_edge = self.rel_k_proj(rel_flat).reshape(-1, self.n_heads, self.head_dim)
+                scores = scores + jnp.sum(q_rel_edge * rel_k_edge, axis=-1) * scale
+
+                if self.add_relation_to_v:
+                    rel_v_edge = self.rel_v_proj(rel_flat).reshape(-1, self.n_heads, self.head_dim)
+                else:
+                    rel_v_edge = rel_k_edge
+
+            segment_ids = jnp.repeat(jnp.arange(bsz * q_len, dtype=jnp.int32), width, axis=0)
+            valid_flat = combined_mask.reshape(-1)
+            attn = self._segment_softmax(
+                scores,
+                segment_ids,
+                num_segments=bsz * q_len,
+                valid_mask=valid_flat,
+            )
+
+            value_edge = v_edge if rel_v_edge is None else (v_edge + rel_v_edge)
+            weighted = attn[..., None] * value_edge
+            out_flat = jax.ops.segment_sum(weighted, segment_ids, num_segments=bsz * q_len)
+            out = out_flat.reshape(bsz, q_len, self.n_heads, self.head_dim).reshape(bsz, q_len, self.d_model)
+            return self.o_proj(out)
+
+
     class RelationAwareDecoderBlock(nnx.Module):
         """One decoder block with explicit A2A, A2T, A2S attention."""
 
@@ -993,6 +1162,9 @@ if HAS_NNX:
             d_model = cfg.d_model
             self.legacy_parity_mode = bool(cfg.decoder.enabled) and bool(cfg.decoder.use_legacy_motion_embed)
             self.use_sparse_relation_attn = self.legacy_parity_mode and (not bool(cfg.decoder.dense_masked_relation_attn))
+            self.use_edge_sparse_relation_attn = self.use_sparse_relation_attn and bool(
+                cfg.decoder.edge_sparse_relation_attn
+            )
             rel_factor = max(1, int(cfg.relation.simple_relation_factor))
             legacy_rel_dim = max(1, int(d_model // rel_factor))
             self.a2a_relation_dim = legacy_rel_dim if self.legacy_parity_mode else int(cfg.a2a_rel_dim)
@@ -1024,7 +1196,9 @@ if HAS_NNX:
                 self.a2a_rel_norm = None
                 self.a2s_rel_norm = None
 
-            self.a2a_attn = MultiHeadAttention(
+            attn_cls = SparseEdgeMultiHeadAttention if self.use_edge_sparse_relation_attn else MultiHeadAttention
+
+            self.a2a_attn = attn_cls(
                 d_model,
                 cfg.n_heads,
                 relation_dim=self.a2a_relation_dim,
@@ -1032,7 +1206,7 @@ if HAS_NNX:
                 remove_rel_norm=bool(cfg.relation.remove_rel_norm),
                 rngs=rngs,
             )
-            self.a2t_attn = MultiHeadAttention(
+            self.a2t_attn = attn_cls(
                 d_model,
                 cfg.n_heads,
                 relation_dim=self.a2t_relation_dim,
@@ -1040,7 +1214,7 @@ if HAS_NNX:
                 remove_rel_norm=bool(cfg.relation.remove_rel_norm),
                 rngs=rngs,
             )
-            self.a2s_attn = MultiHeadAttention(
+            self.a2s_attn = attn_cls(
                 d_model,
                 cfg.n_heads,
                 relation_dim=self.a2s_relation_dim,

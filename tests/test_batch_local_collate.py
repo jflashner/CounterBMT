@@ -143,6 +143,27 @@ class BatchLocalCollateTests(unittest.TestCase):
         self.assertEqual(limits["max_vectors_per_map_feature"], 128)
         self.assertIsNone(limits["max_traffic_lights"])
 
+    def test_bucketed_collate_mode_rounds_up_to_reusable_shapes(self) -> None:
+        cfg = SupervisedTrainConfig(
+            max_time_steps=91,
+            max_agents=128,
+            max_map_features=512,
+            max_vectors_per_map_feature=128,
+            max_traffic_lights=64,
+            collate_padding_mode="bucketed",
+        )
+        samples = [
+            _make_sample(scenario_id="a", horizon=10, num_agents=21, num_map_features=140, num_traffic_lights=11),
+            _make_sample(scenario_id="b", horizon=10, num_agents=33, num_map_features=185, num_traffic_lights=17),
+        ]
+
+        limits = _resolve_collate_padding_limits(cfg, samples=samples)
+        self.assertEqual(limits["max_time_steps"], 91)
+        self.assertEqual(limits["max_agents"], 48)
+        self.assertEqual(limits["max_map_features"], 192)
+        self.assertEqual(limits["max_vectors_per_map_feature"], 128)
+        self.assertEqual(limits["max_traffic_lights"], 24)
+
 
 if __name__ == "__main__":
     unittest.main()

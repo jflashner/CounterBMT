@@ -102,11 +102,37 @@ def legacy_midgpt_recipe_preset() -> RuntimeTrainPreset:
     )
 
 
+def legacy_midgpt_speed_recipe_preset() -> RuntimeTrainPreset:
+    """Speed-oriented MidGPT runtime for JAX/XLA training.
+
+    This keeps the same optimization recipe as the parity preset, but swaps the
+    collate policy to `bucketed` so batches reuse a small set of compiled
+    shapes. It is intentionally a training-throughput preset, not the most
+    literal legacy padding match.
+    """
+    return RuntimeTrainPreset(
+        model_preset="midgpt_parity",
+        tokenizer_mode="adv_bmt_parity",
+        learning_rate=3e-4,
+        warmup_steps=2000,
+        weight_decay=0.0,
+        grad_clip_norm=1.0,
+        skip_steps=5,
+        lr_schedule_mode="legacy_cosine_zero",
+        num_epochs=30,
+        mode="forward",
+        reverse_probability=0.0,
+        collate_padding_mode="bucketed",
+    )
+
+
 def get_runtime_preset(name: str) -> Dict[str, object]:
     if name == "adv_bmt_runtime_parity":
         return asdict(adv_bmt_runtime_parity_preset())
     if name == "legacy_midgpt_recipe":
         return asdict(legacy_midgpt_recipe_preset())
+    if name == "legacy_midgpt_speed_recipe":
+        return asdict(legacy_midgpt_speed_recipe_preset())
     return asdict(runtime_preset_none())
 
 
