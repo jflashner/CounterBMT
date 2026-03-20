@@ -568,6 +568,11 @@ def collate_nnx_scene_samples(
     If a sample has more timesteps than ``max_time_steps``, we truncate to the
     leading ``max_time_steps`` frames. This keeps full-length WOMD (20s) scenes
     compatible with Adv-BMT-style 91-step training runs.
+
+    Passing ``None`` for a count-like maximum (agents / map features / traffic
+    lights) means "pad to the batch-local maximum". This matches legacy
+    Adv-BMT's `PADDING_TO_MAX=false` behavior as long as the individual samples
+    have already been truncated to the configured ceilings at load time.
     """
 
     if not samples:
@@ -658,6 +663,14 @@ def collate_nnx_scene_samples(
 
     return {
         "scenario_ids": scenario_ids,
+        "collate_shape": {
+            "batch_size": bsz,
+            "time_steps": t_max,
+            "agents": n_max,
+            "map_features": m_max,
+            "vectors_per_map_feature": v_max,
+            "traffic_lights": l_max,
+        },
         "current_time_index": current_time_index,
         "dt_s": dt_s,
         "agent_ids": agent_ids,

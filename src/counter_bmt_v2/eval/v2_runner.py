@@ -287,6 +287,7 @@ def run_v2_model(
         max_map_features=int(ckpt_train_cfg.get("max_map_features", 512)),
         max_vectors_per_map_feature=int(ckpt_train_cfg.get("max_vectors_per_map_feature", 128)),
         max_traffic_lights=int(ckpt_train_cfg.get("max_traffic_lights", 64)),
+        collate_padding_mode=str(ckpt_train_cfg.get("collate_padding_mode", "fixed")),
         precision="fp32",
     )
     dag_mode = str(spec.runtime.dag_source_mode).strip().lower()

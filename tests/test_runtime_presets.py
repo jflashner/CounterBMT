@@ -22,6 +22,7 @@ def _base_runtime_args(runtime_preset: str = "legacy_midgpt_recipe") -> SimpleNa
         epochs=3,
         mode="mixed",
         reverse_prob=0.5,
+        collate_padding_mode=None,
     )
 
 
@@ -36,6 +37,7 @@ class RuntimePresetTests(unittest.TestCase):
         self.assertEqual(preset["num_epochs"], 30)
         self.assertEqual(preset["mode"], "forward")
         self.assertEqual(preset["reverse_probability"], 0.0)
+        self.assertEqual(preset["collate_padding_mode"], "batch_local")
 
     def test_supervised_cli_applies_legacy_midgpt_recipe_defaults(self) -> None:
         resolved = resolve_supervised_runtime(_base_runtime_args(), provided_flags=set())
@@ -43,20 +45,23 @@ class RuntimePresetTests(unittest.TestCase):
         self.assertEqual(resolved["num_epochs"], 30)
         self.assertEqual(resolved["mode"], "forward")
         self.assertEqual(resolved["reverse_probability"], 0.0)
+        self.assertEqual(resolved["collate_padding_mode"], "batch_local")
 
     def test_supervised_cli_explicit_flags_override_recipe(self) -> None:
         args = _base_runtime_args()
         args.epochs = 12
         args.mode = "mixed"
         args.reverse_prob = 0.25
+        args.collate_padding_mode = "fixed"
         resolved = resolve_supervised_runtime(
             args,
-            provided_flags={"--epochs", "--mode", "--reverse-prob"},
+            provided_flags={"--epochs", "--mode", "--reverse-prob", "--collate-padding-mode"},
         )
 
         self.assertEqual(resolved["num_epochs"], 12)
         self.assertEqual(resolved["mode"], "mixed")
         self.assertEqual(resolved["reverse_probability"], 0.25)
+        self.assertEqual(resolved["collate_padding_mode"], "fixed")
 
     def test_dag_cli_receives_same_recipe_direction_defaults(self) -> None:
         resolved = resolve_dag_runtime(_base_runtime_args(), provided_flags=set())
@@ -64,6 +69,7 @@ class RuntimePresetTests(unittest.TestCase):
         self.assertEqual(resolved["num_epochs"], 30)
         self.assertEqual(resolved["mode"], "forward")
         self.assertEqual(resolved["reverse_probability"], 0.0)
+        self.assertEqual(resolved["collate_padding_mode"], "batch_local")
 
 
 if __name__ == "__main__":

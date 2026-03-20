@@ -35,6 +35,7 @@ class RuntimeTrainPreset:
     num_epochs: int = 3
     mode: str = "mixed"
     reverse_probability: float = 0.5
+    collate_padding_mode: str = "fixed"
 
 
 def runtime_preset_none() -> RuntimeTrainPreset:
@@ -97,6 +98,7 @@ def legacy_midgpt_recipe_preset() -> RuntimeTrainPreset:
         num_epochs=30,
         mode="forward",
         reverse_probability=0.0,
+        collate_padding_mode="batch_local",
     )
 
 

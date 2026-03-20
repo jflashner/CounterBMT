@@ -175,6 +175,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-map-features", type=int, default=512)
     parser.add_argument("--max-vectors", type=int, default=128)
     parser.add_argument("--max-traffic-lights", type=int, default=64)
+    parser.add_argument(
+        "--collate-padding-mode",
+        type=str,
+        default=None,
+        choices=["fixed", "batch_local"],
+        help=(
+            "batch padding policy: 'fixed' pads to configured ceilings, "
+            "'batch_local' pads to per-batch maxima under those ceilings"
+        ),
+    )
 
     parser.add_argument(
         "--no-center-to-map",
@@ -296,6 +306,7 @@ def _resolve_runtime_defaults(args: argparse.Namespace, provided_flags: Set[str]
         "num_epochs": 3,
         "mode": "mixed",
         "reverse_probability": 0.5,
+        "collate_padding_mode": "fixed",
     }
     runtime_defaults = get_runtime_preset(str(args.runtime_preset))
     resolved: Dict[str, object] = dict(base_defaults)
@@ -313,6 +324,7 @@ def _resolve_runtime_defaults(args: argparse.Namespace, provided_flags: Set[str]
         "--epochs": ("num_epochs", args.epochs),
         "--mode": ("mode", args.mode),
         "--reverse-prob": ("reverse_probability", args.reverse_prob),
+        "--collate-padding-mode": ("collate_padding_mode", args.collate_padding_mode),
     }
     for flag, (key, value) in explicit_map.items():
         if flag in provided_flags and value is not None:
@@ -387,6 +399,7 @@ def main() -> int:
         max_map_features=args.max_map_features,
         max_vectors_per_map_feature=args.max_vectors,
         max_traffic_lights=args.max_traffic_lights,
+        collate_padding_mode=str(resolved_runtime["collate_padding_mode"]),
         center_to_map=(not args.no_center_to_map),
         resume_checkpoint=args.resume_checkpoint,
         resume_strict_determinism=bool(args.resume_strict_determinism),

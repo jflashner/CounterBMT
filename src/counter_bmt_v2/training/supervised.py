@@ -68,6 +68,7 @@ TokenizerModeType = Literal["paper_simple", "adv_bmt_parity"]
 DistributedBackendType = Literal["none", "pmap"]
 PrecisionType = Literal["fp32", "bf16-mixed"]
 LRScheduleModeType = Literal["v2_cosine_minlr", "legacy_cosine_zero"]
+CollatePaddingModeType = Literal["fixed", "batch_local"]
 
 
 @dataclass
@@ -124,12 +125,16 @@ class SupervisedTrainConfig:
     tensorboard_flush_secs: int = 30
     tensorboard_log_run_config: bool = True
 
-    # Fixed collate shapes prevent recompilation churn and keep JIT stable.
+    # Loader ceilings are still applied per-sample before batching. The collate
+    # mode controls whether batches are padded all the way to those ceilings
+    # (`fixed`) or only to the batch-local maxima under the same ceilings
+    # (`batch_local`), which matches legacy Adv-BMT more closely.
     max_time_steps: int = 91
     max_agents: int = 128
     max_map_features: int = 512
     max_vectors_per_map_feature: int = 128
     max_traffic_lights: int = 64
+    collate_padding_mode: CollatePaddingModeType = "fixed"
 
     center_to_map: bool = True
     resume_checkpoint: str = ""
@@ -409,13 +414,14 @@ def _prepare_supervised_batch(
     rng: np.random.Generator,
     is_training: bool,
 ) -> Dict[str, Any]:
+    collate_limits = _resolve_collate_padding_limits(train_cfg)
     batch = collate_nnx_scene_samples(
         samples,
-        max_time_steps=train_cfg.max_time_steps,
-        max_agents=train_cfg.max_agents,
-        max_map_features=train_cfg.max_map_features,
-        max_vectors_per_map_feature=train_cfg.max_vectors_per_map_feature,
-        max_traffic_lights=train_cfg.max_traffic_lights,
+        max_time_steps=collate_limits["max_time_steps"],
+        max_agents=collate_limits["max_agents"],
+        max_map_features=collate_limits["max_map_features"],
+        max_vectors_per_map_feature=collate_limits["max_vectors_per_map_feature"],
+        max_traffic_lights=collate_limits["max_traffic_lights"],
     )
 
     token_batch = _tokenize_motion_targets(
@@ -525,6 +531,46 @@ def _prepare_supervised_batch(
         # Keep raw tensors for forward-pass metric computation.
         "raw_batch": batch,
         "sample_steps": token_batch["sample_steps"],
+    }
+
+
+def _resolve_collate_padding_limits(train_cfg: SupervisedTrainConfig) -> Dict[str, Optional[int]]:
+    """Resolve batch padding limits from the training config.
+
+    Legacy Adv-BMT keeps `MAX_*` values as per-sample ceilings, but with
+    `PADDING_TO_MAX=false` it only pads each batch to its local maxima. The v2
+    parity path needs the same behavior to keep attention/relation activation
+    memory in line with the legacy stack. We still keep a `fixed` mode because
+    it is useful when minimizing recompilation churn matters more than memory.
+    """
+
+    mode = str(train_cfg.collate_padding_mode).strip().lower()
+    if mode not in {"fixed", "batch_local"}:
+        raise ValueError(
+            "Unsupported collate_padding_mode: "
+            f"{train_cfg.collate_padding_mode!r}. Expected 'fixed' or 'batch_local'."
+        )
+
+    if mode == "fixed":
+        return {
+            "max_time_steps": int(train_cfg.max_time_steps),
+            "max_agents": int(train_cfg.max_agents),
+            "max_map_features": int(train_cfg.max_map_features),
+            "max_vectors_per_map_feature": int(train_cfg.max_vectors_per_map_feature),
+            "max_traffic_lights": int(train_cfg.max_traffic_lights),
+        }
+
+    # In batch-local mode we still keep the time horizon fixed to preserve the
+    # intended 91-step training window, and we keep the per-polyline vector
+    # budget fixed because individual map tokens are already extracted at that
+    # shape. The large memory savings come from letting agent/map/light counts
+    # follow the batch-local maxima instead of the global ceilings.
+    return {
+        "max_time_steps": int(train_cfg.max_time_steps),
+        "max_agents": None,
+        "max_map_features": None,
+        "max_vectors_per_map_feature": int(train_cfg.max_vectors_per_map_feature),
+        "max_traffic_lights": None,
     }
 
 
@@ -1438,7 +1484,7 @@ def _validate_resume_compatibility(
         )
 
     ckpt_train_cfg = resume_payload.get("train_cfg", {})
-    for k in ("model_preset", "tokenizer_mode", "skip_steps", "precision"):
+    for k in ("model_preset", "tokenizer_mode", "skip_steps", "precision", "collate_padding_mode"):
         if k in ckpt_train_cfg and ckpt_train_cfg[k] != getattr(train_cfg, k):
             raise ValueError(
                 f"Resume strict determinism failed: train_cfg[{k}] mismatch "
