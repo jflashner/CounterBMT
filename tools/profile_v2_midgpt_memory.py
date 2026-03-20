@@ -382,7 +382,12 @@ def main() -> int:
         _train_step,
         _train_step_pmap,
     )
-    from counter_bmt_v2.trajectory_jax import AdvBMTParityTokenizer, BidirectionalMotionTokenizer, ParityTokenizerConfig
+    from counter_bmt_v2.trajectory_jax import (
+        AdvBMTParityTokenizer,
+        BidirectionalMotionTokenizer,
+        NNXBidirectionalMotionTransformer,
+        ParityTokenizerConfig,
+    )
 
     provided_flags = _collect_provided_flags(sys.argv[1:])
     resolved_runtime = _resolve_runtime_defaults(args, provided_flags)
