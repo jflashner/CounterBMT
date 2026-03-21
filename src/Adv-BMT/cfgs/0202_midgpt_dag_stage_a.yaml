@@ -1,0 +1,22 @@
+defaults:
+  - 0202_midgpt
+  - _self_
+
+exp_name: "midgpt_dag_stage_a"
+
+DAG_LATENT:
+  ENABLED: True
+  STAGE: "A"
+  USE_GRAPH_ENCODER: True
+  D_NODE_IN: 24
+  D_EDGE_IN: 8
+  D_HIDDEN: 128
+  N_LAYERS: 3
+  DROPOUT: 0.0
+  MAX_NODES: 64
+  MAX_EDGES: 256
+  LATENT_DIM: null
+  INJECTION_MODE: "global_gated_residual"
+  DAG_DROPOUT_PROB: 1.0
+  USE_NULL_LATENT: False
+  NULL_LATENT_INIT_STD: 0.02

@@ -7,6 +7,12 @@ decoder internals. Instead it adds a new Torch model class:
 
 - `bmt.dag_latent.model.MotionLMDAGLatent`
 
+The Stage-A training additions are:
+
+- `bmt.dag_latent.lightning.MotionLMDAGLatentLightning`
+- `bmt.dag_latent.train_stage_a`
+- `cfgs/0202_midgpt_dag_stage_a.yaml`
+
 ## What It Does
 
 `MotionLMDAGLatent` inherits from the legacy `bmt.models.motionlm.MotionLM`
@@ -71,6 +77,29 @@ dag_cfg = DAGLatentConfig(
 
 model = MotionLMDAGLatent(config=legacy_cfg, dag_config=dag_cfg)
 output = model(batch_dict)
+```
+
+## Stage A Training
+
+Stage A keeps the legacy `0202_midgpt` recipe and swaps in the additive
+DAG-latent model wrapper.
+
+The provided Stage-A config:
+
+- [0202_midgpt_dag_stage_a.yaml](/Users/joshuaflashner/Projects/CounterBMT/src/Adv-BMT/cfgs/0202_midgpt_dag_stage_a.yaml)
+
+inherits the released MidGPT config and sets:
+
+- `DAG_LATENT.ENABLED=True`
+- `DAG_LATENT.DAG_DROPOUT_PROB=1.0`
+
+So even if DAG tensors are present, the latent path has zero effect and Stage A
+reduces to autoregressive pretraining.
+
+Launch with:
+
+```bash
+PYTHONPATH=src/Adv-BMT python -m bmt.dag_latent.train_stage_a
 ```
 
 ## Behavior Notes
