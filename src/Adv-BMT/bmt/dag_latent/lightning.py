@@ -17,6 +17,7 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
         super().__init__(config=config)
         self.dag_latent_cfg = build_dag_latent_config(self.config)
         self.model = MotionLMDAGLatent(config=self.config, dag_config=self.dag_latent_cfg)
+        self._freeze_stage_a_dag_parameters()
 
         # Preserve the legacy hparam payload but attach the resolved DAG block
         # so the checkpoint is self-describing.
@@ -24,6 +25,22 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
         if isinstance(hparams, dict):
             hparams["DAG_LATENT_RESOLVED"] = dag_latent_config_as_dict(self.config)
         self.save_hyperparameters(hparams)
+
+    def _freeze_stage_a_dag_parameters(self) -> None:
+        dag_block = self.config.get("DAG_LATENT", {})
+        stage = str(dag_block.get("STAGE", "")).strip().upper()
+        if stage != "A":
+            return
+
+        for module_name in ("dag_encoder", "dag_latent_proj", "dag_gate_proj"):
+            module = getattr(self.model, module_name, None)
+            if module is None:
+                continue
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+        if getattr(self.model, "null_dag_latent", None) is not None:
+            self.model.null_dag_latent.requires_grad_(False)
 
     def _prepare_validation_batch(self, data_dict):
         # The legacy decoder expects a randomized modeled-agent id to already be
