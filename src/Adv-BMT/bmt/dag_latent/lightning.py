@@ -24,3 +24,47 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
         if isinstance(hparams, dict):
             hparams["DAG_LATENT_RESOLVED"] = dag_latent_config_as_dict(self.config)
         self.save_hyperparameters(hparams)
+
+    def validation_step(self, data_dict, batch_idx):
+        # This repository snapshot's training path does not construct the
+        # scenario-level evaluator that the legacy validation_step expects.
+        # For Stage-A pretraining, surface normal validation loss metrics in
+        # W&B/TensorBoard instead of routing through the separate evaluator
+        # stack.
+        if not hasattr(self, "evaluator"):
+            data_dict = self(data_dict)
+            loss, loss_stat = self.get_loss(data_dict)
+
+            batch_size = int(data_dict["encoder/map_feature"].shape[0])
+
+            self.log_dict(
+                {f"val/{k}": float(v) for k, v in loss_stat.items()},
+                batch_size=batch_size,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+            for src_key, pbar_key in (
+                ("total_loss", "val_loss"),
+                ("accuracy", "val_acc"),
+                ("entropy", "val_entropy"),
+            ):
+                if src_key in loss_stat:
+                    self.log(
+                        pbar_key,
+                        float(loss_stat[src_key]),
+                        batch_size=batch_size,
+                        prog_bar=True,
+                        on_step=False,
+                        on_epoch=True,
+                        sync_dist=True,
+                    )
+            return loss
+        return super().validation_step(data_dict, batch_idx)
+
+    def on_validation_epoch_end(self):
+        if not hasattr(self, "evaluator"):
+            self.log("monitoring_step", float(self.global_step))
+            return None
+        return super().on_validation_epoch_end()

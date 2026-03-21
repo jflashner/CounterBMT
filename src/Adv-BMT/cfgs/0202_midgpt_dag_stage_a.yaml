@@ -3,6 +3,8 @@ defaults:
   - _self_
 
 exp_name: "midgpt_dag_stage_a"
+EVAL_MOTION: false
+num_sanity_val_steps: 0
 
 DAG_LATENT:
   ENABLED: True
