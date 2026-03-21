@@ -25,6 +25,23 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
             hparams["DAG_LATENT_RESOLVED"] = dag_latent_config_as_dict(self.config)
         self.save_hyperparameters(hparams)
 
+    def _prepare_validation_batch(self, data_dict):
+        # The legacy decoder expects a randomized modeled-agent id to already be
+        # present when running in evaluation mode. Legacy autoregressive eval
+        # paths populate this explicitly, but our Stage-A loss-only validation
+        # path calls the model forward directly.
+        if (
+            self.config.REMOVE_AGENT_FROM_SCENE_ENCODER
+            and "decoder/randomized_modeled_agent_id" not in data_dict
+        ):
+            data_dict["decoder/randomized_modeled_agent_id"] = (
+                self.model.motion_decoder.randomize_modeled_agent_id(
+                    data_dict,
+                    clip_agent_id=True,
+                )
+            )
+        return data_dict
+
     def validation_step(self, data_dict, batch_idx):
         # This repository snapshot's training path does not construct the
         # scenario-level evaluator that the legacy validation_step expects.
@@ -32,6 +49,7 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
         # W&B/TensorBoard instead of routing through the separate evaluator
         # stack.
         if not hasattr(self, "evaluator"):
+            data_dict = self._prepare_validation_batch(data_dict)
             data_dict = self(data_dict)
             loss, loss_stat = self.get_loss(data_dict)
 
