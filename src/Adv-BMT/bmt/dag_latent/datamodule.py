@@ -3,6 +3,11 @@
 This keeps the legacy dataset logic intact but makes batching tolerant of
 non-array object fields such as `original_SD`, which some local project
 preprocessing paths attach to each sample.
+
+For Stage-A training we do not need those raw python objects in the model
+batch, and preserving them breaks DDP device transfer on multi-GPU hosts. The
+wrapper therefore drops unsupported object-valued fields instead of trying to
+forward them through Lightning.
 """
 
 from __future__ import annotations
@@ -24,22 +29,21 @@ class DAGLatentInfgenDataset(InfgenDataset):
             return super().collate_batch(batch_list)
 
         # Some local preprocessing paths attach raw python objects (for example
-        # `original_SD`) that the legacy collate does not whitelist. Preserve
-        # them as passthrough lists and let the parent collate handle the
-        # regular tensor/scalar fields exactly as before.
+        # `original_SD`) that the legacy collate does not whitelist. Those
+        # objects are not used by the Stage-A trainer and also break DDP's
+        # recursive `.to(device)` walk, so we drop them here and let the parent
+        # collate handle the regular tensor/scalar fields exactly as before.
         sanitized_batch = [dict(sample) for sample in batch_list]
-        passthrough: Dict[str, List[Any]] = {}
         sample0 = sanitized_batch[0]
         for key, value in list(sample0.items()):
             is_supported_scalar = isinstance(value, (int, float, bool, str))
             is_supported_array = isinstance(value, np.ndarray)
             if is_supported_scalar or is_supported_array:
                 continue
-            passthrough[key] = [sample.pop(key) for sample in sanitized_batch]
+            for sample in sanitized_batch:
+                sample.pop(key, None)
 
-        batch = super().collate_batch(sanitized_batch)
-        batch.update(passthrough)
-        return batch
+        return super().collate_batch(sanitized_batch)
 
 
 class DAGLatentInfgenDataModule(pl.LightningDataModule):
