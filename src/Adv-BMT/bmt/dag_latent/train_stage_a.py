@@ -41,8 +41,8 @@ for package_root in (_WORKSPACE_ROOT / "metadrive", _WORKSPACE_ROOT / "scenarion
             sys.path.insert(0, package_root_str)
 
 import bmt.utils as utils
+from bmt.dag_latent.datamodule import DAGLatentInfgenDataModule
 from bmt.dag_latent.lightning import MotionLMDAGLatentLightning
-from bmt.dataset.datamodule import InfgenDataModule
 from bmt.utils import REPO_ROOT, get_time_str
 
 torch.set_float32_matmul_precision("high")
@@ -136,7 +136,7 @@ def main(config):
         check_val_every_n_epoch=config.get("check_val_every_n_epoch", 1),
     )
 
-    datamodule = InfgenDataModule(
+    datamodule = DAGLatentInfgenDataModule(
         config,
         train_batch_size=batch_size,
         train_num_workers=num_workers,
