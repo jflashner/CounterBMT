@@ -9,6 +9,7 @@ checkpoints can be evaluated directly.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
 import sys
@@ -63,6 +64,7 @@ def main() -> int:
     from torch.utils.data import DataLoader  # type: ignore
     from pytorch_lightning import Trainer  # type: ignore
     from easydict import EasyDict  # type: ignore
+    from omegaconf import OmegaConf  # type: ignore
 
     from bmt.dag_latent.lightning import MotionLMDAGLatentLightning  # type: ignore
     from bmt.dataset.dataset import InfgenDataset  # type: ignore
@@ -100,6 +102,21 @@ def main() -> int:
             return EasyDict({k: _to_easydict(v) for k, v in obj.items()})
         if isinstance(obj, list):
             return [_to_easydict(v) for v in obj]
+        if OmegaConf.is_dict(obj):
+            return EasyDict({k: _to_easydict(v) for k, v in obj.items()})
+        if OmegaConf.is_list(obj):
+            return [_to_easydict(v) for v in obj]
+        return obj
+
+    def _to_builtin(obj):
+        if isinstance(obj, dict):
+            return {k: _to_builtin(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_to_builtin(v) for v in obj]
+        if OmegaConf.is_dict(obj):
+            return {k: _to_builtin(v) for k, v in obj.items()}
+        if OmegaConf.is_list(obj):
+            return [_to_builtin(v) for v in obj]
         return obj
 
     def _apply_eval_overrides(cfg):
@@ -118,9 +135,17 @@ def main() -> int:
         _set_obj(sampling_cfg, "TOPP", float(args.topp))
         return cfg
 
-    default_config = cfg_from_yaml_file(legacy_root / "cfgs" / "motion_default.yaml", global_config)
-    config = cfg_from_yaml_file(legacy_root / "cfgs" / "0202_midgpt_dag_stage_a.yaml", global_config)
-    config = _apply_eval_overrides(config)
+    default_config_edict = cfg_from_yaml_file(
+        legacy_root / "cfgs" / "motion_default.yaml",
+        copy.deepcopy(global_config),
+    )
+    config_edict = cfg_from_yaml_file(
+        legacy_root / "cfgs" / "0202_midgpt_dag_stage_a.yaml",
+        copy.deepcopy(global_config),
+    )
+    config_edict = _apply_eval_overrides(config_edict)
+    default_config = OmegaConf.create(_to_builtin(default_config_edict))
+    config = OmegaConf.create(_to_builtin(config_edict))
 
     map_location = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_from_checkpoint(
