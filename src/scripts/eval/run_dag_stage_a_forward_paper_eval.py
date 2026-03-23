@@ -149,26 +149,13 @@ def main() -> int:
         legacy_root / "cfgs" / "motion_default.yaml",
         copy.deepcopy(global_config),
     )
-    config_edict = cfg_from_yaml_file(
-        legacy_root / "cfgs" / "0202_midgpt.yaml",
-        copy.deepcopy(global_config),
-    )
-    stage_cfg_raw = OmegaConf.to_container(
-        OmegaConf.load(legacy_root / "cfgs" / "0202_midgpt_dag_stage_a.yaml"),
-        resolve=True,
-    )
-    if not isinstance(stage_cfg_raw, dict):
-        raise TypeError("Stage-A DAG config must load as a dictionary.")
-    config_edict = _merge_nested_dict(config_edict, stage_cfg_raw)
-    config_edict = _apply_eval_overrides(config_edict)
     default_config = OmegaConf.create(_to_builtin(default_config_edict))
-    config = OmegaConf.create(_to_builtin(config_edict))
 
     map_location = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_from_checkpoint(
         checkpoint_path=str(ckpt_path),
         cls=MotionLMDAGLatentLightning,
-        config=config,
+        config=None,
         default_config=default_config,
         strict=True,
         checkpoint_surgery_func=checkpoint_surgery_func,
