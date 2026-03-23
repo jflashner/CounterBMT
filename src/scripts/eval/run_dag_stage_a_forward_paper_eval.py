@@ -119,6 +119,16 @@ def main() -> int:
             return [_to_builtin(v) for v in obj]
         return obj
 
+    def _merge_nested_dict(dst, src):
+        for key, value in src.items():
+            if key == "defaults":
+                continue
+            if isinstance(value, dict) and isinstance(dst.get(key), dict):
+                _merge_nested_dict(dst[key], value)
+            else:
+                dst[key] = copy.deepcopy(value)
+        return dst
+
     def _apply_eval_overrides(cfg):
         preprocessing = _get_obj(cfg, "PREPROCESSING")
         data_cfg = _get_obj(cfg, "DATA")
@@ -140,9 +150,16 @@ def main() -> int:
         copy.deepcopy(global_config),
     )
     config_edict = cfg_from_yaml_file(
-        legacy_root / "cfgs" / "0202_midgpt_dag_stage_a.yaml",
+        legacy_root / "cfgs" / "0202_midgpt.yaml",
         copy.deepcopy(global_config),
     )
+    stage_cfg_raw = OmegaConf.to_container(
+        OmegaConf.load(legacy_root / "cfgs" / "0202_midgpt_dag_stage_a.yaml"),
+        resolve=True,
+    )
+    if not isinstance(stage_cfg_raw, dict):
+        raise TypeError("Stage-A DAG config must load as a dictionary.")
+    config_edict = _merge_nested_dict(config_edict, stage_cfg_raw)
     config_edict = _apply_eval_overrides(config_edict)
     default_config = OmegaConf.create(_to_builtin(default_config_edict))
     config = OmegaConf.create(_to_builtin(config_edict))
