@@ -67,6 +67,13 @@ def _extract_json(text: str) -> Dict[str, Any]:
     return {}
 
 
+def _response_excerpt(text: str, limit: int = 800) -> str:
+    cleaned = " ".join(str(text).split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit] + "...<truncated>"
+
+
 def _maneuver_type_from_str(s: str) -> ManeuverType:
     t = s.lower().strip().replace("-", "_").replace(" ", "_")
     for m in ManeuverType:
@@ -233,6 +240,9 @@ Rules:
             detail = f" scene={scene.scenario_id} model={self.model!r} reason={reason}"
             if exc is not None:
                 detail += f" error={exc!r}"
+                raw_excerpt = getattr(exc, "raw_excerpt", "")
+                if raw_excerpt:
+                    detail += f" raw_excerpt={raw_excerpt!r}"
             raise RuntimeError(f"OpenAI perception failed:{detail}") from exc
         logger.warning("OpenAI perception fallback to mock (%s): %s", reason, exc or "no exception")
         features = self._fallback.extract(scene)
@@ -264,7 +274,13 @@ Rules:
 
         data = _extract_json(raw)
         if not data:
-            return self._fallback_extract(scene, reason="json_parse_failed")
+            parse_exc = ValueError(
+                "OpenAI perception returned non-JSON or unparsable JSON. "
+                f"raw_excerpt={_response_excerpt(raw)!r}"
+            )
+            setattr(parse_exc, "raw_response", raw)
+            setattr(parse_exc, "raw_excerpt", _response_excerpt(raw, limit=1600))
+            return self._fallback_extract(scene, reason="json_parse_failed", exc=parse_exc)
 
         maneuvers: List[ManeuverSegment] = []
         for m in data.get("maneuvers", []):

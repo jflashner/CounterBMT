@@ -7,6 +7,7 @@ import json
 import logging
 import pickle
 import time
+import traceback
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -563,6 +564,7 @@ def main() -> int:
 
             for attempt in range(1, max(1, int(args.max_retries)) + 1):
                 attempts = attempt
+                ex_dir: Optional[Path] = None
                 try:
                     sample = loader.load(int(idx))
                     sample_path = Path(loader.files[int(idx)])
@@ -737,6 +739,26 @@ def main() -> int:
                     break
                 except Exception as exc:
                     last_error = str(exc)
+                    if ex_dir is not None:
+                        try:
+                            (ex_dir / f"attempt_{attempt}_error.txt").write_text(
+                                traceback.format_exc(),
+                                encoding="utf-8",
+                            )
+                            raw_text = str(getattr(exc, "raw_response", "") or "")
+                            if raw_text:
+                                (ex_dir / f"attempt_{attempt}_raw_response.txt").write_text(
+                                    raw_text,
+                                    encoding="utf-8",
+                                )
+                            raw_excerpt = str(getattr(exc, "raw_excerpt", "") or "")
+                            if raw_excerpt:
+                                (ex_dir / f"attempt_{attempt}_error_excerpt.txt").write_text(
+                                    raw_excerpt + "\n",
+                                    encoding="utf-8",
+                                )
+                        except Exception:
+                            pass
                     if attempt < int(args.max_retries):
                         time.sleep(float(args.retry_backoff_sec) * float(2 ** (attempt - 1)))
                         continue
