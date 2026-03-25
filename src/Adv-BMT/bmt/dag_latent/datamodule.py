@@ -20,9 +20,15 @@ from torch.utils.data import DataLoader
 
 from bmt.dataset.dataset import InfgenDataset
 
+from .dag_cache import DAGCacheBatchBuilder
+
 
 class DAGLatentInfgenDataset(InfgenDataset):
     """Legacy dataset with a safer collate for object-valued metadata fields."""
+
+    def __init__(self, *args, dag_cache_builder: DAGCacheBatchBuilder | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dag_cache_builder = dag_cache_builder
 
     def collate_batch(self, batch_list: List[Dict[str, Any]]):
         if not batch_list:
@@ -43,7 +49,10 @@ class DAGLatentInfgenDataset(InfgenDataset):
             for sample in sanitized_batch:
                 sample.pop(key, None)
 
-        return super().collate_batch(sanitized_batch)
+        batch = super().collate_batch(sanitized_batch)
+        if self.dag_cache_builder is not None and self.dag_cache_builder.enabled_for_batch():
+            batch.update(self.dag_cache_builder.build_batch_tensors(batch_list))
+        return batch
 
 
 class DAGLatentInfgenDataModule(pl.LightningDataModule):
@@ -69,8 +78,18 @@ class DAGLatentInfgenDataModule(pl.LightningDataModule):
         self.val_prefetch_factor = val_prefetch_factor
 
     def setup(self, stage: str):
-        self.train_dataset = DAGLatentInfgenDataset(config=self.config, mode="training")
-        self.val_dataset = DAGLatentInfgenDataset(config=self.config, mode="test")
+        train_builder = DAGCacheBatchBuilder(self.config)
+        val_builder = DAGCacheBatchBuilder(self.config)
+        self.train_dataset = DAGLatentInfgenDataset(
+            config=self.config,
+            mode="training",
+            dag_cache_builder=train_builder,
+        )
+        self.val_dataset = DAGLatentInfgenDataset(
+            config=self.config,
+            mode="test",
+            dag_cache_builder=val_builder,
+        )
 
     def train_dataloader(self):
         return DataLoader(

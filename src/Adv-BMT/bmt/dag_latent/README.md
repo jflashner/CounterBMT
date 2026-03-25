@@ -7,11 +7,15 @@ decoder internals. Instead it adds a new Torch model class:
 
 - `bmt.dag_latent.model.MotionLMDAGLatent`
 
-The Stage-A training additions are:
+The training additions are:
 
 - `bmt.dag_latent.lightning.MotionLMDAGLatentLightning`
 - `bmt.dag_latent.train_stage_a`
+- `bmt.dag_latent.train_stage_b`
+- `bmt.dag_latent.train_stage_c`
 - `cfgs/0202_midgpt_dag_stage_a.yaml`
+- `cfgs/0202_midgpt_dag_stage_b.yaml`
+- `cfgs/0202_midgpt_dag_stage_c.yaml`
 
 ## What It Does
 
@@ -101,6 +105,45 @@ Launch with:
 ```bash
 PYTHONPATH=src/Adv-BMT python -m bmt.dag_latent.train_stage_a
 ```
+
+## Stage B And Stage C
+
+The additive legacy Stage B/C path is cache-backed for now. It reuses the v2
+DAG cache schema and tensorization path, then attaches tensorized `dag_*`
+fields to each legacy batch inside the additive datamodule.
+
+What each stage does:
+
+- Stage B: fit the DAG encoder and DAG conditioning adapters while freezing
+  non-DAG legacy model parameters.
+- Stage C: joint finetune all trainable modules, but with a lower decoder LR
+  and a higher DAG-module LR.
+
+The provided configs:
+
+- [0202_midgpt_dag_stage_b.yaml](/Users/joshuaflashner/Projects/CounterBMT/src/Adv-BMT/cfgs/0202_midgpt_dag_stage_b.yaml)
+- [0202_midgpt_dag_stage_c.yaml](/Users/joshuaflashner/Projects/CounterBMT/src/Adv-BMT/cfgs/0202_midgpt_dag_stage_c.yaml)
+
+Current assumptions:
+
+- `DAG_LATENT.SOURCE_MODE="cache"`
+- `DAG_LATENT.CACHE_DIR` points at a v2 DAG cache directory keyed by
+  `scenario_id`
+- `dag_alignment/*` validation metrics run in Stage B/C when the legacy
+  scenario evaluator is not attached
+
+Launch examples:
+
+```bash
+PYTHONPATH=src/Adv-BMT python -m bmt.dag_latent.train_stage_b \
+  DAG_LATENT.CACHE_DIR=../../outputs/dag_cache
+
+PYTHONPATH=src/Adv-BMT python -m bmt.dag_latent.train_stage_c \
+  DAG_LATENT.CACHE_DIR=../../outputs/dag_cache
+```
+
+Use `pretrain=...` to branch from the previous stage's checkpoint and `ckpt=...`
+to resume the same stage in place.
 
 ## Behavior Notes
 

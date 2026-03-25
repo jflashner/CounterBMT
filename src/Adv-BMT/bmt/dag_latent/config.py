@@ -11,6 +11,10 @@ from .encoder import DAGLatentConfig
 DEFAULT_DAG_LATENT_BLOCK: Dict[str, Any] = {
     "ENABLED": False,
     "STAGE": "",
+    "SOURCE_MODE": "",
+    "CACHE_DIR": "",
+    "CACHE_STRICT": False,
+    "EXPECTED_SCHEMA": "any",
     "USE_GRAPH_ENCODER": True,
     "D_NODE_IN": 24,
     "D_EDGE_IN": 8,
@@ -24,6 +28,10 @@ DEFAULT_DAG_LATENT_BLOCK: Dict[str, Any] = {
     "DAG_DROPOUT_PROB": 0.0,
     "USE_NULL_LATENT": False,
     "NULL_LATENT_INIT_STD": 0.02,
+    "EVAL_ALIGNMENT": False,
+    "STAGE_B_FREEZE_NON_DAG": True,
+    "STAGE_C_DECODER_LR_SCALE": 0.1,
+    "STAGE_C_DAG_LR_SCALE": 1.0,
 }
 
 

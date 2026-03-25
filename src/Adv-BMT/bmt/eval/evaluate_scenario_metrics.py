@@ -907,12 +907,11 @@ class EvaluationLightningModule(pl.LightningModule):
             output_dict = utils.torch_to_numpy(output_data)
             output_dict = _get_mode(output_dict, i, self.num_modes)
 
-            from bmt.gradio_ui.plot import create_animation_from_pred
+            # Optional visualization hooks used during local debugging only.
+            # Keep metric evaluation independent from plotting dependencies.
             # video_path = f"{self.eval_mode}_pred_{output_dict['metadata/scenario_id']}_{i}.mp4"
             # video_path = create_animation_from_pred(output_dict, save_path=video_path, dpi=100)
             # print("predict gif path:", video_path)
-
-            from bmt.gradio_ui.plot import plot_pred
             # plot_pred(output_dict, save_path=f"{self.eval_mode}_pred_{output_dict['metadata/scenario_id']}_{i}.png")
 
             output_dict_mode = _get_mode(output_data_all_modes, i, num_modes=num_modes)

@@ -1,0 +1,32 @@
+defaults:
+  - 0202_midgpt
+  - _self_
+
+exp_name: "midgpt_dag_stage_b"
+EVAL_MOTION: false
+num_sanity_val_steps: 0
+
+DAG_LATENT:
+  ENABLED: True
+  STAGE: "B"
+  SOURCE_MODE: "cache"
+  CACHE_DIR: ""
+  CACHE_STRICT: True
+  EXPECTED_SCHEMA: "any"
+  USE_GRAPH_ENCODER: True
+  D_NODE_IN: 24
+  D_EDGE_IN: 8
+  D_HIDDEN: 128
+  N_LAYERS: 3
+  DROPOUT: 0.0
+  MAX_NODES: 64
+  MAX_EDGES: 256
+  LATENT_DIM: null
+  INJECTION_MODE: "global_gated_residual"
+  DAG_DROPOUT_PROB: 0.0
+  USE_NULL_LATENT: False
+  NULL_LATENT_INIT_STD: 0.02
+  EVAL_ALIGNMENT: True
+  STAGE_B_FREEZE_NON_DAG: True
+  STAGE_C_DECODER_LR_SCALE: 0.1
+  STAGE_C_DAG_LR_SCALE: 1.0

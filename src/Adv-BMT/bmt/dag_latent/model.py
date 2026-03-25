@@ -115,7 +115,13 @@ class MotionLMDAGLatent(MotionLM):
             dag_edge_mask=dag_edge_mask.bool(),
             dag_global_feat=(None if dag_global_feat is None else dag_global_feat.float()),
         )
-        meta["source_used"] = dag_node_mask.bool().any(dim=1).float()
+        source_used = self._lookup(batch, "dag/source_used", "dag_source_used")
+        if source_used is None:
+            meta["source_used"] = dag_node_mask.bool().any(dim=1).float()
+        else:
+            if not torch.is_tensor(source_used):
+                source_used = torch.as_tensor(source_used)
+            meta["source_used"] = source_used.float()
         return z_dag, meta
 
     def resolve_dag_latent(self, batch: Dict[str, Any], *, device: torch.device, dtype: torch.dtype) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
@@ -161,6 +167,10 @@ class MotionLMDAGLatent(MotionLM):
         if z_dag is None:
             return batch
 
+        present = meta.get("source_used")
+        if present is not None:
+            present = present.to(device=scene_token.device, dtype=scene_token.dtype)
+
         p_drop = float(self.dag_config.dag_dropout_prob)
         if self.training and p_drop >= 1.0:
             batch[self._APPLIED_FLAG] = True
@@ -182,12 +192,19 @@ class MotionLMDAGLatent(MotionLM):
         bias = self.dag_latent_proj(z_dag)
         gate = torch.sigmoid(self.dag_gate_proj(z_dag))
         dag_bias = gate * bias
+        if present is not None:
+            dag_bias = dag_bias * present[:, None]
+            effective_z = z_dag * present[:, None]
+            effective_gate = gate * present[:, None]
+        else:
+            effective_z = z_dag
+            effective_gate = gate
 
         batch["encoder/scenario_token"] = scene_token + dag_bias[:, None, :]
         batch[self._APPLIED_FLAG] = True
         batch["dag/latent"] = z_dag
-        batch["dag/latent_norm"] = torch.linalg.norm(z_dag, dim=-1)
-        batch["dag/gate_mean"] = gate.mean(dim=-1)
+        batch["dag/latent_norm"] = torch.linalg.norm(effective_z, dim=-1)
+        batch["dag/gate_mean"] = effective_gate.mean(dim=-1)
         for key, value in meta.items():
             batch[f"dag/{key}"] = value.to(device=scene_token.device, dtype=scene_token.dtype)
         return batch

@@ -51,10 +51,19 @@ class OpenAIChatClient:
             )
         content.append({"type": "text", "text": prompt})
 
-        resp = self._client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": content}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        request = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": temperature,
+            # GPT-5-family chat requests expect `max_completion_tokens`.
+            # Older model families generally tolerate it as well, but keep a
+            # fallback for older SDK/server combinations below.
+            "max_completion_tokens": max_tokens,
+        }
+        try:
+            resp = self._client.chat.completions.create(**request)
+        except TypeError:
+            request.pop("max_completion_tokens", None)
+            request["max_tokens"] = max_tokens
+            resp = self._client.chat.completions.create(**request)
         return (resp.choices[0].message.content or "").strip()
