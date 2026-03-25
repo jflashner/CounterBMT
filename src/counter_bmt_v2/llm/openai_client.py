@@ -30,6 +30,9 @@ class OpenAIChatClient:
 
         self._client = OpenAI(api_key=key, timeout=self.timeout_s)
 
+    def _is_gpt5_family(self) -> bool:
+        return str(self.model).strip().lower().startswith("gpt-5")
+
     def complete(
         self,
         *,
@@ -54,12 +57,13 @@ class OpenAIChatClient:
         request = {
             "model": self.model,
             "messages": [{"role": "user", "content": content}],
-            "temperature": temperature,
             # GPT-5-family chat requests expect `max_completion_tokens`.
             # Older model families generally tolerate it as well, but keep a
             # fallback for older SDK/server combinations below.
             "max_completion_tokens": max_tokens,
         }
+        if not self._is_gpt5_family():
+            request["temperature"] = temperature
         try:
             resp = self._client.chat.completions.create(**request)
         except TypeError:

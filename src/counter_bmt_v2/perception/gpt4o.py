@@ -231,6 +231,8 @@ Rules:
     def _fallback_extract(self, scene: ScenarioInput, *, reason: str, exc: Exception | None = None) -> VLMFeatures:
         if not self._allow_debug_fallbacks:
             detail = f" scene={scene.scenario_id} model={self.model!r} reason={reason}"
+            if exc is not None:
+                detail += f" error={exc!r}"
             raise RuntimeError(f"OpenAI perception failed:{detail}") from exc
         logger.warning("OpenAI perception fallback to mock (%s): %s", reason, exc or "no exception")
         features = self._fallback.extract(scene)
