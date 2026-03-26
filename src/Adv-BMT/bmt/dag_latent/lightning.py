@@ -33,6 +33,14 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
     )
 
     def __init__(self, config):
+        # Checkpoint loading merges saved hyperparameters back into the live
+        # config. `DAG_LATENT_RESOLVED` is checkpoint metadata only; if left in
+        # place it can preserve stale Stage-A values (for example dropout=1.0)
+        # and make config equality checks fail when branching into Stage B/C.
+        if "DAG_LATENT_RESOLVED" in config:
+            OmegaConf.set_struct(config, False)
+            config.pop("DAG_LATENT_RESOLVED", None)
+            OmegaConf.set_struct(config, True)
         super().__init__(config=config)
         self.dag_latent_cfg = build_dag_latent_config(self.config)
         self.model = MotionLMDAGLatent(config=self.config, dag_config=self.dag_latent_cfg)
