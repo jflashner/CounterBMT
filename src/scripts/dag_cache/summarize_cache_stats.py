@@ -59,11 +59,11 @@ def _top_items(counter: Counter[str], top_k: int) -> List[Dict[str, Any]]:
 
 
 def _resolve_paths(input_path: Path) -> Tuple[Path, Path]:
-    if input_path.is_dir() and any(input_path.glob("*.json")):
-        return input_path, input_path.parent
     cache_dir = input_path / "cache"
     if cache_dir.is_dir():
         return cache_dir, input_path
+    if input_path.is_dir() and any(input_path.glob("*.json")):
+        return input_path, input_path.parent
     raise FileNotFoundError(
         f"Could not resolve cache dir from {input_path}. Expected either a cache dir with *.json "
         "or an output root containing cache/."
