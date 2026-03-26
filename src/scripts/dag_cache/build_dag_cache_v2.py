@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import json
 import logging
 import pickle
 import time
 import traceback
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None
 
 # Allow standalone execution from repo root.
 import sys
@@ -34,6 +40,9 @@ from counter_bmt_v2.training.dag_cache_schema import (
     schema_version_for_contract,
     validate_cache_payload,
 )
+
+
+_WORKER_STATE: Dict[str, Any] = {}
 
 
 def _normalize_sid(sid: str) -> str:
@@ -256,6 +265,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--render-screen-size", type=int, default=800)
     p.add_argument("--model", type=str, default="gpt-4o")
     p.add_argument("--api-key", type=str, default="")
+    p.add_argument("--num-workers", type=int, default=1)
+    p.add_argument("--progress", dest="progress", action="store_true")
+    p.add_argument("--no-progress", dest="progress", action="store_false")
+    p.set_defaults(progress=True)
     p.add_argument("--max-retries", type=int, default=3)
     p.add_argument("--retry-backoff-sec", type=float, default=2.0)
     p.add_argument("--continue-on-error", dest="continue_on_error", action="store_true")
@@ -275,6 +288,74 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dag-contract-mode", type=str, default="hard", choices=["hard"])
     return p.parse_args()
+
+
+def _create_runtime(args: argparse.Namespace) -> Dict[str, Any]:
+    loader = ScenarioNetNNXLoader(args.data_dir)
+    scn_state = _setup_scenarionet_renderer(
+        data_dir=str(args.data_dir),
+        frame_renderer=str(args.frame_renderer),
+        film_size=int(args.render_film_size),
+        screen_size=int(args.render_screen_size),
+    )
+    if str(args.frame_renderer) == "scenarionet" and not bool(scn_state.get("available")):
+        raise RuntimeError(
+            "frame_renderer=scenarionet but ScenarioNet renderer is unavailable: "
+            f"{scn_state.get('error', 'unknown error')}"
+        )
+    max_frames_for_perception = int(max(1, int(args.num_frames) * (2 if bool(args.dual_view) else 1)))
+    perception = GPT4oPerceptionModel(
+        model=str(args.model),
+        api_key=(args.api_key or None),
+        max_frames=max_frames_for_perception,
+        use_mock_fallback=False,
+    )
+    dag_builder = PromptBNDAGBuilder(
+        model=str(args.model),
+        api_key=(args.api_key or None),
+        max_retries=4,
+        use_simple_fallback=not bool(args.strict_promptbn),
+        dag_contract=str(args.dag_contract),
+        dag_contract_mode=str(args.dag_contract_mode),
+    )
+    dag_contract_cfg = DAGContractConfig(
+        name=str(args.dag_contract),
+        mode=str(args.dag_contract_mode),
+    )
+    expected_cache_schema_version = schema_version_for_contract(str(args.dag_contract))
+    return {
+        "args": args,
+        "loader": loader,
+        "scn_state": scn_state,
+        "max_frames_for_perception": max_frames_for_perception,
+        "perception": perception,
+        "dag_builder": dag_builder,
+        "dag_contract_cfg": dag_contract_cfg,
+        "expected_cache_schema_version": expected_cache_schema_version,
+    }
+
+
+def _close_runtime(runtime: Dict[str, Any]) -> None:
+    vis = runtime.get("scn_state", {}).get("visualizer")
+    if vis is not None:
+        try:
+            vis.close()
+        except Exception:
+            pass
+
+
+def _init_worker(worker_args: Dict[str, Any]) -> None:
+    args = argparse.Namespace(**worker_args)
+    runtime = _create_runtime(args)
+    _WORKER_STATE.clear()
+    _WORKER_STATE.update(runtime)
+
+
+def _progress_write(message: str, pbar: Any = None) -> None:
+    if pbar is not None and tqdm is not None:
+        tqdm.write(message)
+        return
+    print(message, flush=True)
 
 
 def _setup_scenarionet_renderer(
@@ -470,6 +551,273 @@ def _render_frames_for_scene(
     return frames, _ego_trajectory(sample), "tensor", sid, int(loader_index)
 
 
+def _process_selected_index(row_i: int, idx: int, *, runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    state = runtime if runtime is not None else _WORKER_STATE
+    if not state:
+        raise RuntimeError("Worker runtime is not initialized.")
+
+    args = state["args"]
+    loader = state["loader"]
+    scn_state = state["scn_state"]
+    perception = state["perception"]
+    dag_builder = state["dag_builder"]
+    dag_contract_cfg = state["dag_contract_cfg"]
+    expected_cache_schema_version = state["expected_cache_schema_version"]
+
+    out_dir = Path(args.out_dir)
+    cache_dir = out_dir / "cache"
+    examples_dir = out_dir / "examples"
+
+    row_start = time.time()
+    status = "failed"
+    sid = f"idx_{idx:06d}"
+    last_error = ""
+    attempts = 0
+    n_nodes = 0
+    n_edges = 0
+    n_frames_raw = 0
+    n_frames_vlm = 0
+    renderer_used = ""
+    rendered_sid = ""
+    rendered_index = -1
+    contract_pass = False
+    contract_violation_counts: Dict[str, int] = {}
+    contract_report_summary: Dict[str, Any] = {}
+    maneuver_nodes = 0
+    maneuver_interval_complete_rate = 0.0
+    contract_nodes_after: Optional[int] = None
+    contract_edges_after: Optional[int] = None
+    contract_norm_counts_local: Dict[str, int] = {}
+
+    for attempt in range(1, max(1, int(args.max_retries)) + 1):
+        attempts = attempt
+        ex_dir: Optional[Path] = None
+        try:
+            sample = loader.load(int(idx))
+            sample_path = Path(loader.files[int(idx)])
+            sid = str(sample.scenario_id)
+            cache_path = cache_dir / f"{sid}.json"
+            if cache_path.is_file() and not bool(args.overwrite):
+                status = "skipped_existing"
+                break
+
+            ex_dir = examples_dir / sid
+            ex_dir.mkdir(parents=True, exist_ok=True)
+            raw_frames_dir = ex_dir / "frames_raw"
+            vlm_frames_dir = ex_dir / "frames_vlm"
+            raw_frames, ego_xy, renderer_used, rendered_sid, rendered_index = _render_frames_for_scene(
+                args=args,
+                sample=sample,
+                sample_path=sample_path,
+                loader_index=int(idx),
+                frames_dir=raw_frames_dir,
+                scn_state=scn_state,
+            )
+            n_frames_raw = int(len(raw_frames))
+            vlm_frames, frame_manifest, vlm_context_text = build_vlm_frame_pack(
+                sample=sample,
+                raw_frames=raw_frames,
+                out_dir=vlm_frames_dir,
+                max_agents=int(args.max_agents_render),
+                annotate_vlm_frames=bool(args.annotate_vlm_frames),
+                annotation_style=str(args.annotation_style),
+                ego_color_hint=str(args.ego_color_hint),
+                include_ego_context_text=bool(args.include_ego_context_text),
+                dual_view=bool(args.dual_view),
+                dual_view_mode=str(args.dual_view_mode),
+                add_ego_inset=bool(args.add_ego_inset),
+            )
+            n_frames_vlm = int(len(vlm_frames))
+            frame_manifest_path = ex_dir / "frame_manifest.json"
+            frame_manifest_path.write_text(json.dumps(frame_manifest, indent=2), encoding="utf-8")
+            (ex_dir / "vlm_prompt_context.txt").write_text((vlm_context_text or "") + "\n", encoding="utf-8")
+
+            scene = ScenarioInput(
+                scenario_id=sid,
+                frames=vlm_frames,
+                ego_trajectory_xy=ego_xy,
+                metadata={
+                    "source": "scenarionet_v2",
+                    "data_dir": str(args.data_dir),
+                    "loader_index": int(idx),
+                    "loader_file": str(sample_path),
+                    "frame_renderer": renderer_used,
+                    "rendered_scenario_id": str(rendered_sid),
+                    "rendered_scenario_index": int(rendered_index),
+                    "ego_color_hint": str(args.ego_color_hint),
+                    "dual_view_enabled": bool(args.dual_view),
+                    "dual_view_mode": str(args.dual_view_mode),
+                    "add_ego_inset": bool(args.add_ego_inset),
+                    "annotation_enabled": bool(args.annotate_vlm_frames),
+                    "annotation_style": str(args.annotation_style),
+                    "frame_manifest_path": str(frame_manifest_path),
+                    "frame_manifest": frame_manifest,
+                    "vlm_context_text": vlm_context_text if bool(args.include_ego_context_text) else "",
+                },
+            )
+
+            features = perception.extract(scene)
+            dag = dag_builder.build(scene, features)
+            payload = dag_to_cache_payload(dag)
+            payload["schema_version"] = expected_cache_schema_version
+            meta = payload.get("metadata", {})
+            if not isinstance(meta, dict):
+                meta = {"metadata_raw": str(meta)}
+            meta.update(
+                {
+                    "source": "counter_bmt_v2_promptbn",
+                    "model": str(args.model),
+                    "strict_promptbn": bool(args.strict_promptbn),
+                    "dag_contract": str(args.dag_contract),
+                    "dag_contract_mode": str(args.dag_contract_mode),
+                    "loader_index": int(idx),
+                    "generated_at_unix_s": float(time.time()),
+                    "frame_renderer": renderer_used,
+                    "rendered_scenario_id": str(rendered_sid),
+                    "rendered_scenario_index": int(rendered_index),
+                    "annotate_vlm_frames": bool(args.annotate_vlm_frames),
+                    "annotation_style": str(args.annotation_style),
+                    "dual_view": bool(args.dual_view),
+                    "dual_view_mode": str(args.dual_view_mode),
+                    "add_ego_inset": bool(args.add_ego_inset),
+                    "ego_color_hint": str(args.ego_color_hint),
+                    "n_frames_raw": int(n_frames_raw),
+                    "n_frames_vlm": int(n_frames_vlm),
+                }
+            )
+            payload["metadata"] = meta
+            contract_ok, payload, contract_report = enforce_dag_contract(payload, config=dag_contract_cfg)
+            contract_report_summary = contract_report.summary()
+            contract_violation_counts = dict(contract_report.violation_counts)
+            contract_report_path = ex_dir / "dag_contract_report.json"
+            contract_report_path.write_text(json.dumps(contract_report_summary, indent=2), encoding="utf-8")
+            if not contract_ok:
+                raise RuntimeError(
+                    "DAG contract hard-enforcement failed: "
+                    f"violations={contract_violation_counts}"
+                )
+            contract_pass = True
+            contract_nodes_after = int(contract_report.after_nodes)
+            contract_edges_after = int(contract_report.after_edges)
+            contract_norm_counts_local = {
+                str(k): int(v) for k, v in contract_report.normalization_counts.items()
+            }
+
+            if not validate_cache_payload(payload):
+                raise RuntimeError("Generated DAG payload failed schema validation.")
+
+            node_list = payload.get("nodes", []) if isinstance(payload.get("nodes", []), list) else []
+            maneuver_nodes = int(
+                sum(1 for n in node_list if str(n.get("node_type", "")).strip().lower() == "maneuver")
+            )
+            interval_complete = 0
+            if maneuver_nodes > 0:
+                for n in node_list:
+                    if str(n.get("node_type", "")).strip().lower() != "maneuver":
+                        continue
+                    md = n.get("metadata", {})
+                    if not isinstance(md, dict):
+                        continue
+                    has_all = all(k in md for k in ("start_s", "end_s", "duration_s", "mid_s"))
+                    interval_complete += int(has_all)
+                maneuver_interval_complete_rate = float(interval_complete / max(1, maneuver_nodes))
+
+            cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+            feat_dict = _jsonify(features)
+            if not bool(args.save_raw_llm):
+                raw = feat_dict.get("raw", {})
+                if isinstance(raw, dict):
+                    raw.pop("raw_response", None)
+            feat_dict["prompt_context"] = {
+                "ego_color_hint": str(args.ego_color_hint),
+                "dual_view_enabled": bool(args.dual_view),
+                "dual_view_mode": str(args.dual_view_mode),
+                "add_ego_inset": bool(args.add_ego_inset),
+                "annotation_enabled": bool(args.annotate_vlm_frames),
+                "annotation_style": str(args.annotation_style),
+                "include_ego_context_text": bool(args.include_ego_context_text),
+                "frame_manifest_path": str(frame_manifest_path),
+                "n_frames_raw": int(n_frames_raw),
+                "n_frames_vlm": int(n_frames_vlm),
+                "dag_contract": str(args.dag_contract),
+                "dag_contract_mode": str(args.dag_contract_mode),
+                "contract_report_path": str(ex_dir / "dag_contract_report.json"),
+            }
+            (ex_dir / "features.json").write_text(json.dumps(feat_dict, indent=2), encoding="utf-8")
+            if bool(args.save_raw_llm):
+                raw = feat_dict.get("raw", {})
+                raw_text = ""
+                if isinstance(raw, dict):
+                    raw_text = str(raw.get("raw_response", ""))
+                if raw_text:
+                    (ex_dir / "perception_raw_response.txt").write_text(raw_text, encoding="utf-8")
+
+            (ex_dir / "dag.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            (ex_dir / "dag_summary.txt").write_text(_dag_summary_text(payload), encoding="utf-8")
+
+            n_nodes = int(len(payload.get("nodes", [])))
+            n_edges = int(len(payload.get("edges", [])))
+            status = "success"
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            if ex_dir is not None:
+                try:
+                    (ex_dir / f"attempt_{attempt}_error.txt").write_text(
+                        traceback.format_exc(),
+                        encoding="utf-8",
+                    )
+                    raw_text = str(getattr(exc, "raw_response", "") or "")
+                    if raw_text:
+                        (ex_dir / f"attempt_{attempt}_raw_response.txt").write_text(
+                            raw_text,
+                            encoding="utf-8",
+                        )
+                    raw_excerpt = str(getattr(exc, "raw_excerpt", "") or "")
+                    if raw_excerpt:
+                        (ex_dir / f"attempt_{attempt}_error_excerpt.txt").write_text(
+                            raw_excerpt + "\n",
+                            encoding="utf-8",
+                        )
+                except Exception:
+                    pass
+            if attempt < int(args.max_retries):
+                time.sleep(float(args.retry_backoff_sec) * float(2 ** (attempt - 1)))
+                continue
+            status = "failed"
+
+    duration = float(time.time() - row_start)
+    record = {
+        "row": int(row_i),
+        "loader_index": int(idx),
+        "scenario_id": sid,
+        "status": status,
+        "attempts": int(attempts),
+        "duration_sec": duration,
+        "n_nodes": int(n_nodes),
+        "n_edges": int(n_edges),
+        "n_frames_raw": int(n_frames_raw),
+        "n_frames_vlm": int(n_frames_vlm),
+        "frame_renderer": renderer_used,
+        "rendered_scenario_id": str(rendered_sid),
+        "rendered_scenario_index": int(rendered_index),
+        "error": last_error,
+        "contract_pass": bool(contract_pass),
+        "contract_violation_counts": contract_violation_counts,
+        "contract_report": contract_report_summary,
+        "schema_version": str(expected_cache_schema_version),
+        "maneuver_nodes": int(maneuver_nodes),
+        "maneuver_interval_complete_rate": float(maneuver_interval_complete_rate),
+    }
+    return {
+        "record": record,
+        "contract_nodes_after": contract_nodes_after,
+        "contract_edges_after": contract_edges_after,
+        "contract_norm_counts": contract_norm_counts_local,
+    }
+
+
 def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_dir)
@@ -480,47 +828,11 @@ def main() -> int:
     examples_dir.mkdir(parents=True, exist_ok=True)
     results_jsonl = out_dir / "results.jsonl"
 
-    loader = ScenarioNetNNXLoader(args.data_dir)
-    indices = _resolve_indices(len(loader), args)
+    loader_indexer = ScenarioNetNNXLoader(args.data_dir)
+    indices = _resolve_indices(len(loader_indexer), args)
     if not indices:
         raise ValueError("No valid scenario indices resolved from inputs.")
-    scn_state = _setup_scenarionet_renderer(
-        data_dir=str(args.data_dir),
-        frame_renderer=str(args.frame_renderer),
-        film_size=int(args.render_film_size),
-        screen_size=int(args.render_screen_size),
-    )
-    if str(args.frame_renderer) == "scenarionet" and not bool(scn_state.get("available")):
-        raise RuntimeError(
-            "frame_renderer=scenarionet but ScenarioNet renderer is unavailable: "
-            f"{scn_state.get('error', 'unknown error')}"
-        )
-    if str(args.frame_renderer) == "auto" and not bool(scn_state.get("available")):
-        print(
-            "[dag-cache-v2] ScenarioNet renderer unavailable; auto mode will use tensor renderer. "
-            f"reason={scn_state.get('error', 'unknown')}",
-            flush=True,
-        )
-
     max_frames_for_perception = int(max(1, int(args.num_frames) * (2 if bool(args.dual_view) else 1)))
-    perception = GPT4oPerceptionModel(
-        model=str(args.model),
-        api_key=(args.api_key or None),
-        max_frames=max_frames_for_perception,
-        use_mock_fallback=False,
-    )
-    dag_builder = PromptBNDAGBuilder(
-        model=str(args.model),
-        api_key=(args.api_key or None),
-        max_retries=4,
-        use_simple_fallback=not bool(args.strict_promptbn),
-        dag_contract=str(args.dag_contract),
-        dag_contract_mode=str(args.dag_contract_mode),
-    )
-    dag_contract_cfg = DAGContractConfig(
-        name=str(args.dag_contract),
-        mode=str(args.dag_contract_mode),
-    )
     expected_cache_schema_version = schema_version_for_contract(str(args.dag_contract))
 
     started_ts = time.time()
@@ -538,285 +850,159 @@ def main() -> int:
     maneuver_interval_complete_counts: List[float] = []
 
     print(
-        f"[dag-cache-v2] dataset={args.data_dir} total={len(loader)} selected={len(indices)} "
-        f"strict_promptbn={bool(args.strict_promptbn)} frame_renderer={args.frame_renderer}"
-    , flush=True)
+        f"[dag-cache-v2] dataset={args.data_dir} total={len(loader_indexer)} selected={len(indices)} "
+        f"strict_promptbn={bool(args.strict_promptbn)} frame_renderer={args.frame_renderer} "
+        f"num_workers={max(1, int(args.num_workers))}"
+        , flush=True)
+
+    progress_enabled = bool(args.progress) and tqdm is not None
+    runtime: Optional[Dict[str, Any]] = None
+    pbar = tqdm(total=len(indices), desc="dag-cache-v2", dynamic_ncols=True) if progress_enabled else None
 
     try:
-        for row_i, idx in enumerate(indices, start=1):
-            row_start = time.time()
-            status = "failed"
-            sid = f"idx_{idx:06d}"
-            last_error = ""
-            attempts = 0
-            n_nodes = 0
-            n_edges = 0
-            n_frames_raw = 0
-            n_frames_vlm = 0
-            renderer_used = ""
-            rendered_sid = ""
-            rendered_index = -1
-            contract_pass = False
-            contract_violation_counts: Dict[str, int] = {}
-            contract_report_summary: Dict[str, Any] = {}
-            maneuver_nodes = 0
-            maneuver_interval_complete_rate = 0.0
-
-            for attempt in range(1, max(1, int(args.max_retries)) + 1):
-                attempts = attempt
-                ex_dir: Optional[Path] = None
-                try:
-                    sample = loader.load(int(idx))
-                    sample_path = Path(loader.files[int(idx)])
-                    sid = str(sample.scenario_id)
-                    cache_path = cache_dir / f"{sid}.json"
-                    if cache_path.is_file() and not bool(args.overwrite):
-                        status = "skipped_existing"
-                        skipped_existing_ids.append(sid)
-                        break
-
-                    ex_dir = examples_dir / sid
-                    ex_dir.mkdir(parents=True, exist_ok=True)
-                    raw_frames_dir = ex_dir / "frames_raw"
-                    vlm_frames_dir = ex_dir / "frames_vlm"
-                    raw_frames, ego_xy, renderer_used, rendered_sid, rendered_index = _render_frames_for_scene(
-                        args=args,
-                        sample=sample,
-                        sample_path=sample_path,
-                        loader_index=int(idx),
-                        frames_dir=raw_frames_dir,
-                        scn_state=scn_state,
-                    )
-                    n_frames_raw = int(len(raw_frames))
-                    vlm_frames, frame_manifest, vlm_context_text = build_vlm_frame_pack(
-                        sample=sample,
-                        raw_frames=raw_frames,
-                        out_dir=vlm_frames_dir,
-                        max_agents=int(args.max_agents_render),
-                        annotate_vlm_frames=bool(args.annotate_vlm_frames),
-                        annotation_style=str(args.annotation_style),
-                        ego_color_hint=str(args.ego_color_hint),
-                        include_ego_context_text=bool(args.include_ego_context_text),
-                        dual_view=bool(args.dual_view),
-                        dual_view_mode=str(args.dual_view_mode),
-                        add_ego_inset=bool(args.add_ego_inset),
-                    )
-                    n_frames_vlm = int(len(vlm_frames))
-                    frame_manifest_path = ex_dir / "frame_manifest.json"
-                    frame_manifest_path.write_text(json.dumps(frame_manifest, indent=2), encoding="utf-8")
-                    (ex_dir / "vlm_prompt_context.txt").write_text((vlm_context_text or "") + "\n", encoding="utf-8")
-
-                    scene = ScenarioInput(
-                        scenario_id=sid,
-                        frames=vlm_frames,
-                        ego_trajectory_xy=ego_xy,
-                        metadata={
-                            "source": "scenarionet_v2",
-                            "data_dir": str(args.data_dir),
-                            "loader_index": int(idx),
-                            "loader_file": str(sample_path),
-                            "frame_renderer": renderer_used,
-                            "rendered_scenario_id": str(rendered_sid),
-                            "rendered_scenario_index": int(rendered_index),
-                            "ego_color_hint": str(args.ego_color_hint),
-                            "dual_view_enabled": bool(args.dual_view),
-                            "dual_view_mode": str(args.dual_view_mode),
-                            "add_ego_inset": bool(args.add_ego_inset),
-                            "annotation_enabled": bool(args.annotate_vlm_frames),
-                            "annotation_style": str(args.annotation_style),
-                            "frame_manifest_path": str(frame_manifest_path),
-                            "frame_manifest": frame_manifest,
-                            "vlm_context_text": vlm_context_text if bool(args.include_ego_context_text) else "",
-                        },
-                    )
-
-                    features = perception.extract(scene)
-                    dag = dag_builder.build(scene, features)
-                    payload = dag_to_cache_payload(dag)
-                    payload["schema_version"] = expected_cache_schema_version
-                    meta = payload.get("metadata", {})
-                    if not isinstance(meta, dict):
-                        meta = {"metadata_raw": str(meta)}
-                    meta.update(
-                        {
-                        "source": "counter_bmt_v2_promptbn",
-                        "model": str(args.model),
-                        "strict_promptbn": bool(args.strict_promptbn),
-                        "dag_contract": str(args.dag_contract),
-                        "dag_contract_mode": str(args.dag_contract_mode),
-                        "loader_index": int(idx),
-                        "generated_at_unix_s": float(time.time()),
-                        "frame_renderer": renderer_used,
-                        "rendered_scenario_id": str(rendered_sid),
-                        "rendered_scenario_index": int(rendered_index),
-                        "annotate_vlm_frames": bool(args.annotate_vlm_frames),
-                        "annotation_style": str(args.annotation_style),
-                        "dual_view": bool(args.dual_view),
-                        "dual_view_mode": str(args.dual_view_mode),
-                        "add_ego_inset": bool(args.add_ego_inset),
-                        "ego_color_hint": str(args.ego_color_hint),
-                        "n_frames_raw": int(n_frames_raw),
-                        "n_frames_vlm": int(n_frames_vlm),
-                        }
-                    )
-                    payload["metadata"] = meta
-                    contract_ok, payload, contract_report = enforce_dag_contract(payload, config=dag_contract_cfg)
-                    contract_report_summary = contract_report.summary()
-                    contract_violation_counts = dict(contract_report.violation_counts)
-                    contract_report_path = ex_dir / "dag_contract_report.json"
-                    contract_report_path.write_text(json.dumps(contract_report_summary, indent=2), encoding="utf-8")
-                    if not contract_ok:
-                        raise RuntimeError(
-                            "DAG contract hard-enforcement failed: "
-                            f"violations={contract_violation_counts}"
-                        )
-                    contract_pass = True
-                    contract_pass_count += 1
-                    contract_nodes_after.append(int(contract_report.after_nodes))
-                    contract_edges_after.append(int(contract_report.after_edges))
-                    for k, v in contract_report.normalization_counts.items():
-                        contract_norm_counts[str(k)] = int(contract_norm_counts.get(str(k), 0) + int(v))
-
-                    if not validate_cache_payload(payload):
-                        raise RuntimeError("Generated DAG payload failed schema validation.")
-
-                    node_list = payload.get("nodes", []) if isinstance(payload.get("nodes", []), list) else []
-                    maneuver_nodes = int(
-                        sum(1 for n in node_list if str(n.get("node_type", "")).strip().lower() == "maneuver")
-                    )
-                    interval_complete = 0
-                    if maneuver_nodes > 0:
-                        for n in node_list:
-                            if str(n.get("node_type", "")).strip().lower() != "maneuver":
-                                continue
-                            md = n.get("metadata", {})
-                            if not isinstance(md, dict):
-                                continue
-                            has_all = all(k in md for k in ("start_s", "end_s", "duration_s", "mid_s"))
-                            interval_complete += int(has_all)
-                        maneuver_interval_complete_rate = float(interval_complete / max(1, maneuver_nodes))
-
-                    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-                    feat_dict = _jsonify(features)
-                    if not bool(args.save_raw_llm):
-                        raw = feat_dict.get("raw", {})
-                        if isinstance(raw, dict):
-                            raw.pop("raw_response", None)
-                    feat_dict["prompt_context"] = {
-                        "ego_color_hint": str(args.ego_color_hint),
-                        "dual_view_enabled": bool(args.dual_view),
-                        "dual_view_mode": str(args.dual_view_mode),
-                        "add_ego_inset": bool(args.add_ego_inset),
-                        "annotation_enabled": bool(args.annotate_vlm_frames),
-                        "annotation_style": str(args.annotation_style),
-                        "include_ego_context_text": bool(args.include_ego_context_text),
-                        "frame_manifest_path": str(frame_manifest_path),
-                        "n_frames_raw": int(n_frames_raw),
-                        "n_frames_vlm": int(n_frames_vlm),
-                        "dag_contract": str(args.dag_contract),
-                        "dag_contract_mode": str(args.dag_contract_mode),
-                        "contract_report_path": str(ex_dir / "dag_contract_report.json"),
-                    }
-                    (ex_dir / "features.json").write_text(json.dumps(feat_dict, indent=2), encoding="utf-8")
-                    if bool(args.save_raw_llm):
-                        raw = feat_dict.get("raw", {})
-                        raw_text = ""
-                        if isinstance(raw, dict):
-                            raw_text = str(raw.get("raw_response", ""))
-                        if raw_text:
-                            (ex_dir / "perception_raw_response.txt").write_text(raw_text, encoding="utf-8")
-
-                    (ex_dir / "dag.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-                    (ex_dir / "dag_summary.txt").write_text(_dag_summary_text(payload), encoding="utf-8")
-
-                    n_nodes = int(len(payload.get("nodes", [])))
-                    n_edges = int(len(payload.get("edges", [])))
-                    maneuver_node_counts.append(int(maneuver_nodes))
-                    maneuver_interval_complete_counts.append(float(maneuver_interval_complete_rate))
-                    status = "success"
-                    successful_ids.append(sid)
-                    break
-                except Exception as exc:
-                    last_error = str(exc)
-                    if ex_dir is not None:
-                        try:
-                            (ex_dir / f"attempt_{attempt}_error.txt").write_text(
-                                traceback.format_exc(),
-                                encoding="utf-8",
-                            )
-                            raw_text = str(getattr(exc, "raw_response", "") or "")
-                            if raw_text:
-                                (ex_dir / f"attempt_{attempt}_raw_response.txt").write_text(
-                                    raw_text,
-                                    encoding="utf-8",
-                                )
-                            raw_excerpt = str(getattr(exc, "raw_excerpt", "") or "")
-                            if raw_excerpt:
-                                (ex_dir / f"attempt_{attempt}_error_excerpt.txt").write_text(
-                                    raw_excerpt + "\n",
-                                    encoding="utf-8",
-                                )
-                        except Exception:
-                            pass
-                    if attempt < int(args.max_retries):
-                        time.sleep(float(args.retry_backoff_sec) * float(2 ** (attempt - 1)))
-                        continue
-                    status = "failed"
-
-            duration = float(time.time() - row_start)
-            if status == "failed":
-                failed_ids.append(sid)
-                key = (last_error or "unknown_error").splitlines()[0][:200]
-                failure_reasons[key] = int(failure_reasons.get(key, 0) + 1)
-                if "DAG contract hard-enforcement failed" in (last_error or ""):
-                    contract_fail_count += 1
-
-            record = {
-                "row": int(row_i),
-                "loader_index": int(idx),
-                "scenario_id": sid,
-                "status": status,
-                "attempts": int(attempts),
-                "duration_sec": duration,
-                "n_nodes": int(n_nodes),
-                "n_edges": int(n_edges),
-                "n_frames_raw": int(n_frames_raw),
-                "n_frames_vlm": int(n_frames_vlm),
-                "frame_renderer": renderer_used,
-                "rendered_scenario_id": str(rendered_sid),
-                "rendered_scenario_index": int(rendered_index),
-                "error": last_error,
-                "contract_pass": bool(contract_pass),
-                "contract_violation_counts": contract_violation_counts,
-                "contract_report": contract_report_summary,
-                "schema_version": str(expected_cache_schema_version),
-                "maneuver_nodes": int(maneuver_nodes),
-                "maneuver_interval_complete_rate": float(maneuver_interval_complete_rate),
-            }
-            _append_jsonl(results_jsonl, record)
-            scenario_results[sid] = record
-
-            msg = (
-                f"[{row_i}/{len(indices)}] idx={idx} sid={sid} status={status} "
-                f"attempts={attempts} nodes={n_nodes} edges={n_edges} "
-                f"frames_raw={n_frames_raw} frames_vlm={n_frames_vlm} "
-                f"renderer={renderer_used or 'n/a'} "
-                f"rendered_sid={rendered_sid or 'n/a'} dt={duration:.1f}s"
+        if max(1, int(args.num_workers)) == 1:
+            runtime = _create_runtime(args)
+            _WORKER_STATE.clear()
+            _WORKER_STATE.update(runtime)
+            if str(args.frame_renderer) == "auto" and not bool(runtime["scn_state"].get("available")):
+                _progress_write(
+                    "[dag-cache-v2] ScenarioNet renderer unavailable; auto mode will use tensor renderer. "
+                    f"reason={runtime['scn_state'].get('error', 'unknown')}",
+                    pbar=pbar,
+                )
+            results_iter = (
+                _process_selected_index(row_i, idx, runtime=runtime)
+                for row_i, idx in enumerate(indices, start=1)
             )
-            if last_error and status == "failed":
-                msg += f" error={last_error[:160]}"
-            print(msg, flush=True)
+            for payload in results_iter:
+                record = payload["record"]
+                sid = str(record["scenario_id"])
+                status = str(record["status"])
+                last_error = str(record.get("error", "") or "")
+                if status == "success":
+                    successful_ids.append(sid)
+                    contract_pass_count += int(bool(record.get("contract_pass", False)))
+                    if payload.get("contract_nodes_after") is not None:
+                        contract_nodes_after.append(int(payload["contract_nodes_after"]))
+                    if payload.get("contract_edges_after") is not None:
+                        contract_edges_after.append(int(payload["contract_edges_after"]))
+                    for k, v in dict(payload.get("contract_norm_counts", {})).items():
+                        contract_norm_counts[str(k)] = int(contract_norm_counts.get(str(k), 0) + int(v))
+                    maneuver_node_counts.append(int(record.get("maneuver_nodes", 0)))
+                    maneuver_interval_complete_counts.append(float(record.get("maneuver_interval_complete_rate", 0.0)))
+                elif status == "failed":
+                    failed_ids.append(sid)
+                    key = (last_error or "unknown_error").splitlines()[0][:200]
+                    failure_reasons[key] = int(failure_reasons.get(key, 0) + 1)
+                    if "DAG contract hard-enforcement failed" in last_error:
+                        contract_fail_count += 1
+                elif status == "skipped_existing":
+                    skipped_existing_ids.append(sid)
+                scenario_results[sid] = record
+                _append_jsonl(results_jsonl, record)
 
-            if status == "failed" and not bool(args.continue_on_error):
-                break
+                msg = (
+                    f"[{record['row']}/{len(indices)}] idx={record['loader_index']} sid={sid} status={status} "
+                    f"attempts={record['attempts']} nodes={record['n_nodes']} edges={record['n_edges']} "
+                    f"frames_raw={record['n_frames_raw']} frames_vlm={record['n_frames_vlm']} "
+                    f"renderer={record.get('frame_renderer') or 'n/a'} "
+                    f"rendered_sid={record.get('rendered_scenario_id') or 'n/a'} "
+                    f"dt={float(record['duration_sec']):.1f}s"
+                )
+                if last_error and status == "failed":
+                    msg += f" error={last_error[:160]}"
+                _progress_write(msg, pbar=pbar)
+                if pbar is not None:
+                    pbar.update(1)
+                if status == "failed" and not bool(args.continue_on_error):
+                    break
+        else:
+            worker_args = {k: v for k, v in vars(args).items()}
+            ctx = mp.get_context("spawn")
+            stop_requested = False
+            max_workers = max(1, int(args.num_workers))
+            max_pending = max(2 * max_workers, max_workers)
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=ctx,
+                initializer=_init_worker,
+                initargs=(worker_args,),
+            ) as executor:
+                next_pos = 0
+                pending: Dict[Future, tuple[int, int]] = {}
+
+                def _submit_more() -> None:
+                    nonlocal next_pos
+                    while not stop_requested and next_pos < len(indices) and len(pending) < max_pending:
+                        row_i = next_pos + 1
+                        idx = int(indices[next_pos])
+                        fut = executor.submit(_process_selected_index, row_i, idx)
+                        pending[fut] = (row_i, idx)
+                        next_pos += 1
+
+                _submit_more()
+                while pending:
+                    done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        pending.pop(fut, None)
+                        payload = fut.result()
+                        record = payload["record"]
+                        sid = str(record["scenario_id"])
+                        status = str(record["status"])
+                        last_error = str(record.get("error", "") or "")
+
+                        if status == "success":
+                            successful_ids.append(sid)
+                            contract_pass_count += int(bool(record.get("contract_pass", False)))
+                            if payload.get("contract_nodes_after") is not None:
+                                contract_nodes_after.append(int(payload["contract_nodes_after"]))
+                            if payload.get("contract_edges_after") is not None:
+                                contract_edges_after.append(int(payload["contract_edges_after"]))
+                            for k, v in dict(payload.get("contract_norm_counts", {})).items():
+                                contract_norm_counts[str(k)] = int(contract_norm_counts.get(str(k), 0) + int(v))
+                            maneuver_node_counts.append(int(record.get("maneuver_nodes", 0)))
+                            maneuver_interval_complete_counts.append(
+                                float(record.get("maneuver_interval_complete_rate", 0.0))
+                            )
+                        elif status == "failed":
+                            failed_ids.append(sid)
+                            key = (last_error or "unknown_error").splitlines()[0][:200]
+                            failure_reasons[key] = int(failure_reasons.get(key, 0) + 1)
+                            if "DAG contract hard-enforcement failed" in last_error:
+                                contract_fail_count += 1
+                            if not bool(args.continue_on_error):
+                                stop_requested = True
+                        elif status == "skipped_existing":
+                            skipped_existing_ids.append(sid)
+
+                        scenario_results[sid] = record
+                        _append_jsonl(results_jsonl, record)
+
+                        msg = (
+                            f"[{record['row']}/{len(indices)}] idx={record['loader_index']} sid={sid} status={status} "
+                            f"attempts={record['attempts']} nodes={record['n_nodes']} edges={record['n_edges']} "
+                            f"frames_raw={record['n_frames_raw']} frames_vlm={record['n_frames_vlm']} "
+                            f"renderer={record.get('frame_renderer') or 'n/a'} "
+                            f"rendered_sid={record.get('rendered_scenario_id') or 'n/a'} "
+                            f"dt={float(record['duration_sec']):.1f}s"
+                        )
+                        if last_error and status == "failed":
+                            msg += f" error={last_error[:160]}"
+                        _progress_write(msg, pbar=pbar)
+                        if pbar is not None:
+                            pbar.update(1)
+                    if stop_requested:
+                        for fut in pending:
+                            fut.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                    _submit_more()
     finally:
-        vis = scn_state.get("visualizer")
-        if vis is not None:
-            try:
-                vis.close()
-            except Exception:
-                pass
+        if pbar is not None:
+            pbar.close()
+        if runtime is not None:
+            _close_runtime(runtime)
+        _WORKER_STATE.clear()
 
     # Preview markdown for random successful scenarios.
     rng = np.random.default_rng(int(args.seed) + 1337)
@@ -848,6 +1034,8 @@ def main() -> int:
             "render_film_size": int(args.render_film_size),
             "render_screen_size": int(args.render_screen_size),
             "model": str(args.model),
+            "num_workers": int(max(1, int(args.num_workers))),
+            "progress": bool(args.progress),
             "perception_max_frames": int(max_frames_for_perception),
             "strict_promptbn": bool(args.strict_promptbn),
             "max_retries": int(args.max_retries),
