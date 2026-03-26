@@ -12,6 +12,7 @@ forward them through Lightning.
 
 from __future__ import annotations
 
+import pathlib
 from typing import Any, Dict, List
 
 import numpy as np
@@ -19,16 +20,97 @@ import lightning.pytorch as pl
 from torch.utils.data import DataLoader
 
 from bmt.dataset.dataset import InfgenDataset
+from bmt.utils import REPO_ROOT
+from bmt.utils import utils
 
+from .config import get_dag_latent_block
 from .dag_cache import DAGCacheBatchBuilder
+
+
+def _normalize_scenario_id(text: str) -> str:
+    raw = str(text).strip()
+    if not raw:
+        return raw
+    stem = pathlib.Path(raw).stem
+    if stem.startswith("sd_"):
+        parts = stem.split("_")
+        if len(parts) >= 2:
+            return parts[-1]
+    return stem
+
+
+def _resolve_cache_payload_dir(cache_dir: str) -> pathlib.Path:
+    path = pathlib.Path(str(cache_dir)).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    path = path.resolve()
+    if (path / "cache").is_dir():
+        path = path / "cache"
+    return path
+
+
+def _list_cached_scenario_ids(cache_dir: str) -> set[str]:
+    payload_dir = _resolve_cache_payload_dir(cache_dir)
+    if not payload_dir.is_dir():
+        raise ValueError(f"DAG cache directory does not exist: {payload_dir}")
+    out: set[str] = set()
+    for path in payload_dir.glob("*.json"):
+        sid = _normalize_scenario_id(path.stem)
+        if not sid or sid == "manifest":
+            continue
+        out.add(sid)
+    return out
 
 
 class DAGLatentInfgenDataset(InfgenDataset):
     """Legacy dataset with a safer collate for object-valued metadata fields."""
 
-    def __init__(self, *args, dag_cache_builder: DAGCacheBatchBuilder | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        dag_cache_builder: DAGCacheBatchBuilder | None = None,
+        restrict_to_cache_ids: bool = False,
+        cache_dir: str = "",
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.dag_cache_builder = dag_cache_builder
+        if bool(restrict_to_cache_ids):
+            self._filter_to_cache_ids(str(cache_dir))
+
+    def _packed_filenames(self) -> List[str]:
+        base_length = int(self.real_length) if hasattr(self, "real_length") else int(self.length)
+        out: List[str] = []
+        for idx in range(base_length):
+            seq = utils.unpack_sequence(self.strings_v, self.strings_o, idx)
+            out.append(utils.sequence_to_string(seq))
+        return out
+
+    def _reset_filenames(self, filenames: List[str]) -> None:
+        self.data_mapping = {k: self.data_mapping[k] for k in filenames}
+        seqs = [utils.string_to_sequence(s) for s in filenames]
+        self.strings_v, self.strings_o = utils.pack_sequences(seqs)
+        self.length = len(filenames)
+        if hasattr(self, "real_length"):
+            self.real_length = len(filenames)
+            if self.config.BACKWARD_PREDICTION and self.mode == "training":
+                self.length = self.real_length * 2
+
+    def _filter_to_cache_ids(self, cache_dir: str) -> None:
+        cache_ids = _list_cached_scenario_ids(cache_dir)
+        filenames = self._packed_filenames()
+        filtered = [name for name in filenames if _normalize_scenario_id(name) in cache_ids]
+        if not filtered:
+            raise ValueError(
+                "No dataset examples overlap the DAG cache ids. "
+                f"dataset_dir={self.data_dir} cache_dir={_resolve_cache_payload_dir(cache_dir)}"
+            )
+        self._reset_filenames(filtered)
+        print(
+            f"[dag-latent] filtered {self.mode} dataset to {len(filtered)} cached scenarios "
+            f"from cache_dir={_resolve_cache_payload_dir(cache_dir)}",
+            flush=True,
+        )
 
     def collate_batch(self, batch_list: List[Dict[str, Any]]):
         if not batch_list:
@@ -78,17 +160,24 @@ class DAGLatentInfgenDataModule(pl.LightningDataModule):
         self.val_prefetch_factor = val_prefetch_factor
 
     def setup(self, stage: str):
+        dag_block = get_dag_latent_block(self.config)
+        restrict_to_cache_ids = bool(dag_block.get("ONLY_CACHE_IDS", False))
+        cache_dir = str(dag_block.get("CACHE_DIR", ""))
         train_builder = DAGCacheBatchBuilder(self.config)
         val_builder = DAGCacheBatchBuilder(self.config)
         self.train_dataset = DAGLatentInfgenDataset(
             config=self.config,
             mode="training",
             dag_cache_builder=train_builder,
+            restrict_to_cache_ids=restrict_to_cache_ids,
+            cache_dir=cache_dir,
         )
         self.val_dataset = DAGLatentInfgenDataset(
             config=self.config,
             mode="test",
             dag_cache_builder=val_builder,
+            restrict_to_cache_ids=restrict_to_cache_ids,
+            cache_dir=cache_dir,
         )
 
     def train_dataloader(self):

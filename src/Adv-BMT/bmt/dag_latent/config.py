@@ -15,6 +15,7 @@ DEFAULT_DAG_LATENT_BLOCK: Dict[str, Any] = {
     "CACHE_DIR": "",
     "CACHE_STRICT": False,
     "EXPECTED_SCHEMA": "any",
+    "ONLY_CACHE_IDS": False,
     "USE_GRAPH_ENCODER": True,
     "D_NODE_IN": 24,
     "D_EDGE_IN": 8,
