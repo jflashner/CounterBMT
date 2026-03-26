@@ -1,7 +1,7 @@
 """OpenAI perception adapter.
 
-Implements a structured extraction step for maneuvers and decisions from scene
-frames, producing v2 contracts.
+Implements a structured extraction step for maneuvers and outcome labels from
+scene frames, producing v2 contracts.
 """
 
 from __future__ import annotations
@@ -15,8 +15,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from counter_bmt_v2.contracts import (
-    DecisionPoint,
-    DecisionType,
     ManeuverSegment,
     ManeuverType,
     ScenarioInput,
@@ -99,23 +97,22 @@ def _maneuver_type_from_str(s: str) -> ManeuverType:
     return ManeuverType.UNKNOWN
 
 
-def _decision_type_from_str(s: str) -> DecisionType:
-    t = s.lower().strip().replace("-", "_").replace(" ", "_")
-    for d in DecisionType:
-        if t == d.value:
-            return d
-
-    if "yield" in t or "proceed" in t:
-        return DecisionType.PROCEED_OR_YIELD
-    if "lane" in t:
-        return DecisionType.LANE_CHOICE
-    if "evasive" in t or "avoid" in t:
-        return DecisionType.EVASIVE_ACTION
-    if "gap" in t or "merge" in t:
-        return DecisionType.GAP_ACCEPTANCE
-    if "speed" in t:
-        return DecisionType.SPEED_CHOICE
-    return DecisionType.UNKNOWN
+def _normalize_outcome_label(name: str, value: Any) -> str:
+    key = str(name).strip()
+    text = str(value).lower().strip().replace("-", "_").replace(" ", "_")
+    if key == "collision_outcome":
+        if "possible" in text or "collision" in text or "crash" in text or "unsafe" in text:
+            return "collision_possible"
+        return "collision_avoided"
+    if key == "progress_outcome":
+        if "limited" in text or "blocked" in text or "stuck" in text or "slow" in text:
+            return "progress_limited"
+        return "progress_good"
+    if key == "compliance_outcome":
+        if "violation" in text or "illegal" in text or "non" in text:
+            return "violation_possible"
+        return "compliant"
+    return str(value)
 
 
 @dataclass
@@ -173,6 +170,8 @@ class OpenAIPerceptionModel(PerceptionModel):
             "Track the same ego vehicle consistently across the full sequence.",
             "Inspect the full horizon including the final 25% of frames for late maneuvers.",
             "Infer ego maneuvers from visible motion over time, not single-frame snapshots.",
+            "When the ego moves laterally into an adjacent lane while continuing forward motion, label it as lane_change_left or lane_change_right rather than straight.",
+            "Reserve left_turn and right_turn for true turning maneuvers at intersections or curved turn geometry, not simple lane shifts.",
         ]
         if dual_view_enabled:
             semantics.append(
@@ -180,10 +179,6 @@ class OpenAIPerceptionModel(PerceptionModel):
             )
             if dual_view_mode:
                 semantics.append(f"Dual-view mode: {dual_view_mode}.")
-        elif add_ego_inset:
-            semantics.append(
-                "Each global frame includes an EGO ZOOM inset (same timestamp) showing ego-centric local context."
-            )
 
         context_block = ""
         if context_text:
@@ -213,25 +208,32 @@ Return JSON only with schema:
       "reasoning": "..."
     }}
   ],
-  "decisions": [
-    {{
-      "type": "proceed_or_yield|lane_choice|evasive_action|gap_acceptance|speed_choice|unknown",
-      "timestamp_s": <float>,
-      "choice": "...",
-      "alternatives": ["..."],
+  "outcomes": {{
+    "collision_outcome": {{
+      "value": "collision_avoided|collision_possible",
+      "confidence": <float 0..1>,
+      "reasoning": "..."
+    }},
+    "progress_outcome": {{
+      "value": "progress_good|progress_limited",
+      "confidence": <float 0..1>,
+      "reasoning": "..."
+    }},
+    "compliance_outcome": {{
+      "value": "compliant|violation_possible",
       "confidence": <float 0..1>,
       "reasoning": "..."
     }}
-  ],
+  }},
   "summary": "..."
 }}
 
 Rules:
-- Be conservative and avoid hallucinated events.
-- If uncertainty is high, lower confidence and output fewer events.
 - Keep maneuvers time-ordered and non-overlapping when possible.
 - Always include at least one maneuver segment that covers the end of the horizon (end_s near {max_ts:.2f}s).
 - If the ego performs a late turn (left/right) near the end, include that maneuver explicitly with timestamps.
+- If the ego changes lanes, explicitly use lane_change_left or lane_change_right with timestamps covering the visible lateral transition.
+- Choose outcome labels from the full sequence, not just the initial frames.
 - Base conclusions only on visible evidence and supplied context text.
 """.strip()
 
@@ -305,38 +307,33 @@ Rules:
             except Exception:
                 continue
 
-        decisions: List[DecisionPoint] = []
-        for d in data.get("decisions", []):
-            try:
-                alts = d.get("alternatives", [])
-                if not isinstance(alts, list):
-                    alts = [str(alts)]
-                decisions.append(
-                    DecisionPoint(
-                        decision_type=_decision_type_from_str(str(d.get("type", "unknown"))),
-                        timestamp_s=float(d.get("timestamp_s", 0.0)),
-                        choice=str(d.get("choice", "unknown")),
-                        alternatives=[str(x) for x in alts],
-                        confidence=float(d.get("confidence", 0.5)),
-                        reasoning=str(d.get("reasoning", "")),
-                    )
-                )
-            except Exception:
-                continue
-
         maneuvers.sort(key=lambda x: (x.start_s, x.end_s))
-        decisions.sort(key=lambda x: x.timestamp_s)
+
+        outcomes_raw = data.get("outcomes", {})
+        if not isinstance(outcomes_raw, dict):
+            outcomes_raw = {}
+        normalized_outcomes: Dict[str, Dict[str, Any]] = {}
+        for name in ("collision_outcome", "progress_outcome", "compliance_outcome"):
+            item = outcomes_raw.get(name, {})
+            if not isinstance(item, dict):
+                item = {"value": item}
+            normalized_outcomes[name] = {
+                "value": _normalize_outcome_label(name, item.get("value", "")),
+                "confidence": float(item.get("confidence", 0.5)),
+                "reasoning": str(item.get("reasoning", "")),
+            }
 
         return VLMFeatures(
             scenario_id=scene.scenario_id,
             maneuvers=maneuvers,
-            decisions=decisions,
+            decisions=[],
             raw={
                 "backend": "openai",
                 "summary": data.get("summary", ""),
+                "outcomes": normalized_outcomes,
                 "raw_response": raw,
                 "n_images_sent": len(images),
-                "prompt_version": "v2_topdown_ego_v2_endaware",
+                "prompt_version": "v3_maneuver_outcome_no_decisions",
                 "ego_color_hint": ego_color_hint,
                 "dual_view_enabled": dual_view_enabled,
                 "add_ego_inset": add_ego_inset,

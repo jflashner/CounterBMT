@@ -28,6 +28,33 @@ def _timestamp_to_t_index(sample: NNXBMTSceneSample, timestamp_s: float) -> int:
     return int(np.clip(idx, 0, t_steps - 1))
 
 
+def _frame_span_summary(sample: NNXBMTSceneSample, raw_frames: Sequence[TimestampedFrame]) -> Dict[str, Any]:
+    t_steps = int(sample.agent_position_xy.shape[0]) if sample.agent_position_xy.ndim >= 3 else 0
+    dt = _safe_dt(sample)
+    horizon_end_s = float(max(0.0, (t_steps - 1) * dt))
+    t_indices = [_timestamp_to_t_index(sample, float(f.timestamp_s)) for f in raw_frames]
+    timestamps = [float(f.timestamp_s) for f in raw_frames]
+    start_idx = int(min(t_indices)) if t_indices else 0
+    end_idx = int(max(t_indices)) if t_indices else 0
+    start_s = float(min(timestamps)) if timestamps else 0.0
+    end_s = float(max(timestamps)) if timestamps else 0.0
+    coverage_ratio = float(end_s / max(horizon_end_s, 1e-6)) if horizon_end_s > 0 else 1.0
+    covers_terminal_frame = bool(end_idx >= max(0, t_steps - 1))
+    return {
+        "scenario_t_steps": int(t_steps),
+        "dt_s": float(dt),
+        "horizon_end_s": float(horizon_end_s),
+        "sampled_t_indices": [int(x) for x in t_indices],
+        "sampled_timestamps_s": [float(x) for x in timestamps],
+        "start_t_index": int(start_idx),
+        "end_t_index": int(end_idx),
+        "start_s": float(start_s),
+        "end_s": float(end_s),
+        "coverage_ratio": float(coverage_ratio),
+        "covers_terminal_frame": bool(covers_terminal_frame),
+    }
+
+
 def _mean_abs_heading_delta(heading: np.ndarray, valid: np.ndarray) -> float:
     if heading.ndim != 1 or valid.ndim != 1 or heading.shape[0] < 2:
         return 0.0
@@ -86,6 +113,7 @@ def _build_ego_context_text(sample: NNXBMTSceneSample, raw_frames: Sequence[Time
     speed_max = float(np.max(speed_valid)) if speed_valid.size else 0.0
 
     ts_list = ", ".join(f"{float(f.timestamp_s):.2f}" for f in raw_frames) if raw_frames else "none"
+    span = _frame_span_summary(sample, raw_frames)
     final_turn = "unknown"
     try:
         valid_idx = np.where(ego_valid)[0]
@@ -124,6 +152,13 @@ def _build_ego_context_text(sample: NNXBMTSceneSample, raw_frames: Sequence[Time
         f"- Final-horizon turn trend: {final_turn}",
         f"- Frame timestamps (s): {ts_list}",
         f"- Frame dt (s): {dt:.3f}",
+        (
+            f"- Frame span coverage: start={float(span['start_s']):.2f}s "
+            f"end={float(span['end_s']):.2f}s horizon_end={float(span['horizon_end_s']):.2f}s "
+            f"coverage_ratio={float(span['coverage_ratio']):.3f} "
+            f"covers_terminal_frame={bool(span['covers_terminal_frame'])}"
+        ),
+        f"- Sampled frame indices: {span['sampled_t_indices']}",
     ]
     if keyframe_lines:
         lines.append("- Ego keyframe states:")
@@ -408,6 +443,7 @@ def build_vlm_frame_pack(
     ordered = sorted(raw_frames, key=lambda f: (float(f.timestamp_s), str(f.path)))
     frames_for_vlm: List[TimestampedFrame] = []
     manifest: List[Dict[str, Any]] = []
+    span = _frame_span_summary(sample, ordered)
 
     for i, raw in enumerate(ordered):
         global_path = out_dir / f"global_t{i:03d}.png"
@@ -477,9 +513,13 @@ def build_vlm_frame_pack(
                 "frame_id": f"global_t{i:03d}",
                 "role": "global",
                 "timestamp_s": float(raw.timestamp_s),
+                "t_index": int(t_idx),
                 "path": str(global_path),
                 "sequence_index": int(sequence_index),
                 "has_ego_inset": bool(add_ego_inset and ego_render_ok),
+                "scenario_t_steps": int(span["scenario_t_steps"]),
+                "scenario_horizon_end_s": float(span["horizon_end_s"]),
+                "covers_terminal_frame": bool(span["covers_terminal_frame"]),
             }
         )
 
@@ -499,9 +539,13 @@ def build_vlm_frame_pack(
                     "frame_id": f"ego_t{i:03d}",
                     "role": "ego_view",
                     "timestamp_s": float(raw.timestamp_s),
+                    "t_index": int(t_idx),
                     "path": str(ego_path),
                     "sequence_index": int(sequence_index),
                     "derived_from": f"global_t{i:03d}",
+                    "scenario_t_steps": int(span["scenario_t_steps"]),
+                    "scenario_horizon_end_s": float(span["horizon_end_s"]),
+                    "covers_terminal_frame": bool(span["covers_terminal_frame"]),
                 }
             )
 

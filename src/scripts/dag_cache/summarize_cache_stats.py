@@ -23,6 +23,21 @@ REQUIRED_OUTCOMES = (
     "compliance_outcome",
 )
 
+MANEUVER_CLASSES_MO = (
+    "straight",
+    "left_turn",
+    "right_turn",
+    "lane_change_left",
+    "lane_change_right",
+    "stop",
+    "accelerate",
+    "decelerate",
+    "yield",
+    "merge",
+    "u_turn",
+    "park",
+)
+
 
 def _safe_mean(xs: Sequence[float]) -> float:
     return float(mean(xs)) if xs else 0.0
@@ -132,7 +147,7 @@ def _graph_maneuver_classes(nodes: Iterable[Mapping[str, Any]]) -> List[str]:
     return out
 
 
-def _summarize_cache(cache_dir: Path, root_dir: Path, *, top_k: int) -> Dict[str, Any]:
+def _summarize_cache(cache_dir: Path, root_dir: Path, *, top_k: int, examples_per_class: int) -> Dict[str, Any]:
     files = sorted(cache_dir.glob("*.json"))
     if not files:
         raise FileNotFoundError(f"No cache json files found in {cache_dir}")
@@ -151,9 +166,11 @@ def _summarize_cache(cache_dir: Path, root_dir: Path, *, top_k: int) -> Dict[str
     interval_complete_rates: List[float] = []
     edge_confidences: List[float] = []
 
-    maneuver_class_node_counts: Counter[str] = Counter()
-    maneuver_class_graph_counts: Counter[str] = Counter()
+    maneuver_class_node_counts: Counter[str] = Counter({cls: 0 for cls in MANEUVER_CLASSES_MO})
+    maneuver_class_graph_counts: Counter[str] = Counter({cls: 0 for cls in MANEUVER_CLASSES_MO})
     maneuver_pair_graph_counts: Counter[str] = Counter()
+    maneuver_examples: Dict[str, List[str]] = {cls: [] for cls in MANEUVER_CLASSES_MO}
+    graph_maneuvers: List[Dict[str, Any]] = []
     outcome_value_counts: Dict[str, Counter[str]] = {k: Counter() for k in REQUIRED_OUTCOMES}
     outcome_presence_counts: Counter[str] = Counter()
     outcome_edge_counts: Counter[str] = Counter()
@@ -200,11 +217,21 @@ def _summarize_cache(cache_dir: Path, root_dir: Path, *, top_k: int) -> Dict[str
 
         class_list = _graph_maneuver_classes(maneuvers)
         class_set = sorted(set(class_list))
+        graph_maneuvers.append(
+            {
+                "scenario_id": sid,
+                "maneuvers": sorted(class_list),
+                "unique_maneuvers": class_set,
+                "n_maneuvers": int(len(class_list)),
+            }
+        )
         unique_maneuver_class_counts.append(len(class_set))
         for cls in class_list:
             maneuver_class_node_counts[cls] += 1
         for cls in class_set:
             maneuver_class_graph_counts[cls] += 1
+            if len(maneuver_examples.setdefault(cls, [])) < int(examples_per_class):
+                maneuver_examples[cls].append(sid)
         for i, cls_a in enumerate(class_set):
             for cls_b in class_set[i + 1 :]:
                 maneuver_pair_graph_counts[f"{cls_a} + {cls_b}"] += 1
@@ -287,10 +314,12 @@ def _summarize_cache(cache_dir: Path, root_dir: Path, *, top_k: int) -> Dict[str
         "edge_confidence_stats": _stats(edge_confidences),
         "maneuver_count_histogram": {k: int(v) for k, v in sorted(maneuver_count_hist.items(), key=lambda kv: int(kv[0]))},
         "maneuver_class_distribution": {
-            "node_counts": dict(maneuver_class_node_counts),
-            "graph_presence_counts": dict(maneuver_class_graph_counts),
+            "node_counts": {cls: int(maneuver_class_node_counts.get(cls, 0)) for cls in MANEUVER_CLASSES_MO},
+            "graph_presence_counts": {cls: int(maneuver_class_graph_counts.get(cls, 0)) for cls in MANEUVER_CLASSES_MO},
             "top_pairs_by_graph_presence": _top_items(maneuver_pair_graph_counts, top_k),
+            "example_scenario_ids_by_class": {cls: list(maneuver_examples.get(cls, [])) for cls in MANEUVER_CLASSES_MO},
         },
+        "graph_maneuver_listing": graph_maneuvers,
         "outcome_summary": {
             "presence_counts": dict(outcome_presence_counts),
             "value_counts": {k: dict(v) for k, v in outcome_value_counts.items()},
@@ -307,7 +336,7 @@ def _summarize_cache(cache_dir: Path, root_dir: Path, *, top_k: int) -> Dict[str
     }
 
 
-def _to_markdown(summary: Mapping[str, Any], *, top_k: int) -> str:
+def _to_markdown(summary: Mapping[str, Any], *, top_k: int, examples_per_class: int) -> str:
     lines: List[str] = []
     lines.append("# DAG Cache Summary")
     lines.append("")
@@ -346,6 +375,24 @@ def _to_markdown(summary: Mapping[str, Any], *, top_k: int) -> str:
         )
     lines.append("")
 
+    lines.append("## Example Scenario IDs By Maneuver Class")
+    lines.append("")
+    example_ids = class_dist.get("example_scenario_ids_by_class", {})
+    for cls in sorted(example_ids.keys()):
+        ids = list(example_ids.get(cls, []))
+        shown = ", ".join(ids[:examples_per_class]) if ids else "(none)"
+        lines.append(f"- `{cls}`: {shown}")
+    lines.append("")
+
+    lines.append("## Per-Graph Maneuver Listing")
+    lines.append("")
+    for item in summary.get("graph_maneuver_listing", []):
+        lines.append(
+            f"- `{item['scenario_id']}`: "
+            f"maneuvers=`{', '.join(item['maneuvers']) if item['maneuvers'] else '(none)'}`"
+        )
+    lines.append("")
+
     lines.append("## Outcome Values")
     lines.append("")
     outcome_summary = summary.get("outcome_summary", {})
@@ -372,6 +419,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Summarize DAG cache statistics.")
     p.add_argument("--cache-dir", type=str, required=True, help="Cache dir or cache build root containing cache/")
     p.add_argument("--top-k", type=int, default=10)
+    p.add_argument("--examples-per-class", type=int, default=25)
     p.add_argument("--output-json", type=str, default="")
     p.add_argument("--output-md", type=str, default="")
     return p.parse_args()
@@ -380,7 +428,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     cache_dir, root_dir = _resolve_paths(Path(args.cache_dir))
-    summary = _summarize_cache(cache_dir, root_dir, top_k=int(args.top_k))
+    summary = _summarize_cache(
+        cache_dir,
+        root_dir,
+        top_k=int(args.top_k),
+        examples_per_class=int(args.examples_per_class),
+    )
 
     print(json.dumps(summary, indent=2, sort_keys=True))
 
@@ -393,7 +446,10 @@ def main() -> int:
     if args.output_md:
         out_md = Path(args.output_md)
         out_md.parent.mkdir(parents=True, exist_ok=True)
-        out_md.write_text(_to_markdown(summary, top_k=int(args.top_k)), encoding="utf-8")
+        out_md.write_text(
+            _to_markdown(summary, top_k=int(args.top_k), examples_per_class=int(args.examples_per_class)),
+            encoding="utf-8",
+        )
         print(f"Saved Markdown summary: {out_md}")
 
     return 0

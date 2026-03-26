@@ -50,6 +50,12 @@ _OUTCOME_ALTERNATIVES_MO: Dict[str, List[str]] = {
     "compliance_outcome": ["compliant", "violation_possible"],
 }
 
+_OUTCOME_DEFAULTS_MO: Dict[str, str] = {
+    "collision_outcome": "collision_avoided",
+    "progress_outcome": "progress_good",
+    "compliance_outcome": "compliant",
+}
+
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
     text = text.strip()
@@ -288,6 +294,31 @@ class PromptBNDAGBuilder(DAGBuilder):
         vars_out: List[Dict[str, Any]] = []
 
         if str(self.dag_contract) == "maneuver_outcome_v1":
+            raw = dict(features.raw) if isinstance(features.raw, dict) else {}
+            outcome_raw = raw.get("outcomes", {})
+            if not isinstance(outcome_raw, dict):
+                outcome_raw = {}
+
+            def _outcome_value(name: str) -> str:
+                item = outcome_raw.get(name, {})
+                if isinstance(item, dict):
+                    value = str(item.get("value", "")).strip()
+                    if value:
+                        return value
+                elif item is not None:
+                    value = str(item).strip()
+                    if value:
+                        return value
+                return _OUTCOME_DEFAULTS_MO[name]
+
+            def _outcome_reasoning(name: str, fallback: str) -> str:
+                item = outcome_raw.get(name, {})
+                if isinstance(item, dict):
+                    reasoning = str(item.get("reasoning", "")).strip()
+                    if reasoning:
+                        return reasoning
+                return fallback
+
             maneuvers = sorted(list(features.maneuvers), key=lambda m: (float(m.start_s), float(m.end_s)))
             for i, m in enumerate(maneuvers[:8]):
                 start_s = float(m.start_s)
@@ -331,24 +362,33 @@ class PromptBNDAGBuilder(DAGBuilder):
                     {
                         "node_id": "collision_outcome",
                         "node_type": "outcome",
-                        "value": "collision_avoided",
-                        "description": "collision consequence at scenario horizon",
+                        "value": _outcome_value("collision_outcome"),
+                        "description": _outcome_reasoning(
+                            "collision_outcome",
+                            "collision consequence at scenario horizon",
+                        ),
                         "alternatives": list(_OUTCOME_ALTERNATIVES_MO["collision_outcome"]),
                         "observed": True,
                     },
                     {
                         "node_id": "progress_outcome",
                         "node_type": "outcome",
-                        "value": "progress_good",
-                        "description": "goal/progress consequence at scenario horizon",
+                        "value": _outcome_value("progress_outcome"),
+                        "description": _outcome_reasoning(
+                            "progress_outcome",
+                            "goal/progress consequence at scenario horizon",
+                        ),
                         "alternatives": list(_OUTCOME_ALTERNATIVES_MO["progress_outcome"]),
                         "observed": True,
                     },
                     {
                         "node_id": "compliance_outcome",
                         "node_type": "outcome",
-                        "value": "compliant",
-                        "description": "rule-compliance consequence at scenario horizon",
+                        "value": _outcome_value("compliance_outcome"),
+                        "description": _outcome_reasoning(
+                            "compliance_outcome",
+                            "rule-compliance consequence at scenario horizon",
+                        ),
                         "alternatives": list(_OUTCOME_ALTERNATIVES_MO["compliance_outcome"]),
                         "observed": True,
                     },
