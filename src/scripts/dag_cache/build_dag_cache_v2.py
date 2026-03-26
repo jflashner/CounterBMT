@@ -9,10 +9,10 @@ import logging
 import pickle
 import time
 import traceback
-from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
+from queue import Empty
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -344,18 +344,77 @@ def _close_runtime(runtime: Dict[str, Any]) -> None:
             pass
 
 
-def _init_worker(worker_args: Dict[str, Any]) -> None:
-    args = argparse.Namespace(**worker_args)
-    runtime = _create_runtime(args)
-    _WORKER_STATE.clear()
-    _WORKER_STATE.update(runtime)
-
-
 def _progress_write(message: str, pbar: Any = None) -> None:
     if pbar is not None and tqdm is not None:
         tqdm.write(message)
         return
     print(message, flush=True)
+
+
+def _format_record_message(record: Dict[str, Any], total: int) -> str:
+    sid = str(record.get("scenario_id", ""))
+    status = str(record.get("status", "unknown"))
+    last_error = str(record.get("error", "") or "")
+    msg = (
+        f"[{int(record.get('row', 0))}/{int(total)}] idx={int(record.get('loader_index', -1))} "
+        f"sid={sid} status={status} "
+        f"attempts={int(record.get('attempts', 0))} "
+        f"nodes={int(record.get('n_nodes', 0))} edges={int(record.get('n_edges', 0))} "
+        f"frames_raw={int(record.get('n_frames_raw', 0))} frames_vlm={int(record.get('n_frames_vlm', 0))} "
+        f"renderer={str(record.get('frame_renderer') or 'n/a')} "
+        f"rendered_sid={str(record.get('rendered_scenario_id') or 'n/a')} "
+        f"dt={float(record.get('duration_sec', 0.0)):.1f}s"
+    )
+    if last_error and status == "failed":
+        msg += f" error={last_error[:160]}"
+    return msg
+
+
+def _accumulate_result(
+    *,
+    payload: Dict[str, Any],
+    results_jsonl: Path,
+    scenario_results: Dict[str, Dict[str, Any]],
+    successful_ids: List[str],
+    failed_ids: List[str],
+    skipped_existing_ids: List[str],
+    failure_reasons: Dict[str, int],
+    contract_nodes_after: List[int],
+    contract_edges_after: List[int],
+    contract_norm_counts: Dict[str, int],
+    maneuver_node_counts: List[int],
+    maneuver_interval_complete_counts: List[float],
+) -> tuple[Dict[str, Any], bool, bool]:
+    record = dict(payload["record"])
+    sid = str(record["scenario_id"])
+    status = str(record["status"])
+    last_error = str(record.get("error", "") or "")
+    contract_pass_increment = False
+    contract_fail_increment = False
+
+    if status == "success":
+        successful_ids.append(sid)
+        contract_pass_increment = bool(record.get("contract_pass", False))
+        if payload.get("contract_nodes_after") is not None:
+            contract_nodes_after.append(int(payload["contract_nodes_after"]))
+        if payload.get("contract_edges_after") is not None:
+            contract_edges_after.append(int(payload["contract_edges_after"]))
+        for k, v in dict(payload.get("contract_norm_counts", {})).items():
+            contract_norm_counts[str(k)] = int(contract_norm_counts.get(str(k), 0) + int(v))
+        maneuver_node_counts.append(int(record.get("maneuver_nodes", 0)))
+        maneuver_interval_complete_counts.append(float(record.get("maneuver_interval_complete_rate", 0.0)))
+    elif status == "failed":
+        failed_ids.append(sid)
+        key = (last_error or "unknown_error").splitlines()[0][:200]
+        failure_reasons[key] = int(failure_reasons.get(key, 0) + 1)
+        if "DAG contract hard-enforcement failed" in last_error:
+            contract_fail_increment = True
+    elif status == "skipped_existing":
+        skipped_existing_ids.append(sid)
+
+    scenario_results[sid] = record
+    _append_jsonl(results_jsonl, record)
+    return record, contract_pass_increment, contract_fail_increment
 
 
 def _setup_scenarionet_renderer(
@@ -818,6 +877,64 @@ def _process_selected_index(row_i: int, idx: int, *, runtime: Optional[Dict[str,
     }
 
 
+def _worker_main(
+    worker_id: int,
+    worker_args: Dict[str, Any],
+    assignments: Sequence[tuple[int, int]],
+    out_queue: Any,
+    stop_event: Any,
+) -> None:
+    runtime: Optional[Dict[str, Any]] = None
+    try:
+        args = argparse.Namespace(**worker_args)
+        runtime = _create_runtime(args)
+        out_queue.put(
+            {
+                "type": "ready",
+                "worker_id": int(worker_id),
+                "assigned": int(len(assignments)),
+            }
+        )
+        for row_i, idx in assignments:
+            if bool(stop_event.is_set()):
+                break
+            out_queue.put(
+                {
+                    "type": "start",
+                    "worker_id": int(worker_id),
+                    "row": int(row_i),
+                    "loader_index": int(idx),
+                }
+            )
+            payload = _process_selected_index(int(row_i), int(idx), runtime=runtime)
+            out_queue.put(
+                {
+                    "type": "record",
+                    "worker_id": int(worker_id),
+                    "payload": payload,
+                }
+            )
+            if bool(stop_event.is_set()):
+                break
+    except Exception:
+        out_queue.put(
+            {
+                "type": "worker_error",
+                "worker_id": int(worker_id),
+                "traceback": traceback.format_exc(),
+            }
+        )
+    finally:
+        if runtime is not None:
+            _close_runtime(runtime)
+        out_queue.put(
+            {
+                "type": "done",
+                "worker_id": int(worker_id),
+            }
+        )
+
+
 def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_dir)
@@ -857,7 +974,9 @@ def main() -> int:
 
     progress_enabled = bool(args.progress) and tqdm is not None
     runtime: Optional[Dict[str, Any]] = None
-    pbar = tqdm(total=len(indices), desc="dag-cache-v2", dynamic_ncols=True) if progress_enabled else None
+    overall_pbar = tqdm(total=len(indices), desc="dag-cache-v2", dynamic_ncols=True, position=0) if progress_enabled else None
+    worker_bars: Dict[int, Any] = {}
+    processes: List[mp.Process] = []
 
     try:
         if max(1, int(args.num_workers)) == 1:
@@ -868,138 +987,168 @@ def main() -> int:
                 _progress_write(
                     "[dag-cache-v2] ScenarioNet renderer unavailable; auto mode will use tensor renderer. "
                     f"reason={runtime['scn_state'].get('error', 'unknown')}",
-                    pbar=pbar,
+                    pbar=overall_pbar,
                 )
             results_iter = (
                 _process_selected_index(row_i, idx, runtime=runtime)
                 for row_i, idx in enumerate(indices, start=1)
             )
             for payload in results_iter:
-                record = payload["record"]
-                sid = str(record["scenario_id"])
-                status = str(record["status"])
-                last_error = str(record.get("error", "") or "")
-                if status == "success":
-                    successful_ids.append(sid)
-                    contract_pass_count += int(bool(record.get("contract_pass", False)))
-                    if payload.get("contract_nodes_after") is not None:
-                        contract_nodes_after.append(int(payload["contract_nodes_after"]))
-                    if payload.get("contract_edges_after") is not None:
-                        contract_edges_after.append(int(payload["contract_edges_after"]))
-                    for k, v in dict(payload.get("contract_norm_counts", {})).items():
-                        contract_norm_counts[str(k)] = int(contract_norm_counts.get(str(k), 0) + int(v))
-                    maneuver_node_counts.append(int(record.get("maneuver_nodes", 0)))
-                    maneuver_interval_complete_counts.append(float(record.get("maneuver_interval_complete_rate", 0.0)))
-                elif status == "failed":
-                    failed_ids.append(sid)
-                    key = (last_error or "unknown_error").splitlines()[0][:200]
-                    failure_reasons[key] = int(failure_reasons.get(key, 0) + 1)
-                    if "DAG contract hard-enforcement failed" in last_error:
-                        contract_fail_count += 1
-                elif status == "skipped_existing":
-                    skipped_existing_ids.append(sid)
-                scenario_results[sid] = record
-                _append_jsonl(results_jsonl, record)
-
-                msg = (
-                    f"[{record['row']}/{len(indices)}] idx={record['loader_index']} sid={sid} status={status} "
-                    f"attempts={record['attempts']} nodes={record['n_nodes']} edges={record['n_edges']} "
-                    f"frames_raw={record['n_frames_raw']} frames_vlm={record['n_frames_vlm']} "
-                    f"renderer={record.get('frame_renderer') or 'n/a'} "
-                    f"rendered_sid={record.get('rendered_scenario_id') or 'n/a'} "
-                    f"dt={float(record['duration_sec']):.1f}s"
+                record, contract_pass_inc, contract_fail_inc = _accumulate_result(
+                    payload=payload,
+                    results_jsonl=results_jsonl,
+                    scenario_results=scenario_results,
+                    successful_ids=successful_ids,
+                    failed_ids=failed_ids,
+                    skipped_existing_ids=skipped_existing_ids,
+                    failure_reasons=failure_reasons,
+                    contract_nodes_after=contract_nodes_after,
+                    contract_edges_after=contract_edges_after,
+                    contract_norm_counts=contract_norm_counts,
+                    maneuver_node_counts=maneuver_node_counts,
+                    maneuver_interval_complete_counts=maneuver_interval_complete_counts,
                 )
-                if last_error and status == "failed":
-                    msg += f" error={last_error[:160]}"
-                _progress_write(msg, pbar=pbar)
-                if pbar is not None:
-                    pbar.update(1)
-                if status == "failed" and not bool(args.continue_on_error):
+                contract_pass_count += int(contract_pass_inc)
+                contract_fail_count += int(contract_fail_inc)
+                _progress_write(_format_record_message(record, len(indices)), pbar=overall_pbar)
+                if overall_pbar is not None:
+                    overall_pbar.update(1)
+                if str(record["status"]) == "failed" and not bool(args.continue_on_error):
                     break
         else:
             worker_args = {k: v for k, v in vars(args).items()}
             ctx = mp.get_context("spawn")
-            stop_requested = False
             max_workers = max(1, int(args.num_workers))
-            max_pending = max(2 * max_workers, max_workers)
-            with ProcessPoolExecutor(
-                max_workers=max_workers,
-                mp_context=ctx,
-                initializer=_init_worker,
-                initargs=(worker_args,),
-            ) as executor:
-                next_pos = 0
-                pending: Dict[Future, tuple[int, int]] = {}
+            assignments_by_worker: List[List[tuple[int, int]]] = [[] for _ in range(max_workers)]
+            for pos, idx in enumerate(indices):
+                worker_id = int(pos % max_workers)
+                assignments_by_worker[worker_id].append((int(pos + 1), int(idx)))
 
-                def _submit_more() -> None:
-                    nonlocal next_pos
-                    while not stop_requested and next_pos < len(indices) and len(pending) < max_pending:
-                        row_i = next_pos + 1
-                        idx = int(indices[next_pos])
-                        fut = executor.submit(_process_selected_index, row_i, idx)
-                        pending[fut] = (row_i, idx)
-                        next_pos += 1
+            for worker_id, assignments in enumerate(assignments_by_worker):
+                if not assignments:
+                    continue
+                if progress_enabled:
+                    worker_bars[worker_id] = tqdm(
+                        total=len(assignments),
+                        desc=f"worker {worker_id + 1}",
+                        dynamic_ncols=True,
+                        position=worker_id + 1,
+                        leave=True,
+                    )
 
-                _submit_more()
-                while pending:
-                    done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
-                    for fut in done:
-                        pending.pop(fut, None)
-                        payload = fut.result()
-                        record = payload["record"]
-                        sid = str(record["scenario_id"])
-                        status = str(record["status"])
-                        last_error = str(record.get("error", "") or "")
+            runtime_check = _create_runtime(args)
+            try:
+                if str(args.frame_renderer) == "auto" and not bool(runtime_check["scn_state"].get("available")):
+                    _progress_write(
+                        "[dag-cache-v2] ScenarioNet renderer unavailable; auto mode will use tensor renderer. "
+                        f"reason={runtime_check['scn_state'].get('error', 'unknown')}",
+                        pbar=overall_pbar,
+                    )
+            finally:
+                _close_runtime(runtime_check)
 
-                        if status == "success":
-                            successful_ids.append(sid)
-                            contract_pass_count += int(bool(record.get("contract_pass", False)))
-                            if payload.get("contract_nodes_after") is not None:
-                                contract_nodes_after.append(int(payload["contract_nodes_after"]))
-                            if payload.get("contract_edges_after") is not None:
-                                contract_edges_after.append(int(payload["contract_edges_after"]))
-                            for k, v in dict(payload.get("contract_norm_counts", {})).items():
-                                contract_norm_counts[str(k)] = int(contract_norm_counts.get(str(k), 0) + int(v))
-                            maneuver_node_counts.append(int(record.get("maneuver_nodes", 0)))
-                            maneuver_interval_complete_counts.append(
-                                float(record.get("maneuver_interval_complete_rate", 0.0))
-                            )
-                        elif status == "failed":
-                            failed_ids.append(sid)
-                            key = (last_error or "unknown_error").splitlines()[0][:200]
-                            failure_reasons[key] = int(failure_reasons.get(key, 0) + 1)
-                            if "DAG contract hard-enforcement failed" in last_error:
-                                contract_fail_count += 1
-                            if not bool(args.continue_on_error):
-                                stop_requested = True
-                        elif status == "skipped_existing":
-                            skipped_existing_ids.append(sid)
+            out_queue = ctx.Queue()
+            stop_event = ctx.Event()
+            for worker_id, assignments in enumerate(assignments_by_worker):
+                if not assignments:
+                    continue
+                proc = ctx.Process(
+                    target=_worker_main,
+                    args=(int(worker_id), worker_args, list(assignments), out_queue, stop_event),
+                    daemon=False,
+                )
+                proc.start()
+                processes.append(proc)
 
-                        scenario_results[sid] = record
-                        _append_jsonl(results_jsonl, record)
+            active_workers = len(processes)
+            while active_workers > 0:
+                try:
+                    message = out_queue.get(timeout=0.2)
+                except Empty:
+                    active_workers = sum(1 for p in processes if p.is_alive())
+                    continue
 
-                        msg = (
-                            f"[{record['row']}/{len(indices)}] idx={record['loader_index']} sid={sid} status={status} "
-                            f"attempts={record['attempts']} nodes={record['n_nodes']} edges={record['n_edges']} "
-                            f"frames_raw={record['n_frames_raw']} frames_vlm={record['n_frames_vlm']} "
-                            f"renderer={record.get('frame_renderer') or 'n/a'} "
-                            f"rendered_sid={record.get('rendered_scenario_id') or 'n/a'} "
-                            f"dt={float(record['duration_sec']):.1f}s"
+                message_type = str(message.get("type", ""))
+                worker_id = int(message.get("worker_id", -1))
+                worker_bar = worker_bars.get(worker_id)
+
+                if message_type == "message":
+                    _progress_write(str(message.get("message", "")), pbar=overall_pbar)
+                    continue
+
+                if message_type == "ready":
+                    if worker_bar is not None:
+                        worker_bar.set_postfix_str(f"ready assigned={int(message.get('assigned', 0))}")
+                    continue
+
+                if message_type == "start":
+                    if worker_bar is not None:
+                        worker_bar.set_postfix_str(
+                            f"row={int(message.get('row', 0))} idx={int(message.get('loader_index', -1))}"
                         )
-                        if last_error and status == "failed":
-                            msg += f" error={last_error[:160]}"
-                        _progress_write(msg, pbar=pbar)
-                        if pbar is not None:
-                            pbar.update(1)
-                    if stop_requested:
-                        for fut in pending:
-                            fut.cancel()
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        break
-                    _submit_more()
+                    continue
+
+                if message_type == "record":
+                    payload = dict(message["payload"])
+                    record, contract_pass_inc, contract_fail_inc = _accumulate_result(
+                        payload=payload,
+                        results_jsonl=results_jsonl,
+                        scenario_results=scenario_results,
+                        successful_ids=successful_ids,
+                        failed_ids=failed_ids,
+                        skipped_existing_ids=skipped_existing_ids,
+                        failure_reasons=failure_reasons,
+                        contract_nodes_after=contract_nodes_after,
+                        contract_edges_after=contract_edges_after,
+                        contract_norm_counts=contract_norm_counts,
+                        maneuver_node_counts=maneuver_node_counts,
+                        maneuver_interval_complete_counts=maneuver_interval_complete_counts,
+                    )
+                    contract_pass_count += int(contract_pass_inc)
+                    contract_fail_count += int(contract_fail_inc)
+                    _progress_write(_format_record_message(record, len(indices)), pbar=overall_pbar)
+                    if overall_pbar is not None:
+                        overall_pbar.update(1)
+                    if worker_bar is not None:
+                        worker_bar.update(1)
+                        worker_bar.set_postfix_str(
+                            f"{str(record['status'])} sid={str(record['scenario_id'])[-8:]}"
+                        )
+                    if str(record["status"]) == "failed" and not bool(args.continue_on_error):
+                        stop_event.set()
+                    continue
+
+                if message_type == "worker_error":
+                    _progress_write(
+                        f"[dag-cache-v2] worker {worker_id + 1} crashed\n{str(message.get('traceback', '')).rstrip()}",
+                        pbar=overall_pbar,
+                    )
+                    stop_event.set()
+                    continue
+
+                if message_type == "done":
+                    active_workers -= 1
+                    if worker_bar is not None:
+                        worker_bar.set_postfix_str("done")
+                    continue
     finally:
-        if pbar is not None:
-            pbar.close()
+        for worker_bar in worker_bars.values():
+            try:
+                worker_bar.close()
+            except Exception:
+                pass
+        for proc in processes:
+            try:
+                proc.join(timeout=1.0)
+            except Exception:
+                pass
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+            except Exception:
+                pass
+        if overall_pbar is not None:
+            overall_pbar.close()
         if runtime is not None:
             _close_runtime(runtime)
         _WORKER_STATE.clear()
