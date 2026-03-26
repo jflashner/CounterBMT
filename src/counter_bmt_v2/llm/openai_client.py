@@ -80,6 +80,7 @@ class OpenAIChatClient:
         temperature: float = 0.1,
         max_tokens: int = 2000,
         response_format: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> str:
         content: List[Dict[str, Any]] = []
         for img in images_base64 or []:
@@ -104,6 +105,8 @@ class OpenAIChatClient:
         }
         if not self._is_gpt5_family():
             request["temperature"] = temperature
+        else:
+            request["reasoning_effort"] = str(reasoning_effort or "low")
         if response_format is not None:
             request["response_format"] = response_format
         try:

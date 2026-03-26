@@ -178,8 +178,9 @@ class PromptBNDAGBuilder(DAGBuilder):
                     prompt=prompt,
                     images_base64=None,
                     temperature=0.1,
-                    max_tokens=2500,
+                    max_tokens=3200,
                     response_format={"type": "json_object"},
+                    reasoning_effort="low",
                 )
             except Exception as exc:
                 last_exc = exc

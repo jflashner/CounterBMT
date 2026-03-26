@@ -272,8 +272,9 @@ Rules:
                 prompt=prompt,
                 images_base64=images,
                 temperature=0.1,
-                max_tokens=1800,
+                max_tokens=3200,
                 response_format={"type": "json_object"},
+                reasoning_effort="low",
             )
         except Exception as exc:
             return self._fallback_extract(scene, reason="api_call_failed", exc=exc)
