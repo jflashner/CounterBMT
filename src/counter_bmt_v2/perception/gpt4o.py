@@ -243,7 +243,12 @@ Rules:
                 raw_excerpt = getattr(exc, "raw_excerpt", "")
                 if raw_excerpt:
                     detail += f" raw_excerpt={raw_excerpt!r}"
-            raise RuntimeError(f"OpenAI perception failed:{detail}") from exc
+            wrapped = RuntimeError(f"OpenAI perception failed:{detail}")
+            for attr in ("raw_response", "raw_excerpt"):
+                value = getattr(exc, attr, None) if exc is not None else None
+                if value:
+                    setattr(wrapped, attr, value)
+            raise wrapped from exc
         logger.warning("OpenAI perception fallback to mock (%s): %s", reason, exc or "no exception")
         features = self._fallback.extract(scene)
         features.raw = dict(features.raw)
@@ -268,6 +273,7 @@ Rules:
                 images_base64=images,
                 temperature=0.1,
                 max_tokens=1800,
+                response_format={"type": "json_object"},
             )
         except Exception as exc:
             return self._fallback_extract(scene, reason="api_call_failed", exc=exc)

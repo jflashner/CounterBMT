@@ -174,7 +174,13 @@ class PromptBNDAGBuilder(DAGBuilder):
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                raw = self._client.complete(prompt=prompt, images_base64=None, temperature=0.1, max_tokens=2500)
+                raw = self._client.complete(
+                    prompt=prompt,
+                    images_base64=None,
+                    temperature=0.1,
+                    max_tokens=2500,
+                    response_format={"type": "json_object"},
+                )
             except Exception as exc:
                 last_exc = exc
                 logger.warning("PromptBN DAG call failed on attempt %d/%d: %s", attempt, self.max_retries, exc)
