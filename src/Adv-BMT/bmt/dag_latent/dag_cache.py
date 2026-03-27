@@ -80,13 +80,31 @@ def _empty_payload(scenario_id: str, expected_schema: str) -> Dict[str, Any]:
 class DAGCacheBatchBuilder:
     """Resolve DAG cache payloads by scenario id and tensorize them for legacy batches."""
 
-    def __init__(self, config: Any):
+    def __init__(
+        self,
+        config: Any,
+        *,
+        cache_dir_override: str | None = None,
+        cache_strict_override: bool | None = None,
+        expected_schema_override: str | None = None,
+    ):
         dag_block = get_dag_latent_block(config)
         self.enabled = bool(dag_block.get("ENABLED", False))
         self.source_mode = str(dag_block.get("SOURCE_MODE", "")).strip().lower()
-        self.cache_dir = str(dag_block.get("CACHE_DIR", "")).strip()
-        self.cache_strict = bool(dag_block.get("CACHE_STRICT", False))
-        self.expected_schema = resolve_expected_schema_name(str(dag_block.get("EXPECTED_SCHEMA", "any")))
+        cache_dir_value = dag_block.get("CACHE_DIR", "")
+        if cache_dir_override is not None:
+            cache_dir_value = cache_dir_override
+        self.cache_dir = str(cache_dir_value).strip()
+
+        cache_strict_value = dag_block.get("CACHE_STRICT", False)
+        if cache_strict_override is not None:
+            cache_strict_value = cache_strict_override
+        self.cache_strict = bool(cache_strict_value)
+
+        expected_schema_value = dag_block.get("EXPECTED_SCHEMA", "any")
+        if expected_schema_override is not None and str(expected_schema_override).strip():
+            expected_schema_value = expected_schema_override
+        self.expected_schema = resolve_expected_schema_name(str(expected_schema_value))
         self.max_nodes = int(dag_block.get("MAX_NODES", 64))
         self.max_edges = int(dag_block.get("MAX_EDGES", 256))
         self.d_node_in = int(dag_block.get("D_NODE_IN", 24))

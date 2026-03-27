@@ -27,6 +27,29 @@ from .config import get_dag_latent_block
 from .dag_cache import DAGCacheBatchBuilder
 
 
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        text = str(value).strip()
+        if text and text.lower() not in {"none", "null"}:
+            return text
+    return ""
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"", "none", "null"}:
+        return None
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(value)
+
+
 def _normalize_scenario_id(text: str) -> str:
     raw = str(text).strip()
     if not raw:
@@ -161,23 +184,57 @@ class DAGLatentInfgenDataModule(pl.LightningDataModule):
 
     def setup(self, stage: str):
         dag_block = get_dag_latent_block(self.config)
-        restrict_to_cache_ids = bool(dag_block.get("ONLY_CACHE_IDS", False))
-        cache_dir = str(dag_block.get("CACHE_DIR", ""))
-        train_builder = DAGCacheBatchBuilder(self.config)
-        val_builder = DAGCacheBatchBuilder(self.config)
+        base_cache_dir = str(dag_block.get("CACHE_DIR", ""))
+        base_cache_strict = dag_block.get("CACHE_STRICT", False)
+        base_expected_schema = str(dag_block.get("EXPECTED_SCHEMA", "any"))
+        base_only_cache_ids = bool(dag_block.get("ONLY_CACHE_IDS", False))
+
+        train_cache_dir = _first_non_empty(dag_block.get("TRAIN_CACHE_DIR", ""), base_cache_dir)
+        val_cache_dir = _first_non_empty(dag_block.get("VAL_CACHE_DIR", ""), base_cache_dir)
+        train_cache_strict = _optional_bool(dag_block.get("TRAIN_CACHE_STRICT", None))
+        val_cache_strict = _optional_bool(dag_block.get("VAL_CACHE_STRICT", None))
+        train_expected_schema = _first_non_empty(
+            dag_block.get("TRAIN_EXPECTED_SCHEMA", ""),
+            base_expected_schema,
+        )
+        val_expected_schema = _first_non_empty(
+            dag_block.get("VAL_EXPECTED_SCHEMA", ""),
+            base_expected_schema,
+        )
+        train_only_cache_ids = _optional_bool(dag_block.get("ONLY_CACHE_IDS_TRAIN", None))
+        val_only_cache_ids = _optional_bool(dag_block.get("ONLY_CACHE_IDS_VAL", None))
+        restrict_train_to_cache_ids = (
+            base_only_cache_ids if train_only_cache_ids is None else train_only_cache_ids
+        )
+        restrict_val_to_cache_ids = (
+            base_only_cache_ids if val_only_cache_ids is None else val_only_cache_ids
+        )
+
+        train_builder = DAGCacheBatchBuilder(
+            self.config,
+            cache_dir_override=train_cache_dir,
+            cache_strict_override=train_cache_strict,
+            expected_schema_override=train_expected_schema,
+        )
+        val_builder = DAGCacheBatchBuilder(
+            self.config,
+            cache_dir_override=val_cache_dir,
+            cache_strict_override=val_cache_strict,
+            expected_schema_override=val_expected_schema,
+        )
         self.train_dataset = DAGLatentInfgenDataset(
             config=self.config,
             mode="training",
             dag_cache_builder=train_builder,
-            restrict_to_cache_ids=restrict_to_cache_ids,
-            cache_dir=cache_dir,
+            restrict_to_cache_ids=restrict_train_to_cache_ids,
+            cache_dir=train_cache_dir,
         )
         self.val_dataset = DAGLatentInfgenDataset(
             config=self.config,
             mode="test",
             dag_cache_builder=val_builder,
-            restrict_to_cache_ids=restrict_to_cache_ids,
-            cache_dir=cache_dir,
+            restrict_to_cache_ids=restrict_val_to_cache_ids,
+            cache_dir=val_cache_dir,
         )
 
     def train_dataloader(self):
