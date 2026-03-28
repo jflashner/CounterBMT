@@ -67,6 +67,8 @@ class MotionDecoderGPT(nn.Module):
         simple_relation_factor = self.config.SIMPLE_RELATION_FACTOR
         is_v7 = self.config.MODEL.IS_V7
         self.is_v7 = is_v7
+        dag_block = self.config.get("DAG_LATENT", {})
+        maneuver_gate_init_bias = float(dag_block.get("MANEUVER_TOKEN_INIT_GATE_BIAS", -2.0))
         self.decoder = MultiCrossAttTransformerDecoder(
             decoder_layer=MultiCrossAttTransformerDecoderLayer(
                 d_model=d_model,
@@ -78,7 +80,8 @@ class MotionDecoderGPT(nn.Module):
                 is_v7=is_v7,
                 update_relation=self.config.UPDATE_RELATION,
                 add_relation_to_v=self.config.MODEL.ADD_RELATION_TO_V,
-                remove_rel_norm=self.config.REMOVE_REL_NORM
+                remove_rel_norm=self.config.REMOVE_REL_NORM,
+                maneuver_gate_init_bias=maneuver_gate_init_bias,
             ),
             num_layers=num_decoder_layers,
             d_model=d_model,
@@ -353,13 +356,71 @@ class MotionDecoderGPT(nn.Module):
         assert action_token.shape == (B, T_skipped, N, self.d_model)
         assert action_valid_mask.shape == (B, T_skipped, N)
 
+        dag_time_control = input_dict.get("dag/time_control", input_dict.get("dag_time_control", None))
+        if dag_time_control is not None:
+            if not torch.is_tensor(dag_time_control):
+                dag_time_control = torch.as_tensor(
+                    dag_time_control,
+                    device=action_token.device,
+                    dtype=action_token.dtype,
+                )
+            dag_time_control = dag_time_control.to(device=action_token.device, dtype=action_token.dtype)
+            if dag_time_control.ndim != 3:
+                raise ValueError(
+                    f"dag/time_control must be [B,T,D], got shape={tuple(dag_time_control.shape)}"
+                )
+            if int(dag_time_control.shape[0]) != B or int(dag_time_control.shape[-1]) != self.d_model:
+                raise ValueError(
+                    "dag/time_control batch or width mismatch: "
+                    f"expected [B,*,{self.d_model}], got {tuple(dag_time_control.shape)}"
+                )
+
+            dag_time_mask = input_dict.get("dag/time_mask", input_dict.get("dag_time_mask", None))
+            if dag_time_mask is not None:
+                if not torch.is_tensor(dag_time_mask):
+                    dag_time_mask = torch.as_tensor(dag_time_mask, device=action_token.device)
+                dag_time_mask = dag_time_mask.to(device=action_token.device).bool()
+            else:
+                dag_time_mask = torch.ones(
+                    dag_time_control.shape[:2],
+                    device=action_token.device,
+                    dtype=torch.bool,
+                )
+
+            step_index = input_dict["decoder/input_step"]
+            if not torch.is_tensor(step_index):
+                step_index = torch.as_tensor(step_index, device=action_token.device)
+            step_index = step_index.to(device=action_token.device).long()
+            if step_index.ndim == 0:
+                step_index = step_index.reshape(1, 1).expand(B, T_skipped)
+            elif step_index.ndim == 1:
+                step_index = step_index.reshape(1, -1).expand(B, -1)
+            elif step_index.ndim == 2 and int(step_index.shape[0]) == B:
+                # Already batched as [B, T].
+                step_index = step_index
+            else:
+                raise ValueError(
+                    f"decoder/input_step must be [T] or [B,T], got shape={tuple(step_index.shape)}"
+                )
+
+            max_steps = int(dag_time_control.shape[1])
+            gather_idx = step_index.clamp(min=0, max=max(0, max_steps - 1))
+            gather_idx_exp = gather_idx.unsqueeze(-1).expand(-1, -1, self.d_model)
+            gathered_control = torch.gather(dag_time_control, dim=1, index=gather_idx_exp)
+            gathered_mask = torch.gather(dag_time_mask.long(), dim=1, index=gather_idx).bool()
+            action_token = action_token + gathered_control[:, :, None, :] * gathered_mask[:, :, None, None].to(
+                dtype=action_token.dtype
+            )
+
         # ===== Get agent-condition relation =====
         condition_token = None
         if self.config.ACTION_LABEL.USE_SAFETY_LABEL:
             action_label_safety = self.action_label_tokenizer_safety(input_dict["decoder/label_safety"])
             condition_token = action_label_safety[:, None]
             if self.use_adaln:
-                pass
+                # In adaLN mode the condition token is consumed inside each
+                # decoder layer via modulation rather than added here.
+                condition_token = condition_token
             else:
                 action_token += condition_token
 
@@ -534,6 +595,8 @@ class MotionDecoderGPT(nn.Module):
         decoded_tokens = self.decoder(
             agent_token=action_token,
             scene_token=scene_token,
+            maneuver_token=input_dict.get("dag/maneuver_token", input_dict.get("dag_maneuver_token", None)),
+            maneuver_token_mask=input_dict.get("dag/maneuver_mask", input_dict.get("dag_maneuver_mask", None)),
             a2a_info=a2a_info,
             a2t_info=a2t_info,
             a2s_info=a2s_info,

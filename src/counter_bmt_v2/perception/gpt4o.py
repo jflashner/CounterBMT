@@ -97,19 +97,99 @@ def _maneuver_type_from_str(s: str) -> ManeuverType:
     return ManeuverType.UNKNOWN
 
 
-def _normalize_outcome_label(name: str, value: Any) -> str:
+def _normalize_text(value: Any) -> str:
+    return str(value).lower().strip().replace("-", "_").replace(" ", "_")
+
+
+def _contains_any(text: str, patterns: List[str]) -> bool:
+    return any(p in text for p in patterns)
+
+
+def _normalize_outcome_label(name: str, value: Any, reasoning: Any = "") -> str:
     key = str(name).strip()
-    text = str(value).lower().strip().replace("-", "_").replace(" ", "_")
+    text = _normalize_text(value)
+    reasoning_text = _normalize_text(reasoning)
+    combined = f"{text} {reasoning_text}".strip()
     if key == "collision_outcome":
-        if "possible" in text or "collision" in text or "crash" in text or "unsafe" in text:
+        negative_patterns = [
+            "collision_avoided",
+            "collision_was_avoided",
+            "avoided_collision",
+            "no_collision",
+            "no_visible_collision",
+            "without_collision",
+            "no_contact",
+            "no_visible_contact",
+            "without_visible_contact",
+            "does_not_contact",
+            "did_not_contact",
+            "no_overlap",
+            "no_visible_overlap",
+            "without_overlap",
+            "without_visible_overlap",
+            "no_crash",
+            "collision_avoided",
+            "ends_without_visible_contact",
+        ]
+        positive_patterns = [
+            "collision_possible",
+            "possible_collision",
+            "collision_risk",
+            "near_collision",
+            "imminent_collision",
+            "unsafe",
+            "crash",
+            "collision",
+            "contact",
+            "overlap",
+        ]
+        if _contains_any(combined, negative_patterns):
+            return "collision_avoided"
+        if _contains_any(combined, positive_patterns):
             return "collision_possible"
         return "collision_avoided"
     if key == "progress_outcome":
-        if "limited" in text or "blocked" in text or "stuck" in text or "slow" in text:
+        if text in {"progress_good", "good"}:
+            return "progress_good"
+        if text in {"progress_limited", "limited"}:
+            return "progress_limited"
+        if _contains_any(
+            combined,
+            [
+                "no_progress",
+                "little_progress",
+                "limited_progress",
+                "progress_limited",
+                "remains_blocked",
+                "stays_blocked",
+                "remains_stuck",
+                "stays_stuck",
+                "fails_to_advance",
+            ],
+        ):
             return "progress_limited"
         return "progress_good"
     if key == "compliance_outcome":
-        if "violation" in text or "illegal" in text or "non" in text:
+        if text in {"compliant"}:
+            return "compliant"
+        if text in {"violation_possible", "violation"}:
+            return "violation_possible"
+        if _contains_any(
+            combined,
+            [
+                "illegal",
+                "violation_possible",
+                "noncompliant",
+                "non_compliant",
+                "wrong_way",
+                "off_lane",
+                "off_road",
+                "red_light",
+                "ran_red",
+                "clear_evidence_of_illegal",
+                "traffic_law_violation",
+            ],
+        ):
             return "violation_possible"
         return "compliant"
     return str(value)
@@ -170,6 +250,14 @@ class OpenAIPerceptionModel(PerceptionModel):
             "Track the same ego vehicle consistently across the full sequence.",
             "Inspect the full horizon including the final 25% of frames for late maneuvers.",
             "Infer ego maneuvers from visible motion over time, not single-frame snapshots.",
+            f"Base maneuver classification primarily on the visible {ego_color_hint.upper()} ego vehicle in the frames, not on numerical side-channel summaries.",
+            f"For each maneuver, visually locate the {ego_color_hint.upper()} ego vehicle in successive frames and reason about where it is in the roadway image.",
+            "Determine heading from the vehicle's visible orientation in the image, and compare that heading across frames to decide whether direction is changing.",
+            "Turn direction is always from the ego vehicle's own perspective, not from the side of the screen it ends up on.",
+            "Imagine sitting in the ego vehicle: if its nose rotates toward the vehicle's own left as it moves forward, that is left_turn; if it rotates toward the vehicle's own right, that is right_turn.",
+            "A car moving toward the bottom of the frame and then curving toward screen-right is typically making a left turn from the car's perspective, not a right turn.",
+            "Do not decide left_turn or right_turn merely from which side of the image the vehicle reaches at the end of the maneuver.",
+            "Pay attention to whether the ego crosses lane boundaries, lane dividers, or other traffic markings between frames when deciding if a lane change is occurring.",
             "When the ego moves laterally into an adjacent lane while continuing forward motion, label it as lane_change_left or lane_change_right rather than straight.",
             "Reserve left_turn and right_turn for true turning maneuvers at intersections or curved turn geometry, not simple lane shifts.",
         ]
@@ -182,7 +270,11 @@ class OpenAIPerceptionModel(PerceptionModel):
 
         context_block = ""
         if context_text:
-            context_block = f"\nKnown context (trusted side-channel):\n{context_text}\n"
+            context_block = (
+                "\nSecondary side-channel context (use only to cross-check image-based reasoning; "
+                "if it conflicts with what is visible in the frames, trust the frames):\n"
+                f"{context_text}\n"
+            )
 
         return f"""
 You are extracting driving behavior from top-down traffic frame sequences.
@@ -234,7 +326,10 @@ Rules:
 - If the ego performs a late turn (left/right) near the end, include that maneuver explicitly with timestamps.
 - If the ego changes lanes, explicitly use lane_change_left or lane_change_right with timestamps covering the visible lateral transition.
 - Choose outcome labels from the full sequence, not just the initial frames.
-- Base conclusions only on visible evidence and supplied context text.
+- Use collision_avoided unless the frames show visible contact, overlap, or a clearly imminent collision risk; do not choose collision_possible just because another actor is nearby.
+- Base conclusions primarily on the provided frames. Use side-channel context only as a secondary cross-check.
+- The numeric world_heading values in the side-channel context are auxiliary only; they do not directly map to screen-left or screen-right.
+- In each maneuver reasoning string, explicitly refer to visible frame evidence about the {ego_color_hint.upper()} ego vehicle: where it is in the roadway image, which direction it is heading, whether that heading changes across frames, whether it crosses any lane boundary or traffic marking, and whether left/right is being judged from the ego vehicle's own perspective.
 """.strip()
 
     def _fallback_extract(self, scene: ScenarioInput, *, reason: str, exc: Exception | None = None) -> VLMFeatures:
@@ -318,7 +413,11 @@ Rules:
             if not isinstance(item, dict):
                 item = {"value": item}
             normalized_outcomes[name] = {
-                "value": _normalize_outcome_label(name, item.get("value", "")),
+                "value": _normalize_outcome_label(
+                    name,
+                    item.get("value", ""),
+                    item.get("reasoning", ""),
+                ),
                 "confidence": float(item.get("confidence", 0.5)),
                 "reasoning": str(item.get("reasoning", "")),
             }
@@ -330,10 +429,21 @@ Rules:
             raw={
                 "backend": "openai",
                 "summary": data.get("summary", ""),
+                "maneuvers": [
+                    {
+                        "type": str(m.maneuver_type.value),
+                        "start_s": float(m.start_s),
+                        "end_s": float(m.end_s),
+                        "aggressiveness": str(m.aggressiveness),
+                        "confidence": float(m.confidence),
+                        "reasoning": str(m.reasoning),
+                    }
+                    for m in maneuvers
+                ],
                 "outcomes": normalized_outcomes,
                 "raw_response": raw,
                 "n_images_sent": len(images),
-                "prompt_version": "v3_maneuver_outcome_no_decisions",
+                "prompt_version": "v4_visual_priority_ego_relative_turns",
                 "ego_color_hint": ego_color_hint,
                 "dual_view_enabled": dual_view_enabled,
                 "add_ego_inset": add_ego_inset,

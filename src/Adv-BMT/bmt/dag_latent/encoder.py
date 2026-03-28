@@ -45,6 +45,17 @@ class DAGLatentConfig:
     use_null_latent: bool = False
     null_latent_init_std: float = 0.02
 
+    use_time_guidance: bool = False
+    time_guidance_feature_dim: int = 18
+    time_guidance_mode: str = "gated"
+    time_guidance_use_global: bool = False
+    time_guidance_init_gate_bias: float = -2.0
+
+    use_maneuver_tokens: bool = False
+    maneuver_token_feature_dim: int = 20
+    maneuver_token_use_global: bool = False
+    maneuver_token_init_gate_bias: float = -2.0
+
 
 class TorchRMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-6) -> None:

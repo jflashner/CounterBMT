@@ -27,6 +27,10 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
         "dag_edge_feat",
         "dag_edge_mask",
         "dag_global_feat",
+        "dag_time_feat",
+        "dag_time_mask",
+        "dag_maneuver_feat",
+        "dag_maneuver_mask",
         "dag_latent",
         "dag/latent",
         "dag_source_used",
@@ -65,6 +69,9 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
                 name.startswith("dag_encoder")
                 or name.startswith("dag_latent_proj")
                 or name.startswith("dag_gate_proj")
+                or name.startswith("dag_time_proj")
+                or name.startswith("dag_time_gate_proj")
+                or name.startswith("dag_maneuver_token_proj")
                 or name == "null_dag_latent"
             ):
                 yield name, param
@@ -152,6 +159,21 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
             return False
         return bool(self._dag_block().get("EVAL_ALIGNMENT", False))
 
+    def _train_alignment_every_n_steps(self) -> int:
+        raw = self._dag_block().get("TRAIN_ALIGNMENT_EVERY_N_STEPS", 0)
+        try:
+            value = int(raw)
+        except Exception:
+            value = 0
+        return max(0, value)
+
+    @staticmethod
+    def _batch_size_from_batch(batch) -> int:
+        map_feature = batch.get("encoder/map_feature")
+        if torch.is_tensor(map_feature):
+            return int(map_feature.shape[0])
+        return 1
+
     def _run_forward_and_loss(self, data_dict):
         data_dict = self._prepare_validation_batch(data_dict)
         data_dict = self(data_dict)
@@ -183,7 +205,16 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
                     sync_dist=True,
                 )
 
-    def _log_alignment_metrics(self, batch, *, batch_size):
+    def _log_alignment_metrics(
+        self,
+        batch,
+        *,
+        batch_size,
+        prefix: str = "dag_alignment",
+        on_step: bool = False,
+        on_epoch: bool = True,
+        force_eval: bool = False,
+    ):
         if not self._alignment_enabled():
             return
         if not any(key in batch for key in self._DAG_GRAPH_KEYS):
@@ -193,12 +224,19 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
         without_dag = self._strip_dag_inputs(self._clone_batch(batch))
         shuffled_dag, shuffle_available = self._shuffle_dag_inputs(self._clone_batch(batch))
 
-        with torch.no_grad():
-            _, with_stat, _ = self._run_forward_and_loss(with_dag)
-            _, without_stat, _ = self._run_forward_and_loss(without_dag)
-            shuffled_stat = with_stat
-            if shuffle_available:
-                _, shuffled_stat, _ = self._run_forward_and_loss(shuffled_dag)
+        was_training = bool(self.training)
+        try:
+            if force_eval and was_training:
+                self.eval()
+            with torch.no_grad():
+                _, with_stat, _ = self._run_forward_and_loss(with_dag)
+                _, without_stat, _ = self._run_forward_and_loss(without_dag)
+                shuffled_stat = with_stat
+                if shuffle_available:
+                    _, shuffled_stat, _ = self._run_forward_and_loss(shuffled_dag)
+        finally:
+            if force_eval and was_training:
+                self.train()
 
         loss_with = float(with_stat.get("total_loss", 0.0))
         loss_without = float(without_stat.get("total_loss", 0.0))
@@ -210,29 +248,52 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
         denom_shuf = max(1e-6, abs(loss_shuffled))
 
         metrics = {
-            "dag_alignment/present_rate": float(self._dag_present_rate(batch)),
-            "dag_alignment/shuffle_available": float(1.0 if shuffle_available else 0.0),
-            "dag_alignment/loss_with_dag": loss_with,
-            "dag_alignment/loss_without_dag": loss_without,
-            "dag_alignment/loss_gain_vs_without_dag": float(loss_without - loss_with),
-            "dag_alignment/loss_gain_ratio_vs_without_dag": float((loss_without - loss_with) / denom_no),
-            "dag_alignment/loss_with_shuffled_dag": loss_shuffled,
-            "dag_alignment/loss_gain_vs_shuffled_dag": float(loss_shuffled - loss_with),
-            "dag_alignment/loss_gain_ratio_vs_shuffled_dag": float((loss_shuffled - loss_with) / denom_shuf),
-            "dag_alignment/accuracy_with_dag": acc_with,
-            "dag_alignment/accuracy_without_dag": acc_without,
-            "dag_alignment/accuracy_gain_vs_without_dag": float(acc_with - acc_without),
-            "dag_alignment/accuracy_with_shuffled_dag": acc_shuffled,
-            "dag_alignment/accuracy_gain_vs_shuffled_dag": float(acc_with - acc_shuffled),
+            f"{prefix}/present_rate": float(self._dag_present_rate(batch)),
+            f"{prefix}/shuffle_available": float(1.0 if shuffle_available else 0.0),
+            f"{prefix}/loss_with_dag": loss_with,
+            f"{prefix}/loss_without_dag": loss_without,
+            f"{prefix}/loss_gain_vs_without_dag": float(loss_without - loss_with),
+            f"{prefix}/loss_gain_ratio_vs_without_dag": float((loss_without - loss_with) / denom_no),
+            f"{prefix}/loss_with_shuffled_dag": loss_shuffled,
+            f"{prefix}/loss_gain_vs_shuffled_dag": float(loss_shuffled - loss_with),
+            f"{prefix}/loss_gain_ratio_vs_shuffled_dag": float((loss_shuffled - loss_with) / denom_shuf),
+            f"{prefix}/accuracy_with_dag": acc_with,
+            f"{prefix}/accuracy_without_dag": acc_without,
+            f"{prefix}/accuracy_gain_vs_without_dag": float(acc_with - acc_without),
+            f"{prefix}/accuracy_with_shuffled_dag": acc_shuffled,
+            f"{prefix}/accuracy_gain_vs_shuffled_dag": float(acc_with - acc_shuffled),
         }
         self.log_dict(
             metrics,
             batch_size=batch_size,
             prog_bar=False,
-            on_step=False,
-            on_epoch=True,
+            on_step=on_step,
+            on_epoch=on_epoch,
             sync_dist=True,
         )
+
+    def training_step(self, data_dict, batch_idx):
+        train_alignment_interval = self._train_alignment_every_n_steps()
+        alignment_probe_batch = None
+        if (
+            train_alignment_interval > 0
+            and self._alignment_enabled()
+            and int(self.global_step) % train_alignment_interval == 0
+        ):
+            alignment_probe_batch = self._clone_batch(data_dict)
+
+        loss = super().training_step(data_dict, batch_idx)
+
+        if alignment_probe_batch is not None:
+            self._log_alignment_metrics(
+                alignment_probe_batch,
+                batch_size=self._batch_size_from_batch(alignment_probe_batch),
+                prefix="train_dag_alignment",
+                on_step=True,
+                on_epoch=False,
+                force_eval=True,
+            )
+        return loss
 
     def _prepare_validation_batch(self, data_dict):
         # The legacy decoder expects a randomized modeled-agent id to already be
@@ -297,6 +358,9 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
                 name.startswith("model.dag_encoder")
                 or name.startswith("model.dag_latent_proj")
                 or name.startswith("model.dag_gate_proj")
+                or name.startswith("model.dag_time_proj")
+                or name.startswith("model.dag_time_gate_proj")
+                or name.startswith("model.dag_maneuver_token_proj")
                 or name == "model.null_dag_latent"
             ):
                 dag_params.append(param)

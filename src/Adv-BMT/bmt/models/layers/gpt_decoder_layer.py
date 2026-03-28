@@ -45,6 +45,8 @@ class MultiCrossAttTransformerDecoder(Module):
         *,
         agent_token,
         scene_token,
+        maneuver_token=None,
+        maneuver_token_mask=None,
         a2a_info=None,
         a2t_info=None,
         a2s_info=None,
@@ -59,6 +61,8 @@ class MultiCrossAttTransformerDecoder(Module):
             output, past_key_value = mod(
                 agent_token=output,
                 scene_token=scene_token,
+                maneuver_token=maneuver_token,
+                maneuver_token_mask=maneuver_token_mask,
                 a2a_info=a2a_info,
                 a2t_info=a2t_info,
                 a2s_info=a2s_info,
@@ -492,6 +496,7 @@ class MultiCrossAttTransformerDecoderLayer(Module):
         update_relation=False,
         add_relation_to_v=None,
         remove_rel_norm=None,
+        maneuver_gate_init_bias: float = -2.0,
     ) -> None:
         super().__init__()
         self.cross_a2t = MultiheadAttentionLayer(
@@ -524,6 +529,12 @@ class MultiCrossAttTransformerDecoderLayer(Module):
             update_relation=update_relation,
             add_relation_to_v=add_relation_to_v,
         )
+        self.cross_maneuver = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = common_layers.Mlp(
             in_features=d_model, hidden_features=4 * d_model, act_layer=approx_gelu, drop=dropout, is_v7=is_v7
@@ -534,15 +545,18 @@ class MultiCrossAttTransformerDecoderLayer(Module):
             self.a2t_adaln_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
             self.a2a_adaln_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
             self.a2s_adaln_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+            self.maneuver_adaln_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
             self.mlp_adaln_prenorm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
             # https://github.com/facebookresearch/DiT/blob/ed81ce2229091fd4ecc9a223645f95cf379d582b/models.py#L113
-            self.adaln_modulation = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 12 * d_model, bias=True))
+            self.adaln_modulation = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 15 * d_model, bias=True))
             # self.adaLN_modulation_gate = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 4 * d_model, bias=True))
         else:
             self.a2s_norm = nn.LayerNorm(d_model)
             self.a2t_norm = nn.LayerNorm(d_model)
             self.a2a_norm = nn.LayerNorm(d_model)
+            self.maneuver_norm = nn.LayerNorm(d_model)
             self.mlp_prenorm = nn.LayerNorm(d_model)
+        self.maneuver_residual_gate = nn.Parameter(torch.full((d_model,), float(maneuver_gate_init_bias)))
 
         self.remove_rel_norm = remove_rel_norm
         assert remove_rel_norm is not None
@@ -572,6 +586,8 @@ class MultiCrossAttTransformerDecoderLayer(Module):
         *,
         agent_token,
         scene_token,
+        maneuver_token,
+        maneuver_token_mask,
         a2a_info,
         a2t_info,
         a2s_info,
@@ -590,7 +606,8 @@ class MultiCrossAttTransformerDecoderLayer(Module):
             shift_a2t, scale_a2t, gate_a2t = adaln_params[:3]
             shift_a2a, scale_a2a, gate_a2a = adaln_params[3:6]
             shift_a2s, scale_a2s, gate_a2s = adaln_params[6:9]
-            shift_ff, scale_ff, gate_ff = adaln_params[9:12]
+            shift_maneuver, scale_maneuver, gate_maneuver = adaln_params[9:12]
+            shift_ff, scale_ff, gate_ff = adaln_params[12:15]
 
         # === agent-temporal attention ===
         # B,T,N,D -> BN, T, D
@@ -712,6 +729,47 @@ class MultiCrossAttTransformerDecoderLayer(Module):
         if self.update_relation:
             a2s_rel_out = a2s_rel_out + a2s_rel
             a2s_info['edge_features'] = a2s_rel_out
+
+        if (
+            maneuver_token is not None
+            and maneuver_token_mask is not None
+            and maneuver_token.numel() > 0
+            and bool(maneuver_token_mask.any())
+        ):
+            x = x.reshape(B, T * N, D)
+            out = x
+            if self.use_adaln:
+                out = self.maneuver_adaln_norm(out)
+                out = utils.modulate(
+                    out,
+                    shift_maneuver.reshape(B, T * N, D),
+                    scale_maneuver.reshape(B, T * N, D),
+                )
+            else:
+                out = self.maneuver_norm(out)
+
+            maneuver_token = maneuver_token
+            maneuver_token_mask = maneuver_token_mask.bool()
+            empty_rows = ~maneuver_token_mask.any(dim=1)
+            if bool(empty_rows.any()):
+                maneuver_token = maneuver_token.clone()
+                maneuver_token_mask = maneuver_token_mask.clone()
+                maneuver_token[empty_rows, 0] = 0.0
+                maneuver_token_mask[empty_rows, 0] = True
+
+            out, _ = self.cross_maneuver(
+                query=out,
+                key=maneuver_token,
+                value=maneuver_token,
+                key_padding_mask=~maneuver_token_mask.bool(),
+                need_weights=False,
+            )
+            if self.use_adaln:
+                out = out * gate_maneuver.reshape(B, T * N, D)
+            else:
+                out = out * torch.sigmoid(self.maneuver_residual_gate).reshape(1, 1, D)
+            x = x + out
+            x = x.reshape(B, T, N, D)
 
         # Print to make sure overwriting dict is valid.
         # print("a2s_rel_out", a2s_rel.mean().item(), a2s_rel.std().item())

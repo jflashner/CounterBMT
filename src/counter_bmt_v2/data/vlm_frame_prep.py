@@ -105,7 +105,6 @@ def _build_ego_context_text(sample: NNXBMTSceneSample, raw_frames: Sequence[Time
 
     ego_heading = heading[:, 0] if heading.ndim == 2 and heading.shape[:2] == valid.shape else np.zeros_like(speed)
     mean_heading_delta = _mean_abs_heading_delta(ego_heading, ego_valid)
-    maneuver = _maneuver_proxy(speed, ego_heading, ego_valid)
 
     speed_valid = speed[ego_valid]
     speed_min = float(np.min(speed_valid)) if speed_valid.size else 0.0
@@ -114,42 +113,30 @@ def _build_ego_context_text(sample: NNXBMTSceneSample, raw_frames: Sequence[Time
 
     ts_list = ", ".join(f"{float(f.timestamp_s):.2f}" for f in raw_frames) if raw_frames else "none"
     span = _frame_span_summary(sample, raw_frames)
-    final_turn = "unknown"
-    try:
-        valid_idx = np.where(ego_valid)[0]
-        if valid_idx.size >= 3:
-            n_tail = max(2, int(round(0.25 * valid_idx.size)))
-            tail = valid_idx[-n_tail:]
-            dh_tail = np.diff(ego_heading[tail])
-            if dh_tail.size > 0:
-                wrapped_tail = np.arctan2(np.sin(dh_tail), np.cos(dh_tail))
-                mean_tail = float(np.mean(wrapped_tail))
-                mag_tail = float(np.mean(np.abs(wrapped_tail)))
-                if mag_tail < 0.03:
-                    final_turn = "no_significant_turn"
-                elif mean_tail > 0.0:
-                    final_turn = "left_turning_trend"
-                else:
-                    final_turn = "right_turning_trend"
-    except Exception:
-        final_turn = "unknown"
-
     keyframe_lines: List[str] = []
     for f in raw_frames:
         ti = _timestamp_to_t_index(sample, float(f.timestamp_s))
         if ti < valid.shape[0] and bool(valid[ti, 0]):
             sp = float(speed[ti])
             hd = float(np.degrees(ego_heading[ti]))
-            keyframe_lines.append(f"  t={float(f.timestamp_s):.2f}s speed={sp:.2f} heading_deg={hd:.1f}")
+            keyframe_lines.append(
+                f"  t={float(f.timestamp_s):.2f}s speed={sp:.2f} world_heading_deg={hd:.1f}"
+            )
 
     lines = [
         "Known context from tensors (not inferred from images):",
         f"- View type: top-down traffic scene sequence",
         f"- Ego id: agent_0, ego valid ratio: {float(np.mean(ego_valid)):.3f}",
         f"- Ego speed m/s: min={speed_min:.2f}, mean={speed_mean:.2f}, max={speed_max:.2f}",
-        f"- Ego mean absolute heading delta per step (rad): {mean_heading_delta:.4f}",
-        f"- Maneuver proxy from kinematics: {maneuver}",
-        f"- Final-horizon turn trend: {final_turn}",
+        f"- Ego mean absolute world-heading delta per step (rad): {mean_heading_delta:.4f}",
+        (
+            "- world_heading_deg values below are simulator/world-frame angles. "
+            "They are auxiliary only and do not directly encode screen-left or screen-right."
+        ),
+        (
+            "- Determine left_turn vs right_turn from the ego vehicle's own perspective in the images, "
+            "not from the sign of world_heading_deg or the side of the screen reached."
+        ),
         f"- Frame timestamps (s): {ts_list}",
         f"- Frame dt (s): {dt:.3f}",
         (
@@ -214,7 +201,8 @@ def annotate_global_frame(
         legend_text = (
             "Sequence is chronological left-to-right in index order. "
             "Use this frame's timestamp label for temporal grounding. "
-            "Analyze early/mid/late sequence; do not ignore late-frame ego maneuvers."
+            "Analyze early/mid/late sequence; do not ignore late-frame ego maneuvers. "
+            "Judge left/right turns from the ego vehicle's perspective, not from the side of the image."
         )
         ax.text(
             0.01,
@@ -483,7 +471,7 @@ def build_vlm_frame_pack(
                 ego_heading_deg = float(np.degrees(heading[t_idx, 0]))
                 ego_state_text = (
                     f"Ego@t: x={ego_xy[0]:.1f}m y={ego_xy[1]:.1f}m "
-                    f"speed={ego_speed:.1f}m/s heading={ego_heading_deg:.1f}deg"
+                    f"speed={ego_speed:.1f}m/s world_heading={ego_heading_deg:.1f}deg"
                 )
         except Exception:
             ego_state_text = ""

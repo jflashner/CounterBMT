@@ -8,6 +8,12 @@ To stay minimally invasive, the DAG latent is injected as a global gated
 residual on `encoder/scenario_token` just before the legacy decoder runs.
 That keeps all existing tensor contracts intact while still letting the decoder
 attend to DAG-conditioned scene context.
+
+This wrapper also supports an optional timestep-aligned DAG guidance path:
+- cache-backed maneuver intervals are projected into a per-step control tensor
+- the decoder can add that tensor to motion tokens using `decoder/input_step`
+- this gives the model access to "what maneuver is active when" rather than
+  only a single pooled graph latent
 """
 
 from __future__ import annotations
@@ -38,6 +44,11 @@ class MotionLMDAGLatent(MotionLM):
             self.dag_latent_proj = None
             self.dag_gate_proj = None
             self.null_dag_latent = None
+            self.dag_time_in = 0
+            self.dag_time_proj = None
+            self.dag_time_gate_proj = None
+            self.dag_maneuver_in = 0
+            self.dag_maneuver_token_proj = None
             return
 
         if bool(self.dag_config.use_graph_encoder):
@@ -52,6 +63,26 @@ class MotionLMDAGLatent(MotionLM):
         self.null_dag_latent = nn.Parameter(
             torch.randn(self.dag_latent_in) * float(self.dag_config.null_latent_init_std)
         )
+        self.dag_time_in = int(self.dag_config.time_guidance_feature_dim)
+        if bool(self.dag_config.use_time_guidance) and bool(self.dag_config.time_guidance_use_global):
+            self.dag_time_in += int(self.dag_latent_in)
+        if bool(self.dag_config.use_time_guidance):
+            self.dag_time_proj = nn.Linear(self.dag_time_in, self.d_model)
+            self.dag_time_gate_proj = nn.Linear(self.dag_time_in, self.d_model)
+            nn.init.constant_(
+                self.dag_time_gate_proj.bias,
+                float(self.dag_config.time_guidance_init_gate_bias),
+            )
+        else:
+            self.dag_time_proj = None
+            self.dag_time_gate_proj = None
+        self.dag_maneuver_in = int(self.dag_config.maneuver_token_feature_dim)
+        if bool(self.dag_config.use_maneuver_tokens) and bool(self.dag_config.maneuver_token_use_global):
+            self.dag_maneuver_in += int(self.dag_latent_in)
+        if bool(self.dag_config.use_maneuver_tokens):
+            self.dag_maneuver_token_proj = nn.Linear(self.dag_maneuver_in, self.d_model)
+        else:
+            self.dag_maneuver_token_proj = None
 
     @staticmethod
     def _lookup(batch: Dict[str, Any], *names: str) -> Any:
@@ -151,6 +182,88 @@ class MotionLMDAGLatent(MotionLM):
 
         return None, meta
 
+    def resolve_dag_time_guidance(
+        self,
+        batch: Dict[str, Any],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        z_dag: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        meta: Dict[str, torch.Tensor] = {}
+        if not bool(self.dag_config.enabled) or not bool(self.dag_config.use_time_guidance):
+            return None, meta
+
+        dag_time_feat = self._lookup(batch, "dag/time_feat", "dag_time_feat")
+        dag_time_mask = self._lookup(batch, "dag/time_mask", "dag_time_mask")
+        if dag_time_feat is None or dag_time_mask is None:
+            return None, meta
+
+        if not torch.is_tensor(dag_time_feat):
+            dag_time_feat = torch.as_tensor(dag_time_feat)
+        if not torch.is_tensor(dag_time_mask):
+            dag_time_mask = torch.as_tensor(dag_time_mask)
+
+        dag_time_feat = dag_time_feat.to(device=device, dtype=dtype)
+        dag_time_mask = dag_time_mask.to(device=device).bool()
+
+        if bool(self.dag_config.time_guidance_use_global):
+            if z_dag is None:
+                z_expand = dag_time_feat.new_zeros(
+                    (dag_time_feat.shape[0], dag_time_feat.shape[1], self.dag_latent_in)
+                )
+            else:
+                z_expand = z_dag.to(device=device, dtype=dtype)[:, None, :].expand(
+                    -1,
+                    dag_time_feat.shape[1],
+                    -1,
+                )
+            dag_time_feat = torch.cat([dag_time_feat, z_expand], dim=-1)
+
+        meta["time_mask"] = dag_time_mask
+        return dag_time_feat, meta
+
+    def resolve_dag_maneuver_tokens(
+        self,
+        batch: Dict[str, Any],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        z_dag: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        meta: Dict[str, torch.Tensor] = {}
+        if not bool(self.dag_config.enabled) or not bool(self.dag_config.use_maneuver_tokens):
+            return None, meta
+
+        dag_maneuver_feat = self._lookup(batch, "dag/maneuver_feat", "dag_maneuver_feat")
+        dag_maneuver_mask = self._lookup(batch, "dag/maneuver_mask", "dag_maneuver_mask")
+        if dag_maneuver_feat is None or dag_maneuver_mask is None:
+            return None, meta
+
+        if not torch.is_tensor(dag_maneuver_feat):
+            dag_maneuver_feat = torch.as_tensor(dag_maneuver_feat)
+        if not torch.is_tensor(dag_maneuver_mask):
+            dag_maneuver_mask = torch.as_tensor(dag_maneuver_mask)
+
+        dag_maneuver_feat = dag_maneuver_feat.to(device=device, dtype=dtype)
+        dag_maneuver_mask = dag_maneuver_mask.to(device=device).bool()
+
+        if bool(self.dag_config.maneuver_token_use_global):
+            if z_dag is None:
+                z_expand = dag_maneuver_feat.new_zeros(
+                    (dag_maneuver_feat.shape[0], dag_maneuver_feat.shape[1], self.dag_latent_in)
+                )
+            else:
+                z_expand = z_dag.to(device=device, dtype=dtype)[:, None, :].expand(
+                    -1,
+                    dag_maneuver_feat.shape[1],
+                    -1,
+                )
+            dag_maneuver_feat = torch.cat([dag_maneuver_feat, z_expand], dim=-1)
+
+        meta["maneuver_mask"] = dag_maneuver_mask
+        return dag_maneuver_feat, meta
+
     def apply_dag_conditioning(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         if not bool(self.dag_config.enabled):
             return batch
@@ -164,7 +277,19 @@ class MotionLMDAGLatent(MotionLM):
             raise TypeError("`encoder/scenario_token` must be a torch.Tensor before DAG conditioning.")
 
         z_dag, meta = self.resolve_dag_latent(batch, device=scene_token.device, dtype=scene_token.dtype)
-        if z_dag is None:
+        dag_time_feat, time_meta = self.resolve_dag_time_guidance(
+            batch,
+            device=scene_token.device,
+            dtype=scene_token.dtype,
+            z_dag=z_dag,
+        )
+        dag_maneuver_feat, maneuver_meta = self.resolve_dag_maneuver_tokens(
+            batch,
+            device=scene_token.device,
+            dtype=scene_token.dtype,
+            z_dag=z_dag,
+        )
+        if z_dag is None and dag_time_feat is None and dag_maneuver_feat is None:
             return batch
 
         present = meta.get("source_used")
@@ -176,37 +301,161 @@ class MotionLMDAGLatent(MotionLM):
             batch[self._APPLIED_FLAG] = True
             batch["dag/latent_norm"] = torch.zeros((scene_token.shape[0],), device=scene_token.device, dtype=scene_token.dtype)
             batch["dag/gate_mean"] = torch.zeros((scene_token.shape[0],), device=scene_token.device, dtype=scene_token.dtype)
+            if dag_time_feat is not None:
+                batch["dag/time_control"] = torch.zeros(
+                    (dag_time_feat.shape[0], dag_time_feat.shape[1], self.d_model),
+                    device=scene_token.device,
+                    dtype=scene_token.dtype,
+                )
+                batch["dag/time_mask"] = torch.zeros(
+                    (dag_time_feat.shape[0], dag_time_feat.shape[1]),
+                    device=scene_token.device,
+                    dtype=torch.bool,
+                )
+                batch["dag/time_gate_mean"] = torch.zeros(
+                    (dag_time_feat.shape[0],),
+                    device=scene_token.device,
+                    dtype=scene_token.dtype,
+                )
+            if dag_maneuver_feat is not None:
+                batch["dag/maneuver_token"] = torch.zeros(
+                    (dag_maneuver_feat.shape[0], dag_maneuver_feat.shape[1], self.d_model),
+                    device=scene_token.device,
+                    dtype=scene_token.dtype,
+                )
+                batch["dag/maneuver_mask"] = torch.zeros(
+                    (dag_maneuver_feat.shape[0], dag_maneuver_feat.shape[1]),
+                    device=scene_token.device,
+                    dtype=torch.bool,
+                )
             for key, value in meta.items():
                 batch[f"dag/{key}"] = value.to(device=scene_token.device, dtype=scene_token.dtype)
+            for key, value in time_meta.items():
+                batch[f"dag/{key}"] = value.to(device=scene_token.device)
+            for key, value in maneuver_meta.items():
+                batch[f"dag/{key}"] = value.to(device=scene_token.device)
             return batch
-        if self.training and p_drop > 0.0:
-            keep = (torch.rand((z_dag.shape[0], 1), device=z_dag.device) >= p_drop).to(z_dag.dtype)
-            z_dag = z_dag * keep
 
-        if str(self.dag_config.injection_mode) != "global_gated_residual":
-            raise ValueError(
-                f"Unsupported DAG injection mode {self.dag_config.injection_mode!r}; "
-                "this minimal wrapper only implements `global_gated_residual`."
+        keep = None
+        if self.training and p_drop > 0.0:
+            batch_size = (
+                int(z_dag.shape[0])
+                if z_dag is not None
+                else int(dag_time_feat.shape[0])
+            )
+            keep_device = z_dag.device if z_dag is not None else dag_time_feat.device
+            keep_dtype = z_dag.dtype if z_dag is not None else dag_time_feat.dtype
+            keep = (torch.rand((batch_size, 1), device=keep_device) >= p_drop).to(keep_dtype)
+            if z_dag is not None:
+                z_dag = z_dag * keep
+        elif z_dag is not None:
+            keep = torch.ones((z_dag.shape[0], 1), device=z_dag.device, dtype=z_dag.dtype)
+        elif dag_time_feat is not None:
+            keep = torch.ones((dag_time_feat.shape[0], 1), device=dag_time_feat.device, dtype=dag_time_feat.dtype)
+
+        if z_dag is not None:
+            if str(self.dag_config.injection_mode) != "global_gated_residual":
+                raise ValueError(
+                    f"Unsupported DAG injection mode {self.dag_config.injection_mode!r}; "
+                    "this minimal wrapper only implements `global_gated_residual`."
+                )
+
+            bias = self.dag_latent_proj(z_dag)
+            gate = torch.sigmoid(self.dag_gate_proj(z_dag))
+            dag_bias = gate * bias
+            if present is not None:
+                dag_bias = dag_bias * present[:, None]
+                effective_z = z_dag * present[:, None]
+                effective_gate = gate * present[:, None]
+            else:
+                effective_z = z_dag
+                effective_gate = gate
+
+            batch["encoder/scenario_token"] = scene_token + dag_bias[:, None, :]
+            batch["dag/latent"] = z_dag
+            batch["dag/latent_norm"] = torch.linalg.norm(effective_z, dim=-1)
+            batch["dag/gate_mean"] = effective_gate.mean(dim=-1)
+        else:
+            batch["dag/latent_norm"] = torch.zeros(
+                (scene_token.shape[0],),
+                device=scene_token.device,
+                dtype=scene_token.dtype,
+            )
+            batch["dag/gate_mean"] = torch.zeros(
+                (scene_token.shape[0],),
+                device=scene_token.device,
+                dtype=scene_token.dtype,
             )
 
-        bias = self.dag_latent_proj(z_dag)
-        gate = torch.sigmoid(self.dag_gate_proj(z_dag))
-        dag_bias = gate * bias
-        if present is not None:
-            dag_bias = dag_bias * present[:, None]
-            effective_z = z_dag * present[:, None]
-            effective_gate = gate * present[:, None]
-        else:
-            effective_z = z_dag
-            effective_gate = gate
+        if dag_time_feat is not None:
+            time_mask = time_meta.get("time_mask")
+            if time_mask is None:
+                time_mask = torch.ones(
+                    dag_time_feat.shape[:2],
+                    device=scene_token.device,
+                    dtype=torch.bool,
+                )
+            if keep is not None:
+                dag_time_feat = dag_time_feat * keep[:, None, :]
 
-        batch["encoder/scenario_token"] = scene_token + dag_bias[:, None, :]
+            mode = str(self.dag_config.time_guidance_mode).strip().lower()
+            time_bias = self.dag_time_proj(dag_time_feat)
+            if mode == "gated":
+                time_gate = torch.sigmoid(self.dag_time_gate_proj(dag_time_feat))
+                time_control = time_gate * time_bias
+            elif mode == "additive":
+                time_gate = torch.ones_like(time_bias)
+                time_control = time_bias
+            else:
+                raise ValueError(
+                    "Unsupported DAG time guidance mode "
+                    f"{self.dag_config.time_guidance_mode!r}; expected `gated` or `additive`."
+                )
+
+            time_control = time_control * time_mask[:, :, None].to(dtype=scene_token.dtype)
+            if present is not None:
+                time_control = time_control * present[:, None, None]
+                effective_time_gate = time_gate * present[:, None, None]
+            else:
+                effective_time_gate = time_gate
+            batch["dag/time_control"] = time_control
+            batch["dag/time_mask"] = time_mask
+            denom = time_mask.float().sum(dim=1).clamp_min(1.0).to(scene_token.device, dtype=scene_token.dtype)
+            batch["dag/time_gate_mean"] = (
+                effective_time_gate.mean(dim=-1) * time_mask.float().to(scene_token.device)
+            ).sum(dim=1).to(scene_token.dtype) / denom
+
+        if dag_maneuver_feat is not None:
+            maneuver_mask = maneuver_meta.get("maneuver_mask")
+            if maneuver_mask is None:
+                maneuver_mask = torch.ones(
+                    dag_maneuver_feat.shape[:2],
+                    device=scene_token.device,
+                    dtype=torch.bool,
+                )
+            if keep is not None:
+                dag_maneuver_feat = dag_maneuver_feat * keep[:, None, :]
+            maneuver_token = self.dag_maneuver_token_proj(dag_maneuver_feat)
+            maneuver_token = maneuver_token * maneuver_mask[:, :, None].to(dtype=scene_token.dtype)
+            if present is not None:
+                maneuver_token = maneuver_token * present[:, None, None]
+                maneuver_mask = maneuver_mask & present[:, None].bool()
+            batch["dag/maneuver_token"] = maneuver_token
+            batch["dag/maneuver_mask"] = maneuver_mask
+
         batch[self._APPLIED_FLAG] = True
-        batch["dag/latent"] = z_dag
-        batch["dag/latent_norm"] = torch.linalg.norm(effective_z, dim=-1)
-        batch["dag/gate_mean"] = effective_gate.mean(dim=-1)
         for key, value in meta.items():
             batch[f"dag/{key}"] = value.to(device=scene_token.device, dtype=scene_token.dtype)
+        for key, value in time_meta.items():
+            if value.dtype == torch.bool:
+                batch[f"dag/{key}"] = value.to(device=scene_token.device)
+            else:
+                batch[f"dag/{key}"] = value.to(device=scene_token.device, dtype=scene_token.dtype)
+        for key, value in maneuver_meta.items():
+            if value.dtype == torch.bool:
+                batch[f"dag/{key}"] = value.to(device=scene_token.device)
+            else:
+                batch[f"dag/{key}"] = value.to(device=scene_token.device, dtype=scene_token.dtype)
         return batch
 
     def decode_motion(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
