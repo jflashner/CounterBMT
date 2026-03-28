@@ -331,7 +331,7 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
 
     def on_validation_epoch_end(self):
         if not hasattr(self, "evaluator"):
-            self.log("monitoring_step", float(self.global_step))
+            self.log("monitoring_step", float(self.global_step), sync_dist=True)
             return None
         return super().on_validation_epoch_end()
 
