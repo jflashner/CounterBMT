@@ -140,7 +140,11 @@ def main(config):
         val_prefetch_factor=config.prefetch_factor,
     )
     if torch.cuda.device_count() > 1:
-        trainer_kwargs["strategy"] = "ddp"
+        # Stage B only trains the DAG path, and some DAG encoder submodules can
+        # be bypassed on a given rank when that shard's local batch has sparse
+        # or edge-free graphs. Plain DDP treats that as an error; use the
+        # unused-parameter-aware variant so multi-GPU training is robust.
+        trainer_kwargs["strategy"] = "ddp_find_unused_parameters_true"
     if log_dir:
         trainer_kwargs["default_root_dir"] = log_dir
 

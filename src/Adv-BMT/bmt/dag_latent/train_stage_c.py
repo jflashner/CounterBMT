@@ -134,7 +134,9 @@ def main(config):
         val_prefetch_factor=config.prefetch_factor,
     )
     if torch.cuda.device_count() > 1:
-        trainer_kwargs["strategy"] = "ddp"
+        # Joint Stage C finetuning still includes the sparse DAG path, so keep
+        # the DDP strategy tolerant to rank-local unused DAG parameters.
+        trainer_kwargs["strategy"] = "ddp_find_unused_parameters_true"
     if log_dir:
         trainer_kwargs["default_root_dir"] = log_dir
 
