@@ -220,9 +220,16 @@ class MotionLMLightning(pl.LightningModule):
 
         loss_stat["total_loss"] = loss
         try:
-            loss_stat["lr"] = self.trainer.lr_scheduler_configs[0].scheduler.get_last_lr()[0]
-        except RuntimeError:
-            # When debugging, the model might not be attached to a trainer.
+            scheduler_configs = getattr(self.trainer, "lr_scheduler_configs", None)
+            if scheduler_configs:
+                loss_stat["lr"] = scheduler_configs[0].scheduler.get_last_lr()[0]
+            else:
+                optimizers = getattr(self.trainer, "optimizers", None)
+                if optimizers:
+                    loss_stat["lr"] = optimizers[0].param_groups[0]["lr"]
+        except (RuntimeError, AttributeError, IndexError, KeyError):
+            # Pure validation/eval runs may not construct schedulers, and some
+            # debug paths do not attach a full trainer at all.
             pass
         return loss, loss_stat
 

@@ -1,7 +1,17 @@
 import os
+import pathlib
+import sys
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 import pickle
+
+_WORKSPACE_ROOT = pathlib.Path(__file__).resolve().parents[4]
+for package_root in (_WORKSPACE_ROOT / "metadrive", _WORKSPACE_ROOT / "scenarionet"):
+    if package_root.is_dir():
+        package_root_str = str(package_root)
+        if package_root_str not in sys.path:
+            sys.path.insert(0, package_root_str)
+
 from bmt.dataset.scenarionet_utils import overwrite_gt_to_pred_field, merge_preds_along_mode_dim
 import copy
 import hydra
@@ -12,12 +22,116 @@ from bmt.utils import utils
 from bmt.dataset.dataset import InfgenDataset
 from bmt.utils import REPO_ROOT
 import torch
+from bmt.utils.config import cfg_from_yaml_file, global_config
 
 from collections.abc import Iterable
 from bmt.dataset.preprocessor import preprocess_scenario_description_for_motionlm
 from bmt.eval.scenario_evaluator import Evaluator
 from bmt.utils.utils import numpy_to_torch
 from metadrive.scenario.utils import read_dataset_summary
+from bmt.dag_latent.config import get_dag_latent_block
+from bmt.dag_latent.dag_cache import DAGCacheBatchBuilder
+from bmt.dag_latent.datamodule import DAGLatentInfgenDataset
+
+
+def _first_non_empty(*values):
+    for value in values:
+        text = str(value).strip()
+        if text and text.lower() not in {"none", "null"}:
+            return text
+    return ""
+
+
+def _optional_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"", "none", "null"}:
+        return None
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(value)
+
+
+def _resolve_eval_cache_settings(config):
+    dag_block = get_dag_latent_block(config)
+    base_cache_dir = str(dag_block.get("CACHE_DIR", ""))
+    base_cache_strict = dag_block.get("CACHE_STRICT", False)
+    base_expected_schema = str(dag_block.get("EXPECTED_SCHEMA", "any"))
+    base_only_cache_ids = bool(dag_block.get("ONLY_CACHE_IDS", False))
+
+    val_cache_dir = _first_non_empty(dag_block.get("VAL_CACHE_DIR", ""), base_cache_dir)
+    val_cache_strict = _optional_bool(dag_block.get("VAL_CACHE_STRICT", None))
+    val_expected_schema = _first_non_empty(dag_block.get("VAL_EXPECTED_SCHEMA", ""), base_expected_schema)
+    val_only_cache_ids = _optional_bool(dag_block.get("ONLY_CACHE_IDS_VAL", None))
+    restrict_val_to_cache_ids = base_only_cache_ids if val_only_cache_ids is None else val_only_cache_ids
+
+    return {
+        "cache_dir": val_cache_dir,
+        "cache_strict": base_cache_strict if val_cache_strict is None else val_cache_strict,
+        "expected_schema": val_expected_schema,
+        "restrict_to_cache_ids": bool(restrict_val_to_cache_ids),
+    }
+
+
+def _resolve_checkpoint_path(config):
+    checkpoint_path = config.get("ckpt", None) or config.get("pretrain", None)
+    if checkpoint_path is None:
+        checkpoint_path = "../ckpt/last.ckpt"
+    checkpoint_path = pathlib.Path(str(checkpoint_path)).expanduser()
+    checkpoint_path = REPO_ROOT / checkpoint_path
+    if checkpoint_path.is_dir():
+        checkpoint_path = checkpoint_path / "last.ckpt"
+    checkpoint_path = checkpoint_path.resolve().absolute()
+    assert checkpoint_path.is_file(), checkpoint_path
+    assert str(checkpoint_path).endswith(".ckpt"), checkpoint_path
+    return str(checkpoint_path)
+
+
+def _checkpoint_uses_dag_latent(checkpoint_path: str) -> bool:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    hparams = checkpoint.get("hyper_parameters", {})
+    if isinstance(hparams, dict) and "config" in hparams and isinstance(hparams["config"], dict):
+        hparams = hparams["config"]
+    return isinstance(hparams, dict) and (
+        "DAG_LATENT" in hparams or "DAG_LATENT_RESOLVED" in hparams
+    )
+
+
+def _load_eval_model(config, checkpoint_path: str):
+    default_config = cfg_from_yaml_file(REPO_ROOT / "cfgs/motion_default.yaml", global_config)
+
+    if _checkpoint_uses_dag_latent(checkpoint_path):
+        from bmt.dag_latent.lightning import MotionLMDAGLatentLightning
+
+        model = utils.load_from_checkpoint(
+            checkpoint_path=checkpoint_path,
+            cls=MotionLMDAGLatentLightning,
+            config=config,
+            default_config=default_config,
+            strict=False,
+            checkpoint_surgery_func=utils.checkpoint_surgery_func,
+            map_location="cpu",
+        )
+    else:
+        from bmt.models.motionlm_lightning import MotionLMLightning
+
+        model = utils.load_from_checkpoint(
+            checkpoint_path=checkpoint_path,
+            cls=MotionLMLightning,
+            config=config,
+            default_config=default_config,
+            strict=True,
+            checkpoint_surgery_func=utils.checkpoint_surgery_func,
+            map_location="cpu",
+        )
+
+    model.eval()
+    return model
 
 def _get_mode(output_dict, mode, num_modes):
     ret = {}
@@ -281,7 +395,8 @@ class EvaluationLightningModule(pl.LightningModule):
         backward_TF_mode="no_TF",
         save_path=None,
         overwrite_all_agent=False,
-        reject_sampling=False
+        reject_sampling=False,
+        dag_eval_builder=None,
     ):
         """
             eval_mode: Mode of evaluation ("CAT", "SCGEN", "GPTmodel").
@@ -303,6 +418,7 @@ class EvaluationLightningModule(pl.LightningModule):
         self.sid = None
         self.baseline_dir = "/scenarionet_waymo_training_500"
         self.overwrite_all_agent = overwrite_all_agent
+        self.dag_eval_builder = dag_eval_builder
 
         if self.eval_mode == "CAT":
             self.cat_dir = "CAT_scenarios/"
@@ -327,6 +443,21 @@ class EvaluationLightningModule(pl.LightningModule):
 
         self.reject_sample = reject_sampling #FIXME: Hardcoded for now, change later.
 
+    def _maybe_attach_dag_eval_tensors(self, raw_data, input_data):
+        if self.dag_eval_builder is None or not self.dag_eval_builder.enabled_for_batch():
+            return input_data
+
+        dag_tensors = self.dag_eval_builder.build_batch_tensors([raw_data])
+        for key, value in dag_tensors.items():
+            if key == "dag/cache_hit_rate":
+                continue
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            value = value.to(self.model.device)
+            if value.ndim >= 1 and int(value.shape[0]) == 1:
+                value = utils.expand_for_modes(value, num_modes=self.num_modes)
+            input_data[key] = value
+        return input_data
 
 
     def GPT_AR(self, input_data, backward_prediction=False, teacher_forcing=False):
@@ -598,6 +729,7 @@ class EvaluationLightningModule(pl.LightningModule):
         # Force to run backward prediction first to make sure the data is tokenized correctly.
         tok_data_dict, _ = self.tokenizer.tokenize(input_data, backward_prediction=True)
         input_data.update(tok_data_dict)
+        input_data = self._maybe_attach_dag_eval_tensors(data_dict, input_data)
 
         input_data["in_backward_prediction"] = torch.tensor([True] * self.num_modes, dtype=bool).to(self.model.device)
 
@@ -630,6 +762,7 @@ class EvaluationLightningModule(pl.LightningModule):
         # Force to run backward prediction first to make sure the data is tokenized correctly!!!
         tok_data_dict, _ = self.tokenizer.tokenize(input_data, backward_prediction=backward_prediction)
         input_data.update(tok_data_dict)
+        input_data = self._maybe_attach_dag_eval_tensors(raw_data, input_data)
 
         if not backward_prediction: # handle backward flag
             if self.config.BACKWARD_PREDICTION:
@@ -960,22 +1093,22 @@ class EvaluationLightningModule(pl.LightningModule):
 def run_combined_evaluation(config):
     from pytorch_lightning import Trainer
 
-    path = "../ckpt/last.ckpt"  # change to your checkpoint path
     omegaconf.OmegaConf.set_struct(config, False)
+    config.ROOT_DIR = REPO_ROOT
     config.PREPROCESSING.keep_all_data = True
-    config.BACKWARD_PREDICTION = True 
-
-    # ===== FORMAL TEST =====
-    config.DATA.TEST_DATA_DIR = "scenarionet_waymo_training_500" 
-    
-    model = utils.get_model(checkpoint_path=path)
+    if not str(config.DATA.TEST_DATA_DIR).strip():
+        config.DATA.TEST_DATA_DIR = "scenarionet_waymo_training_500"
+    checkpoint_path = _resolve_checkpoint_path(config)
+    model = _load_eval_model(config, checkpoint_path=checkpoint_path)
+    config = model.config
     model = model.to("cuda")
-
     eval_mode = config.eval_mode
     tokenizer = model.model.tokenizer
 
-    test_bs = 1
-    limit_test_batches = 100
+    test_bs = int(config.get("test_batch_size", 1))
+    limit_test_batches = config.get("limit_test_batches", 100)
+    if int(limit_test_batches) < 0:
+        limit_test_batches = None
 
     assert config.multi_mode is True, "Please set config.multi_mode to True for multi-mode evaluation."
 
@@ -992,8 +1125,24 @@ def run_combined_evaluation(config):
     else:
         backward = True
         
-    dataset = InfgenDataset(config, "test", backward_prediction=backward)
-    dataloader = DataLoader(dataset, batch_size=test_bs, collate_fn=lambda x: x[0], num_workers=8) # collate_fn=dataset.collate_batch # collate_fn=sample_10_collate_fn) # lambda x: x[0]
+    eval_cache_settings = _resolve_eval_cache_settings(config)
+    if eval_cache_settings["restrict_to_cache_ids"]:
+        dataset = DAGLatentInfgenDataset(
+            config,
+            "test",
+            backward_prediction=backward,
+            dag_cache_builder=None,
+            restrict_to_cache_ids=True,
+            cache_dir=eval_cache_settings["cache_dir"],
+        )
+    else:
+        dataset = InfgenDataset(config, "test", backward_prediction=backward)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=test_bs,
+        collate_fn=lambda x: x[0],
+        num_workers=int(config.get("val_num_workers", 8)),
+    )
 
     num_modes = 1 if not config.multi_mode else 6
     TF_mode = "all_TF_except_adv" # TF_mode: [no_TF, sdc_TF, all_TF_except_adv] 
@@ -1004,18 +1153,20 @@ def run_combined_evaluation(config):
     # get the current date string in mmdd
     from datetime import datetime
     current_date = datetime.now().strftime("%m%d") # format as mmdd
+    run_tag = _first_non_empty(config.get("save_tag", ""), config.exp_name, pathlib.Path(checkpoint_path).stem)
+    run_tag = run_tag.replace("/", "_")
 
     if eval_mode.startswith("SCGEN"):
         if overwrite_all_agent:
             assert not reject_sampling, "Reject sampling should be False when overwriting all agents."
-            save_path = "{}_{}_{}_{}_open_loop_results".format(current_date, eval_mode, TF_mode, "overwrite_all_agent") if not config.multi_mode else "{}_{}_{}_{}_multi_mode_open_loop_results".format(current_date, eval_mode, TF_mode, "overwrite_all_agent")
+            save_path = "{}_{}_{}_{}_{}_open_loop_results".format(current_date, eval_mode, run_tag, TF_mode, "overwrite_all_agent") if not config.multi_mode else "{}_{}_{}_{}_{}_multi_mode_open_loop_results".format(current_date, eval_mode, run_tag, TF_mode, "overwrite_all_agent")
         elif reject_sampling:
             assert not overwrite_all_agent, "Overwrite all agents should be False when rejecting sampling."
-            save_path = "{}_{}_{}_{}_open_loop_results".format(current_date, eval_mode, TF_mode, "reject_sampling") if not config.multi_mode else "{}_{}_{}_{}_multi_mode_open_loop_results".format(current_date, eval_mode, TF_mode, "reject_sampling")
+            save_path = "{}_{}_{}_{}_{}_open_loop_results".format(current_date, eval_mode, run_tag, TF_mode, "reject_sampling") if not config.multi_mode else "{}_{}_{}_{}_{}_multi_mode_open_loop_results".format(current_date, eval_mode, run_tag, TF_mode, "reject_sampling")
         else:
-            save_path = "{}_{}_{}_open_loop_results".format(current_date,eval_mode, TF_mode) if not config.multi_mode else "{}_{}_{}_multi_mode_open_loop_results".format(current_date, eval_mode, TF_mode)
+            save_path = "{}_{}_{}_{}_open_loop_results".format(current_date, eval_mode, run_tag, TF_mode) if not config.multi_mode else "{}_{}_{}_{}_multi_mode_open_loop_results".format(current_date, eval_mode, run_tag, TF_mode)
     else:
-        save_path = "{}_{}_open_loop_results".format(current_date, eval_mode) if not config.multi_mode else "{}_{}_multi_mode_open_loop_results".format(current_date, eval_mode)
+        save_path = "{}_{}_{}_open_loop_results".format(current_date, eval_mode, run_tag) if not config.multi_mode else "{}_{}_{}_multi_mode_open_loop_results".format(current_date, eval_mode, run_tag)
     
     evaluation_module = EvaluationLightningModule(
         model,
@@ -1029,7 +1180,13 @@ def run_combined_evaluation(config):
         backward_TF_mode=TF_mode,
         save_path=save_path,
         overwrite_all_agent=overwrite_all_agent,
-        reject_sampling=reject_sampling
+        reject_sampling=reject_sampling,
+        dag_eval_builder=DAGCacheBatchBuilder(
+            config,
+            cache_dir_override=eval_cache_settings["cache_dir"],
+            cache_strict_override=eval_cache_settings["cache_strict"],
+            expected_schema_override=eval_cache_settings["expected_schema"],
+        ),
     )
 
     trainer = Trainer(accelerator="gpu", devices=1, limit_test_batches=limit_test_batches)
