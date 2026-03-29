@@ -404,10 +404,12 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
 
         num_epochs = self.config.epochs
         total_steps = num_steps_per_epoch * num_epochs
-        utils.rank_zero_print("Configuring cosine scheduler")
+        scheduler_name = str(opt_cfg.get("SCHEDULER", "cosine")).strip().lower()
+        utils.rank_zero_print("Configuring Stage C optimizer")
         utils.rank_zero_print("Num Steps per epoch: ", num_steps_per_epoch)
         utils.rank_zero_print("Num Epochs: ", num_epochs)
         utils.rank_zero_print("Total Steps: ", total_steps)
+        utils.rank_zero_print("Stage C scheduler: ", scheduler_name or "none")
         utils.rank_zero_print("Stage C backbone LR scale: ", backbone_scale)
         utils.rank_zero_print("Stage C decoder LR scale: ", decoder_scale)
         utils.rank_zero_print("Stage C DAG LR scale: ", dag_scale)
@@ -419,15 +421,21 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
         )
         utils.rank_zero_print("=====================================")
 
-        scheduler = lr_schedule.get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=opt_cfg.WARMUP_STEPS,
-            num_training_steps=total_steps,
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-            },
-        }
+        if scheduler_name in {"", "none", "constant"}:
+            return {"optimizer": optimizer}
+
+        if scheduler_name == "cosine":
+            scheduler = lr_schedule.get_cosine_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=opt_cfg.WARMUP_STEPS,
+                num_training_steps=total_steps,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                },
+            }
+
+        raise ValueError(f"Unsupported Stage C scheduler: {opt_cfg.get('SCHEDULER')!r}")
