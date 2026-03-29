@@ -343,12 +343,13 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
         if opt_cfg.OPTIMIZER != "AdamW":
             raise ValueError(f"Unsupported optimizer for Stage C: {opt_cfg.OPTIMIZER!r}")
 
+        backbone_scale = float(self._dag_block().get("STAGE_C_BACKBONE_LR_SCALE", 0.02))
         decoder_scale = float(self._dag_block().get("STAGE_C_DECODER_LR_SCALE", 0.1))
         dag_scale = float(self._dag_block().get("STAGE_C_DAG_LR_SCALE", 1.0))
 
         decoder_params = []
         dag_params = []
-        other_params = []
+        backbone_params = []
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
@@ -365,11 +366,11 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
             ):
                 dag_params.append(param)
             else:
-                other_params.append(param)
+                backbone_params.append(param)
 
         param_groups = []
-        if other_params:
-            param_groups.append({"params": other_params, "lr": opt_cfg.LR})
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": opt_cfg.LR * backbone_scale})
         if decoder_params:
             param_groups.append({"params": decoder_params, "lr": opt_cfg.LR * decoder_scale})
         if dag_params:
@@ -407,8 +408,15 @@ class MotionLMDAGLatentLightning(MotionLMLightning):
         utils.rank_zero_print("Num Steps per epoch: ", num_steps_per_epoch)
         utils.rank_zero_print("Num Epochs: ", num_epochs)
         utils.rank_zero_print("Total Steps: ", total_steps)
+        utils.rank_zero_print("Stage C backbone LR scale: ", backbone_scale)
         utils.rank_zero_print("Stage C decoder LR scale: ", decoder_scale)
         utils.rank_zero_print("Stage C DAG LR scale: ", dag_scale)
+        utils.rank_zero_print(
+            "Stage C param groups (backbone/decoder/dag): ",
+            len(backbone_params),
+            len(decoder_params),
+            len(dag_params),
+        )
         utils.rank_zero_print("=====================================")
 
         scheduler = lr_schedule.get_cosine_schedule_with_warmup(
