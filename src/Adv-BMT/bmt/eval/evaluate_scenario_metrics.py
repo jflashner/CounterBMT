@@ -136,7 +136,9 @@ def _load_eval_model(config, checkpoint_path: str):
 def _get_mode(output_dict, mode, num_modes):
     ret = {}
     for k, v in output_dict.items():
-        if isinstance(v, np.ndarray) and len(v) == num_modes:
+        if isinstance(v, np.ndarray) and v.ndim > 0 and v.shape[0] == num_modes:
+            ret[k] = v[mode]
+        elif isinstance(v, (list, tuple)) and len(v) == num_modes:
             ret[k] = v[mode]
         else:
             ret[k] = v
