@@ -907,7 +907,7 @@ class EvaluationLightningModule(pl.LightningModule):
             raise ValueError(f"Invalid evaluation mode: {self.eval_mode}")
         
         gathered_output = output_data
-        if not self.evaluator.start_metrics_only:
+        if not self.evaluator.start_metrics_only and not self.evaluator.key_metrics_only:
             if self.eval_mode == "GPTmodel" or self.eval_mode == "Backward" or self.eval_mode == "Backward_TF": 
                 avg_sdc_adv_cr, avg_sdc_bv_cr, avg_adv_bv_cr, all_agent_cr = self.calculate_collision_statistics(
                     output_data,
@@ -1120,7 +1120,10 @@ def run_combined_evaluation(config):
     # model = utils.get_model(config=config)
     # limit_test_batches = 1
 
-    evaluator = Evaluator(key_metrics_only=False, start_metrics_only=False) # key_metrics_only contains metrics without waymo's evaluations
+    evaluator = Evaluator(
+        key_metrics_only=_optional_bool(config.get("key_metrics_only", False)),
+        start_metrics_only=_optional_bool(config.get("start_metrics_only", False)),
+    ) # key_metrics_only keeps core trajectory metrics like SFDE while skipping slower extras
 
     if eval_mode == "GPTmodel":
         backward = False
@@ -1139,12 +1142,19 @@ def run_combined_evaluation(config):
         )
     else:
         dataset = InfgenDataset(config, "test", backward_prediction=backward)
-    dataloader = DataLoader(
-        dataset,
+    num_workers = int(config.get("val_num_workers", 8))
+    pin_memory = _optional_bool(config.get("pin_memory", torch.cuda.is_available()))
+    persistent_workers = _optional_bool(config.get("persistent_workers", num_workers > 0))
+    dataloader_kwargs = dict(
         batch_size=test_bs,
         collate_fn=lambda x: x[0],
-        num_workers=int(config.get("val_num_workers", 8)),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(persistent_workers if num_workers > 0 else False),
     )
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = int(config.get("prefetch_factor", 2))
+    dataloader = DataLoader(dataset, **dataloader_kwargs)
 
     num_modes = 1 if not config.multi_mode else 6
     TF_mode = "all_TF_except_adv" # TF_mode: [no_TF, sdc_TF, all_TF_except_adv] 
@@ -1191,7 +1201,15 @@ def run_combined_evaluation(config):
         ),
     )
 
-    trainer = Trainer(accelerator="gpu", devices=1, limit_test_batches=limit_test_batches)
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision(str(config.get("matmul_precision", "high")))
+
+    trainer = Trainer(
+        accelerator=("gpu" if torch.cuda.is_available() else "cpu"),
+        devices=1,
+        limit_test_batches=limit_test_batches,
+        inference_mode=True,
+    )
     trainer.test(evaluation_module, dataloaders=dataloader)
 
 
