@@ -2,7 +2,8 @@
 This is a wrapper to wrap our dataset as a lightning datamodule.
 """
 import lightning.pytorch as pl
-from torch.utils.data import DataLoader
+import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from bmt.dataset import dataset
 
@@ -26,12 +27,24 @@ class InfgenDataModule(pl.LightningDataModule):
         self.val_dataset = dataset.InfgenDataset(config=self.config, mode="test")
 
     def train_dataloader(self):
+        sampler = None
+        shuffle = True
+        if bool(self.config.DATA.get("COUNTERFACTUAL_WEIGHTED_SAMPLER", False)):
+            weights = self.train_dataset.build_counterfactual_sample_weights()
+            if weights is not None and len(weights) > 0 and float(weights.sum()) > 0.0:
+                sampler = WeightedRandomSampler(
+                    weights=torch.as_tensor(weights, dtype=torch.double),
+                    num_samples=len(weights),
+                    replacement=True,
+                )
+                shuffle = False
         return DataLoader(
             self.train_dataset,
             batch_size=self.train_batch_size,
             pin_memory=True,
             num_workers=self.train_num_workers,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             persistent_workers=True if self.train_num_workers > 0 else False,
             collate_fn=self.train_dataset.collate_batch,
             prefetch_factor=self.train_prefetch_factor if self.train_num_workers > 0 else None,

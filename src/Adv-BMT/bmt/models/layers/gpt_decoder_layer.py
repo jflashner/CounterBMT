@@ -47,14 +47,17 @@ class MultiCrossAttTransformerDecoder(Module):
         scene_token,
         maneuver_token=None,
         maneuver_token_mask=None,
+        maneuver_position_mask=None,
         a2a_info=None,
         a2t_info=None,
         a2s_info=None,
         condition_token=None,
         past_key_value_list=None,
-        use_cache=False
+        use_cache=False,
+        return_intermediate=False,
     ):
         new_past_key_value_list = []
+        intermediate_outputs = [] if return_intermediate else None
         output = agent_token
         for layer_idx, mod in enumerate(self.layers):
             cache = past_key_value_list[layer_idx] if past_key_value_list is not None else None
@@ -63,6 +66,7 @@ class MultiCrossAttTransformerDecoder(Module):
                 scene_token=scene_token,
                 maneuver_token=maneuver_token,
                 maneuver_token_mask=maneuver_token_mask,
+                maneuver_position_mask=maneuver_position_mask,
                 a2a_info=a2a_info,
                 a2t_info=a2t_info,
                 a2s_info=a2s_info,
@@ -72,10 +76,18 @@ class MultiCrossAttTransformerDecoder(Module):
             )
             if use_cache:
                 new_past_key_value_list.append(past_key_value)
+            if intermediate_outputs is not None:
+                intermediate_outputs.append(output)
         if self.norm is not None:
             output = self.norm(output)
+            if intermediate_outputs is not None and intermediate_outputs:
+                intermediate_outputs[-1] = output
         if use_cache:
+            if return_intermediate:
+                return output, new_past_key_value_list, intermediate_outputs
             return output, new_past_key_value_list
+        if return_intermediate:
+            return output, intermediate_outputs
         return output
 
 
@@ -588,6 +600,7 @@ class MultiCrossAttTransformerDecoderLayer(Module):
         scene_token,
         maneuver_token,
         maneuver_token_mask,
+        maneuver_position_mask,
         a2a_info,
         a2t_info,
         a2s_info,
@@ -764,6 +777,8 @@ class MultiCrossAttTransformerDecoderLayer(Module):
                 key_padding_mask=~maneuver_token_mask.bool(),
                 need_weights=False,
             )
+            if maneuver_position_mask is not None:
+                out = out * maneuver_position_mask.reshape(B, T * N, 1).to(dtype=out.dtype)
             if self.use_adaln:
                 out = out * gate_maneuver.reshape(B, T * N, D)
             else:

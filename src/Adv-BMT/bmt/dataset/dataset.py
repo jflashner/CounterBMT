@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import pickle
+from collections import Counter
 
 import hydra
 import numpy as np
@@ -143,6 +144,7 @@ class InfgenDataset(Dataset):
         self.max_traffic_lights = config.PREPROCESSING.MAX_TRAFFIC_LIGHTS
         self.padding_to_max = config.PREPROCESSING.PADDING_TO_MAX
         self.backward_prediction = backward_prediction
+        self.counterfactual_mode = str(self.config.DATA.get("COUNTERFACTUAL_MODE", "default")).strip() or "default"
 
         # We are expecting the data_dir to be either an absolute path or a relative path w.r.t. the repo root.
         if mode == "training":
@@ -170,9 +172,23 @@ class InfgenDataset(Dataset):
         else:  # Default to False.
             self.return_scenario_description = False
 
-        summary_list = summary_list[::interval]
-        # self.data_summary_dict = {k: summary_dict[k] for k in summary_list}
-        self.data_mapping = {k: mapping[k] for k in summary_list}
+        self.counterfactual_control_code_dir = self._resolve_counterfactual_control_code_dir()
+        self.counterfactual_control_code_index = {}
+        self.sample_control_code_paths = None
+        self.sample_control_index_entries = None
+
+        if self._counterfactual_source_is_index_file():
+            summary_list, data_mapping, sample_control_code_paths, sample_control_index_entries = self._load_counterfactual_index_entries(
+                summary_list=summary_list,
+                mapping=mapping,
+            )
+            self.data_mapping = data_mapping
+            self.sample_control_code_paths = sample_control_code_paths
+            self.sample_control_index_entries = sample_control_index_entries
+        else:
+            summary_list = summary_list[::interval]
+            self.data_mapping = {k: mapping[k] for k in summary_list}
+
         self.length = len(summary_list)
         self.use_cache_logged = False
 
@@ -200,6 +216,7 @@ class InfgenDataset(Dataset):
 
         from bmt.tokenization import get_tokenizer
         self.tokenizer = get_tokenizer(config=self.config)
+        self.counterfactual_control_code_index = self._load_counterfactual_control_code_index()
 
     def __len__(self):
         return self.length
@@ -261,7 +278,9 @@ class InfgenDataset(Dataset):
 
                             self.use_cache_logged = True
 
-                        return cache
+                        cache = self._strip_counterfactual_control_fields(cache)
+                        scenario_id = cache.get("metadata/scenario_id", cache.get("scenario_id", ""))
+                        return self._maybe_attach_counterfactual_control_fields(cache, scenario_id=scenario_id, sample_index=index)
                     except EOFError as e:
                         print(f"Error in reading cache file: {cache_path=}")
 
@@ -317,13 +336,14 @@ class InfgenDataset(Dataset):
 
         ret.update(preprocessed_scenario_description)
         ret.update({"metadata/scenario_id": scenario['id']})
+        ret = self._strip_counterfactual_control_fields(ret)
 
         if cache_path is not None:
             with open(cache_path, "wb") as f:
                 pickle.dump(ret, f)
                 # print("Writing cache file: ", cache_path)
 
-        return ret
+        return self._maybe_attach_counterfactual_control_fields(ret, scenario_id=scenario["id"], sample_index=index)
 
     def collate_batch(self, batch_list):
         """
@@ -342,9 +362,11 @@ class InfgenDataset(Dataset):
         data_dict = {}
         object_keys = [
             "raw_scenario_description",
+            "original_SD",
             "encoder/track_name",
             "decoder/track_name",
             "eval/track_name",
+            "cf/debug_meta",
             # "scenario_id",
             # "in_evaluation"
         ]  # Keys exempt from padding and tensor conversion.
@@ -430,6 +452,8 @@ class InfgenDataset(Dataset):
 
             # Other data that does not pass the model or does not need regular shapes
             elif k in [
+                    "cf/time_window_mask",
+                    "cf/decision_agent_mask",
                     # "encoder/modeled_agent_id",
                     # "action_label/labeled_agent_id",
                     "metadata/map_center",  # "decoder/input_step",
@@ -484,6 +508,10 @@ class InfgenDataset(Dataset):
                 data_dict[k] = utils.padding_1st_and_2nd_dim(val_list)
 
             elif k in [
+                    "cf/path_token",
+                    "cf/compliance_token",
+                    "cf/timing_token",
+                    "cf/terminal_anchor",
                     "encoder/agent_type",
                     "decoder/agent_type",
                     "encoder/modeled_agent_type",
@@ -525,6 +553,177 @@ class InfgenDataset(Dataset):
                 raise ValueError("Unknown key: {}".format(k))
 
         return data_dict
+
+    def _resolve_counterfactual_control_code_dir(self):
+        control_source = str(self.config.DATA.get("COUNTERFACTUAL_CONTROL_INDEX", "")).strip()
+        if not control_source:
+            control_source = str(self.config.DATA.get("COUNTERFACTUAL_CONTROL_CODE_DIR", "")).strip()
+        if not control_source:
+            return ""
+        path = pathlib.Path(control_source).expanduser()
+        if not path.is_absolute():
+            path = (global_config.ROOT_DIR / path).resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Configured counterfactual control source does not exist: {path}")
+        return str(path)
+
+    def _counterfactual_source_is_index_file(self):
+        if not self.counterfactual_control_code_dir:
+            return False
+        return pathlib.Path(self.counterfactual_control_code_dir).is_file() and self.counterfactual_control_code_dir.endswith(".jsonl")
+
+    def _load_counterfactual_control_code_index(self):
+        if not self.counterfactual_control_code_dir:
+            return {}
+        if self._counterfactual_source_is_index_file():
+            return {}
+        from bmt.counterfactual.compile_control_code import index_control_code_directory
+
+        return index_control_code_directory(self.counterfactual_control_code_dir)
+
+    def _load_counterfactual_index_entries(self, *, summary_list, mapping):
+        index_path = pathlib.Path(self.counterfactual_control_code_dir)
+        rows = []
+        with index_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                text = line.strip()
+                if text:
+                    rows.append(json.loads(text))
+        file_name_lookup = self._build_scenario_file_lookup(summary_list)
+        filtered_summary_list = []
+        data_mapping = {}
+        sample_control_code_paths = []
+        sample_control_index_entries = []
+        missing = 0
+        for row in rows:
+            control_code_path = str(row.get("factual_control_code_path") or row.get("control_code_path") or "").strip()
+            if not control_code_path:
+                continue
+            file_name = str(row.get("scenario_file_name") or "").strip()
+            if not file_name:
+                scenario_key = str(row.get("scenario_id") or "").strip()
+                file_name = file_name_lookup.get(scenario_key, "")
+            if not file_name or file_name not in mapping:
+                missing += 1
+                continue
+            filtered_summary_list.append(file_name)
+            data_mapping[file_name] = mapping[file_name]
+            sample_control_code_paths.append(control_code_path)
+            sample_control_index_entries.append(dict(row))
+        if not filtered_summary_list:
+            raise ValueError(f"No usable entries found in counterfactual control index: {index_path}")
+        if missing > 0:
+            print(f"Warning: skipped {missing} control-index entries that could not be matched to scenario files")
+        return filtered_summary_list, data_mapping, sample_control_code_paths, sample_control_index_entries
+
+    def _build_scenario_file_lookup(self, summary_list):
+        lookup = {}
+        for file_name in summary_list:
+            file_key = pathlib.Path(file_name).stem
+            lookup[file_key] = file_name
+            lookup[file_key.split("_")[-1]] = file_name
+            lookup[file_name] = file_name
+        return lookup
+
+    def _maybe_attach_counterfactual_control_fields(self, sample, *, scenario_id, sample_index=None):
+        if not self.counterfactual_control_code_dir:
+            return sample
+        from bmt.counterfactual.compile_control_code import build_counterfactual_dataset_fields, load_control_code
+
+        scenario_id = str(scenario_id)
+        decoder_track_names = sample.get("decoder/track_name", [])
+        if len(decoder_track_names) == 0 and "encoder/modeled_agent_id" in sample and "encoder/track_name" in sample:
+            modeled_ids = np.asarray(sample["encoder/modeled_agent_id"], dtype=int).reshape(-1)
+            encoder_track_names = np.asarray(sample["encoder/track_name"])
+            valid_ids = modeled_ids[(modeled_ids >= 0) & (modeled_ids < encoder_track_names.shape[0])]
+            decoder_track_names = encoder_track_names[valid_ids]
+        horizon = 0
+        if "decoder/agent_position" in sample:
+            horizon = int(sample["decoder/agent_position"].shape[0])
+        elif "encoder/agent_position" in sample:
+            horizon = int(sample["encoder/agent_position"].shape[0])
+        elif "decoder/modeled_agent_position" in sample:
+            horizon = int(sample["decoder/modeled_agent_position"].shape[0])
+
+        control_code = None
+        control_code_path = ""
+        if self.sample_control_code_paths is not None and sample_index is not None and 0 <= int(sample_index) < len(self.sample_control_code_paths):
+            control_code_path = str(self.sample_control_code_paths[int(sample_index)])
+        if not control_code_path:
+            control_code_path = self.counterfactual_control_code_index.get(scenario_id, "")
+        if control_code_path:
+            control_code = load_control_code(control_code_path)
+
+        output = dict(sample)
+        output.update(
+            build_counterfactual_dataset_fields(
+                scenario_id=scenario_id,
+                decoder_track_names=decoder_track_names,
+                horizon=horizon,
+                control_code=control_code,
+                control_code_path=control_code_path,
+                require_trainable=self.mode == "training",
+            )
+        )
+        return self._apply_counterfactual_mode(output)
+
+    def _apply_counterfactual_mode(self, sample):
+        if self.counterfactual_mode != "path_only":
+            return sample
+        output = dict(sample)
+        if "cf/compliance_token" in output:
+            output["cf/compliance_token"] = np.zeros_like(output["cf/compliance_token"], dtype=np.float32)
+        if "cf/timing_token" in output:
+            output["cf/timing_token"] = np.zeros_like(output["cf/timing_token"], dtype=np.float32)
+        output["cf/compliance_supervision_mask"] = 0
+        output["cf/timing_supervision_mask"] = 0
+        path_supervision_mask = int(output.get("cf/path_supervision_mask", 0))
+        if path_supervision_mask == 0:
+            output["cf/conditioning_eligible"] = 0
+            output["cf/control_available"] = 0
+            debug_meta = dict(output.get("cf/debug_meta", {}))
+            debug_meta["available"] = False
+            debug_meta["drop_reason"] = "path_only_requires_path_supervision"
+            output["cf/debug_meta"] = debug_meta
+        else:
+            debug_meta = dict(output.get("cf/debug_meta", {}))
+            debug_meta["counterfactual_mode"] = "path_only"
+            output["cf/debug_meta"] = debug_meta
+        return output
+
+    def build_counterfactual_sample_weights(self):
+        if self.sample_control_index_entries is None:
+            return None
+        labels = []
+        for entry in self.sample_control_index_entries:
+            branch_label = str(
+                entry.get("branch_label")
+                or entry.get("supervised_branch_label")
+                or entry.get("path_branch_label")
+                or "none"
+            )
+            labels.append(branch_label)
+        counts = Counter(label for label in labels if label in {"left", "straight", "right"})
+        if len(counts) == 0:
+            return None
+        weights = []
+        for label in labels:
+            if label in counts:
+                weights.append(1.0 / float(counts[label]))
+            else:
+                weights.append(0.0)
+        return np.asarray(weights, dtype=np.float32)
+
+    def _strip_counterfactual_control_fields(self, sample):
+        if not isinstance(sample, dict):
+            return sample
+        if not any(str(key).startswith("cf/") for key in sample.keys()):
+            return sample
+        output = dict(sample)
+        for key in list(output.keys()):
+            if str(key).startswith("cf/"):
+                output.pop(key, None)
+        return output
 
 
 @hydra.main(version_base=None, config_path=str(REPO_ROOT / "cfgs"), config_name="1009_safety_action_debug.yaml")

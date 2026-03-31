@@ -6,6 +6,7 @@ one client abstraction.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from dataclasses import dataclass, field
@@ -72,6 +73,23 @@ class OpenAIChatClient:
             return "\n".join(parts).strip()
         return ""
 
+    @staticmethod
+    def _infer_image_mime(base64_data: str) -> str:
+        try:
+            header = base64.b64decode(str(base64_data), validate=False)[:16]
+        except Exception:
+            return "image/png"
+
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if header.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
+            return "image/gif"
+        if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+            return "image/webp"
+        return "image/png"
+
     def complete(
         self,
         *,
@@ -84,11 +102,12 @@ class OpenAIChatClient:
     ) -> str:
         content: List[Dict[str, Any]] = []
         for img in images_base64 or []:
+            mime = self._infer_image_mime(img)
             content.append(
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/jpeg;base64,{img}",
+                        "url": f"data:{mime};base64,{img}",
                         "detail": "high",
                     },
                 }

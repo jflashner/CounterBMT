@@ -146,7 +146,10 @@ class DAGLatentInfgenDataset(InfgenDataset):
         # collate handle the regular tensor/scalar fields exactly as before.
         sanitized_batch = [dict(sample) for sample in batch_list]
         sample0 = sanitized_batch[0]
+        keep_object_keys = {"cf/debug_meta"}
         for key, value in list(sample0.items()):
+            if key in keep_object_keys:
+                continue
             is_supported_scalar = isinstance(value, (int, float, bool, str))
             is_supported_array = isinstance(value, np.ndarray)
             if is_supported_scalar or is_supported_array:

@@ -5,6 +5,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
+from bmt.counterfactual.compile_control_code import (
+    BRANCH_LABEL_ORDER,
+    COMPLIANCE_LABEL_ORDER,
+    TERMINAL_ANCHOR_DIM,
+    TIMING_LABEL_ORDER,
+)
 from bmt.models.motionlm import MotionLM
 from bmt.tokenization import get_tokenizer
 from bmt.utils import lr_schedule
@@ -68,10 +74,74 @@ class MotionLMLightning(pl.LightningModule):
         self.save_hyperparameters(OmegaConf.to_container(self.config))
 
         self._tokenizer = get_tokenizer(self.config)
+        self.local_control_forward_enabled = bool(self.config.MODEL.get("LOCAL_CONTROL_FORWARD_ENABLED", False))
+        self.counterfactual_mode = str(self.config.DATA.get("COUNTERFACTUAL_MODE", "default")).strip() or "default"
+        if self.local_control_forward_enabled:
+            d_model = int(self.config.MODEL.D_MODEL)
+            self.path_head = torch.nn.Linear(d_model, len(BRANCH_LABEL_ORDER))
+            self.compliance_head = torch.nn.Linear(d_model, len(COMPLIANCE_LABEL_ORDER))
+            self.timing_head = torch.nn.Linear(d_model, len(TIMING_LABEL_ORDER))
+            self.anchor_head = torch.nn.Linear(d_model, TERMINAL_ANCHOR_DIM)
+        self._configure_local_control_finetune()
         # self.validation_outputs = []
         # self.validation_ground_truth = []
 
         self.exp_name = None
+
+    def _configure_local_control_finetune(self):
+        if not self.local_control_forward_enabled:
+            return
+        if not bool(self.config.MODEL.get("LOCAL_CONTROL_FREEZE_BACKBONE", False)):
+            return
+
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+        for parameter in self.path_head.parameters():
+            parameter.requires_grad = True
+        for parameter in self.anchor_head.parameters():
+            parameter.requires_grad = True
+
+        if bool(self.config.MODEL.get("LOCAL_CONTROL_USE_COMPLIANCE", True)):
+            for parameter in self.compliance_head.parameters():
+                parameter.requires_grad = True
+        if bool(self.config.MODEL.get("LOCAL_CONTROL_USE_TIMING", True)):
+            for parameter in self.timing_head.parameters():
+                parameter.requires_grad = True
+
+        motion_decoder = self.model.motion_decoder
+        if hasattr(motion_decoder, "cf_path_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_PATH", True)):
+            for parameter in motion_decoder.cf_path_proj.parameters():
+                parameter.requires_grad = True
+        if hasattr(motion_decoder, "cf_anchor_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_ANCHOR", True)):
+            for parameter in motion_decoder.cf_anchor_proj.parameters():
+                parameter.requires_grad = True
+        if hasattr(motion_decoder, "cf_compliance_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_COMPLIANCE", True)):
+            for parameter in motion_decoder.cf_compliance_proj.parameters():
+                parameter.requires_grad = True
+        if hasattr(motion_decoder, "cf_timing_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_TIMING", True)):
+            for parameter in motion_decoder.cf_timing_proj.parameters():
+                parameter.requires_grad = True
+        if hasattr(motion_decoder, "cf_local_bias"):
+            for parameter in motion_decoder.cf_local_bias.parameters():
+                parameter.requires_grad = True
+        if hasattr(motion_decoder, "cf_local_residual_gate"):
+            motion_decoder.cf_local_residual_gate.requires_grad = True
+
+        train_last_n = int(self.config.MODEL.get("LOCAL_CONTROL_TRAIN_LAST_N_DECODER_BLOCKS", 0))
+        if train_last_n > 0 and hasattr(motion_decoder, "decoder"):
+            for layer in motion_decoder.decoder.layers[-train_last_n:]:
+                for parameter in layer.parameters():
+                    parameter.requires_grad = True
+
+        if bool(self.config.MODEL.get("LOCAL_CONTROL_TRAIN_OUTPUT_HEAD", False)):
+            for parameter in motion_decoder.prediction_head.parameters():
+                parameter.requires_grad = True
+            norm_module = getattr(motion_decoder, "prediction_prenorm", None)
+            if norm_module is None:
+                norm_module = getattr(motion_decoder, "prediction_adaln_norm", None)
+            if norm_module is not None:
+                for parameter in norm_module.parameters():
+                    parameter.requires_grad = True
 
     def forward(self, batch_dict):
         return self.model(batch_dict)
@@ -206,6 +276,128 @@ class MotionLMLightning(pl.LightningModule):
             loss_stat["map_recon_loss"] = map_recon_loss
             loss_stat["map_recon_mask_rate"] = gt_valid_mask.float().mean()
 
+        if self.local_control_forward_enabled and "decoder/control_target_hidden" in data_dict:
+            control_hidden = data_dict["decoder/control_target_hidden"]
+            control_valid_mask = data_dict.get("decoder/control_target_valid_mask")
+            if control_valid_mask is None:
+                control_valid_mask = torch.ones(control_hidden.shape[0], device=control_hidden.device, dtype=torch.bool)
+            else:
+                control_valid_mask = control_valid_mask.to(device=control_hidden.device).bool()
+
+            def _to_tensor(name, dtype=None):
+                value = data_dict[name]
+                if not torch.is_tensor(value):
+                    value = torch.as_tensor(value, device=control_hidden.device)
+                value = value.to(device=control_hidden.device)
+                if dtype is not None:
+                    value = value.to(dtype=dtype)
+                return value
+
+            conditioning_eligible = (
+                _to_tensor("cf/conditioning_eligible", dtype=torch.bool)
+                if "cf/conditioning_eligible" in data_dict
+                else (_to_tensor("cf/control_available", dtype=torch.bool) if "cf/control_available" in data_dict else control_valid_mask)
+            )
+            path_supervision_mask = _to_tensor("cf/path_supervision_mask", dtype=torch.bool) if "cf/path_supervision_mask" in data_dict else control_valid_mask.new_zeros(control_valid_mask.shape)
+            compliance_supervision_mask = _to_tensor("cf/compliance_supervision_mask", dtype=torch.bool) if "cf/compliance_supervision_mask" in data_dict else control_valid_mask.new_zeros(control_valid_mask.shape)
+            timing_supervision_mask = _to_tensor("cf/timing_supervision_mask", dtype=torch.bool) if "cf/timing_supervision_mask" in data_dict else control_valid_mask.new_zeros(control_valid_mask.shape)
+
+            path_supervision_mask = path_supervision_mask & control_valid_mask
+            compliance_supervision_mask = compliance_supervision_mask & control_valid_mask
+            timing_supervision_mask = timing_supervision_mask & control_valid_mask
+            if self.counterfactual_mode == "path_only":
+                compliance_supervision_mask = compliance_supervision_mask & torch.zeros_like(compliance_supervision_mask)
+                timing_supervision_mask = timing_supervision_mask & torch.zeros_like(timing_supervision_mask)
+            if not bool(self.config.MODEL.get("LOCAL_CONTROL_USE_PATH", True)):
+                path_supervision_mask = path_supervision_mask & torch.zeros_like(path_supervision_mask)
+            if not bool(self.config.MODEL.get("LOCAL_CONTROL_USE_COMPLIANCE", True)):
+                compliance_supervision_mask = compliance_supervision_mask & torch.zeros_like(compliance_supervision_mask)
+            if not bool(self.config.MODEL.get("LOCAL_CONTROL_USE_TIMING", True)):
+                timing_supervision_mask = timing_supervision_mask & torch.zeros_like(timing_supervision_mask)
+            anchor_supervision_mask = path_supervision_mask if bool(self.config.MODEL.get("LOCAL_CONTROL_USE_ANCHOR", True)) else torch.zeros_like(path_supervision_mask)
+
+            path_loss_weight = float(self.config.MODEL.get("LOCAL_CONTROL_PATH_LOSS_WEIGHT", 0.2))
+            compliance_loss_weight = float(self.config.MODEL.get("LOCAL_CONTROL_COMPLIANCE_LOSS_WEIGHT", 0.1))
+            timing_loss_weight = float(self.config.MODEL.get("LOCAL_CONTROL_TIMING_LOSS_WEIGHT", 0.1))
+            anchor_loss_weight = float(self.config.MODEL.get("LOCAL_CONTROL_ANCHOR_LOSS_WEIGHT", 0.1))
+            if self.counterfactual_mode == "path_only":
+                compliance_loss_weight = 0.0
+                timing_loss_weight = 0.0
+
+            if "cf/path_token" in data_dict:
+                path_target = _to_tensor("cf/path_token", dtype=torch.float32)[:, 0].long()
+            else:
+                path_target = torch.zeros(control_hidden.shape[0], device=control_hidden.device, dtype=torch.long)
+            if "cf/compliance_token" in data_dict:
+                compliance_target = _to_tensor("cf/compliance_token", dtype=torch.float32)[:, 1].long()
+            else:
+                compliance_target = torch.zeros(control_hidden.shape[0], device=control_hidden.device, dtype=torch.long)
+            if "cf/timing_token" in data_dict:
+                timing_target = _to_tensor("cf/timing_token", dtype=torch.float32)[:, 2].long()
+            else:
+                timing_target = torch.zeros(control_hidden.shape[0], device=control_hidden.device, dtype=torch.long)
+            anchor_target = _to_tensor("cf/terminal_anchor", dtype=torch.float32) if "cf/terminal_anchor" in data_dict else torch.zeros(
+                (control_hidden.shape[0], TERMINAL_ANCHOR_DIM),
+                device=control_hidden.device,
+                dtype=torch.float32,
+            )
+
+            path_logits = self.path_head(control_hidden)
+            compliance_logits = self.compliance_head(control_hidden)
+            timing_logits = self.timing_head(control_hidden)
+            anchor_pred = self.anchor_head(control_hidden)
+
+            path_loss = control_hidden.new_tensor(0.0)
+            compliance_loss = control_hidden.new_tensor(0.0)
+            timing_loss = control_hidden.new_tensor(0.0)
+            anchor_loss = control_hidden.new_tensor(0.0)
+
+            if bool(path_supervision_mask.any()) and path_loss_weight > 0.0:
+                path_loss = F.cross_entropy(path_logits[path_supervision_mask], path_target[path_supervision_mask], reduction="mean")
+                loss = loss + path_loss_weight * path_loss
+                loss_stat["cf/path_acc"] = (path_logits[path_supervision_mask].argmax(dim=-1) == path_target[path_supervision_mask]).float().mean()
+            if bool(compliance_supervision_mask.any()) and compliance_loss_weight > 0.0:
+                compliance_loss = F.cross_entropy(
+                    compliance_logits[compliance_supervision_mask],
+                    compliance_target[compliance_supervision_mask],
+                    reduction="mean",
+                )
+                loss = loss + compliance_loss_weight * compliance_loss
+                loss_stat["cf/compliance_acc"] = (
+                    compliance_logits[compliance_supervision_mask].argmax(dim=-1) == compliance_target[compliance_supervision_mask]
+                ).float().mean()
+            if bool(timing_supervision_mask.any()) and timing_loss_weight > 0.0:
+                timing_loss = F.cross_entropy(
+                    timing_logits[timing_supervision_mask],
+                    timing_target[timing_supervision_mask],
+                    reduction="mean",
+                )
+                loss = loss + timing_loss_weight * timing_loss
+                loss_stat["cf/timing_acc"] = (
+                    timing_logits[timing_supervision_mask].argmax(dim=-1) == timing_target[timing_supervision_mask]
+                ).float().mean()
+            if bool(anchor_supervision_mask.any()) and anchor_loss_weight > 0.0:
+                anchor_loss = F.smooth_l1_loss(anchor_pred[anchor_supervision_mask], anchor_target[anchor_supervision_mask], reduction="mean")
+                loss = loss + anchor_loss_weight * anchor_loss
+
+            loss_stat.update(
+                {
+                    "cf/control_batch_fraction": conditioning_eligible.float().mean(),
+                    "cf/conditioning_batch_fraction": conditioning_eligible.float().mean(),
+                    "cf/path_supervision_fraction": path_supervision_mask.float().mean(),
+                    "cf/compliance_supervision_fraction": compliance_supervision_mask.float().mean(),
+                    "cf/timing_supervision_fraction": timing_supervision_mask.float().mean(),
+                    "cf/path_loss": path_loss,
+                    "cf/compliance_loss": compliance_loss,
+                    "cf/timing_loss": timing_loss,
+                    "cf/anchor_loss": anchor_loss,
+                    "cf/path_loss_weight": path_loss_weight,
+                    "cf/compliance_loss_weight": compliance_loss_weight,
+                    "cf/timing_loss_weight": timing_loss_weight,
+                    "cf/anchor_loss_weight": anchor_loss_weight,
+                }
+            )
+
         # DEBUG CODE to find unused parameters:
         # gs = torch.autograd.grad(loss.mean(), self.parameters(), allow_unused=True, retain_graph=True)
         # ns = [n for n, v in self.named_parameters()]
@@ -336,7 +528,7 @@ class MotionLMLightning(pl.LightningModule):
             raise ValueError()
         elif opt_cfg.OPTIMIZER == 'AdamW':
             optimizer = torch.optim.AdamW(
-                self.parameters(),
+                [parameter for parameter in self.parameters() if parameter.requires_grad],
                 lr=opt_cfg.LR,
                 weight_decay=opt_cfg.get('WEIGHT_DECAY', 0),
                 betas=(0.9, 0.95),

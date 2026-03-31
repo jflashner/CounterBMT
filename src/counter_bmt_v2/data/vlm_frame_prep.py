@@ -66,6 +66,19 @@ def _mean_abs_heading_delta(heading: np.ndarray, valid: np.ndarray) -> float:
     return float(np.mean(np.abs(wrapped[m])))
 
 
+def _total_heading_change(heading: np.ndarray, valid: np.ndarray) -> float:
+    if heading.ndim != 1 or valid.ndim != 1 or heading.shape[0] == 0:
+        return 0.0
+    idx = np.where(valid)[0]
+    if idx.size < 2:
+        return 0.0
+    start = float(heading[int(idx[0])])
+    end = float(heading[int(idx[-1])])
+    delta = end - start
+    wrapped = np.arctan2(np.sin(delta), np.cos(delta))
+    return float(wrapped)
+
+
 def _maneuver_proxy(speed: np.ndarray, heading: np.ndarray, valid: np.ndarray) -> str:
     if speed.ndim != 1 or valid.ndim != 1:
         return "unknown"
@@ -105,6 +118,7 @@ def _build_ego_context_text(sample: NNXBMTSceneSample, raw_frames: Sequence[Time
 
     ego_heading = heading[:, 0] if heading.ndim == 2 and heading.shape[:2] == valid.shape else np.zeros_like(speed)
     mean_heading_delta = _mean_abs_heading_delta(ego_heading, ego_valid)
+    total_heading_change = _total_heading_change(ego_heading, ego_valid)
 
     speed_valid = speed[ego_valid]
     speed_min = float(np.min(speed_valid)) if speed_valid.size else 0.0
@@ -129,9 +143,14 @@ def _build_ego_context_text(sample: NNXBMTSceneSample, raw_frames: Sequence[Time
         f"- Ego id: agent_0, ego valid ratio: {float(np.mean(ego_valid)):.3f}",
         f"- Ego speed m/s: min={speed_min:.2f}, mean={speed_mean:.2f}, max={speed_max:.2f}",
         f"- Ego mean absolute world-heading delta per step (rad): {mean_heading_delta:.4f}",
+        f"- Ego total world-heading change over valid horizon (deg): {float(np.degrees(total_heading_change)):.1f}",
         (
             "- world_heading_deg values below are simulator/world-frame angles. "
             "They are auxiliary only and do not directly encode screen-left or screen-right."
+        ),
+        (
+            "- If total world-heading change over the full horizon is near zero, that is evidence against a true turn. "
+            "In that case, only label left_turn/right_turn if the visible frames clearly show the ego rotating and entering a different outgoing road branch."
         ),
         (
             "- Determine left_turn vs right_turn from the ego vehicle's own perspective in the images, "

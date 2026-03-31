@@ -2,6 +2,12 @@ import torch
 import torch.nn as nn
 from torch_geometric.utils import dense_to_sparse
 
+from bmt.counterfactual.compile_control_code import (
+    COMPLIANCE_TOKEN_DIM,
+    PATH_TOKEN_DIM,
+    TERMINAL_ANCHOR_DIM,
+    TIMING_TOKEN_DIM,
+)
 from bmt.dataset import constants
 from bmt.dataset.preprocess_action_label import SafetyAction
 from bmt.models import relation
@@ -51,6 +57,17 @@ class MotionDecoderGPT(nn.Module):
         super().__init__()
         self.config = config
         self.d_model = d_model = self.config.MODEL.D_MODEL
+        self.local_control_forward_enabled = bool(self.config.MODEL.get("LOCAL_CONTROL_FORWARD_ENABLED", False))
+        self.local_control_forward_mode = str(self.config.MODEL.get("LOCAL_CONTROL_FORWARD_MODE", "interactive"))
+        self.local_control_use_path = bool(self.config.MODEL.get("LOCAL_CONTROL_USE_PATH", True))
+        self.local_control_use_anchor = bool(self.config.MODEL.get("LOCAL_CONTROL_USE_ANCHOR", True))
+        self.local_control_use_compliance = bool(self.config.MODEL.get("LOCAL_CONTROL_USE_COMPLIANCE", True))
+        self.local_control_use_timing = bool(self.config.MODEL.get("LOCAL_CONTROL_USE_TIMING", True))
+        if self.local_control_forward_mode not in {"interactive", "strict_local"}:
+            raise ValueError(
+                f"Unsupported MODEL.LOCAL_CONTROL_FORWARD_MODE={self.local_control_forward_mode!r}; "
+                "expected 'interactive' or 'strict_local'."
+            )
         num_decoder_layers = self.config.MODEL.NUM_DECODER_LAYERS
         self.num_actions = get_action_dim(self.config)
         dropout = self.config.MODEL.DROPOUT
@@ -171,6 +188,18 @@ class MotionDecoderGPT(nn.Module):
         self.motion_embed = fourier_embedding.FourierEmbedding(
             input_dim=6, hidden_dim=d_model, num_freq_bands=64, is_v7=is_v7
         )
+        if self.local_control_forward_enabled:
+            self.cf_path_proj = nn.Linear(PATH_TOKEN_DIM, d_model)
+            self.cf_compliance_proj = nn.Linear(COMPLIANCE_TOKEN_DIM, d_model)
+            self.cf_timing_proj = nn.Linear(TIMING_TOKEN_DIM, d_model)
+            self.cf_anchor_proj = nn.Linear(TERMINAL_ANCHOR_DIM, d_model)
+            self.cf_local_bias = nn.Sequential(
+                nn.Linear(PATH_TOKEN_DIM + COMPLIANCE_TOKEN_DIM + TIMING_TOKEN_DIM + TERMINAL_ANCHOR_DIM, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+            self.cf_local_residual_gate = nn.Parameter(torch.full((d_model,), float(maneuver_gate_init_bias)))
+            self.cf_null_dropout_prob = float(self.config.MODEL.get("LOCAL_CONTROL_NULL_DROPOUT_PROB", 0.2))
 
         tokenizer = get_tokenizer(self.config)
         motion_features = tokenizer.get_motion_feature()
@@ -217,6 +246,115 @@ class MotionDecoderGPT(nn.Module):
             nn.init.constant_(block.adaln_modulation[-1].bias, 0)
         nn.init.constant_(self.adaln_modulation[-1].weight, 0)
         nn.init.constant_(self.adaln_modulation[-1].bias, 0)
+
+    @staticmethod
+    def _is_runtime_probe_enabled(input_dict):
+        value = input_dict.get("cf/runtime_probe_enabled", False)
+        if torch.is_tensor(value):
+            return bool(value.reshape(-1)[0].item()) if value.numel() > 0 else False
+        return bool(value)
+
+    def _maybe_build_local_control(self, input_dict, *, device, dtype, batch_size, horizon, num_agents):
+        if not self.local_control_forward_enabled:
+            return None
+        required = (
+            "cf/path_token",
+            "cf/compliance_token",
+            "cf/timing_token",
+            "cf/terminal_anchor",
+            "cf/time_window_mask",
+            "cf/decision_agent_mask",
+        )
+        if not all(key in input_dict for key in required):
+            return None
+
+        def _to_tensor(name):
+            value = input_dict[name]
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value, device=device)
+            return value.to(device=device, dtype=dtype)
+
+        path_token = _to_tensor("cf/path_token")
+        compliance_token = _to_tensor("cf/compliance_token")
+        timing_token = _to_tensor("cf/timing_token")
+        terminal_anchor = _to_tensor("cf/terminal_anchor")
+        time_window_mask = _to_tensor("cf/time_window_mask")
+        decision_agent_mask = _to_tensor("cf/decision_agent_mask")
+        conditioning_eligible = None
+        if "cf/conditioning_eligible" in input_dict:
+            conditioning_eligible = _to_tensor("cf/conditioning_eligible")
+        elif "cf/control_available" in input_dict:
+            conditioning_eligible = _to_tensor("cf/control_available")
+
+        if path_token.ndim != 2 or compliance_token.ndim != 2 or timing_token.ndim != 2 or terminal_anchor.ndim != 2:
+            raise ValueError("Counterfactual control tokens must be batched as [B, F]")
+        if int(path_token.shape[0]) != batch_size:
+            raise ValueError("Counterfactual control batch size mismatch")
+
+        if time_window_mask.shape[-1] != horizon:
+            time_window_mask = time_window_mask[:, :horizon]
+            if time_window_mask.shape[-1] < horizon:
+                pad = torch.zeros((batch_size, horizon - int(time_window_mask.shape[-1])), device=device, dtype=dtype)
+                time_window_mask = torch.cat([time_window_mask, pad], dim=-1)
+        if decision_agent_mask.shape[-1] != num_agents:
+            decision_agent_mask = decision_agent_mask[:, :num_agents]
+            if decision_agent_mask.shape[-1] < num_agents:
+                pad = torch.zeros((batch_size, num_agents - int(decision_agent_mask.shape[-1])), device=device, dtype=dtype)
+                decision_agent_mask = torch.cat([decision_agent_mask, pad], dim=-1)
+
+        supervision_pos_mask = time_window_mask[:, :, None] * decision_agent_mask[:, None, :]
+        supervision_available_mask = (supervision_pos_mask.reshape(batch_size, -1).sum(dim=-1) > 0)
+        if conditioning_eligible is None:
+            conditioning_flag = torch.ones((batch_size,), device=device, dtype=torch.bool)
+        else:
+            conditioning_flag = conditioning_eligible.reshape(batch_size, -1)[:, 0] > 0
+        available_mask = supervision_available_mask & conditioning_flag
+        if self.training and self.cf_null_dropout_prob > 0.0:
+            keep_mask = (torch.rand((batch_size,), device=device) >= float(self.cf_null_dropout_prob)) | (~available_mask)
+        else:
+            keep_mask = torch.ones((batch_size,), device=device, dtype=torch.bool)
+        available_mask = available_mask & keep_mask
+
+        path_token = path_token * float(self.local_control_use_path)
+        compliance_token = compliance_token * float(self.local_control_use_compliance)
+        timing_token = timing_token * float(self.local_control_use_timing)
+        terminal_anchor = terminal_anchor * float(self.local_control_use_anchor)
+
+        active_control_components = float(
+            self.local_control_use_path
+            or self.local_control_use_compliance
+            or self.local_control_use_timing
+            or self.local_control_use_anchor
+        )
+
+        control_memory = torch.stack(
+            [
+                self.cf_path_proj(path_token) * float(self.local_control_use_path),
+                self.cf_compliance_proj(compliance_token) * float(self.local_control_use_compliance),
+                self.cf_timing_proj(timing_token) * float(self.local_control_use_timing),
+                self.cf_anchor_proj(terminal_anchor) * float(self.local_control_use_anchor),
+            ],
+            dim=1,
+        )
+        control_memory_mask = available_mask[:, None].expand(-1, control_memory.shape[1])
+        control_memory = control_memory * control_memory_mask[:, :, None].to(dtype=dtype)
+
+        control_pos_mask = supervision_pos_mask.clone()
+        control_pos_mask = control_pos_mask * available_mask[:, None, None].to(dtype=dtype)
+        control_features = torch.cat([path_token, compliance_token, timing_token, terminal_anchor], dim=-1)
+        local_bias = self.cf_local_bias(control_features)
+        local_bias = local_bias * torch.sigmoid(self.cf_local_residual_gate).reshape(1, -1).to(dtype=dtype)
+        local_bias = local_bias * active_control_components
+        local_bias = local_bias * available_mask[:, None].to(dtype=dtype)
+
+        return {
+            "control_memory": control_memory,
+            "control_memory_mask": control_memory_mask,
+            "control_pos_mask": control_pos_mask,
+            "supervision_pos_mask": supervision_pos_mask,
+            "local_bias": local_bias,
+            "available_mask": available_mask,
+        }
 
     def randomize_modeled_agent_id(self, data_dict, clip_agent_id=False):
         modeled_agent_id = data_dict["decoder/agent_id"]
@@ -356,8 +494,30 @@ class MotionDecoderGPT(nn.Module):
         assert action_token.shape == (B, T_skipped, N, self.d_model)
         assert action_valid_mask.shape == (B, T_skipped, N)
 
+        local_control = self._maybe_build_local_control(
+            input_dict,
+            device=action_token.device,
+            dtype=action_token.dtype,
+            batch_size=B,
+            horizon=T_skipped,
+            num_agents=N,
+        )
+        runtime_probe_enabled = self._is_runtime_probe_enabled(input_dict)
+        probe_after_control_add = None
+        if local_control is not None:
+            input_dict["cf/control_memory"] = local_control["control_memory"]
+            input_dict["cf/control_memory_mask"] = local_control["control_memory_mask"]
+            input_dict["cf/control_pos_mask"] = local_control["control_pos_mask"]
+            input_dict["cf/supervision_pos_mask"] = local_control["supervision_pos_mask"]
+            input_dict["cf/control_available_mask"] = local_control["available_mask"]
+            if self.local_control_forward_mode == "interactive":
+                local_bias = local_control["local_bias"][:, None, None, :]
+                action_token = action_token + local_bias * local_control["control_pos_mask"][:, :, :, None]
+                if runtime_probe_enabled:
+                    probe_after_control_add = action_token.clone()
+
         dag_time_control = input_dict.get("dag/time_control", input_dict.get("dag_time_control", None))
-        if dag_time_control is not None:
+        if dag_time_control is not None and not self.local_control_forward_enabled:
             if not torch.is_tensor(dag_time_control):
                 dag_time_control = torch.as_tensor(
                     dag_time_control,
@@ -592,25 +752,51 @@ class MotionDecoderGPT(nn.Module):
             if "decoder/cache" in input_dict:
                 past_key_value_list = input_dict["decoder/cache"]
 
+        decoder_maneuver_token = None
+        decoder_maneuver_mask = None
+        decoder_maneuver_position_mask = None
+        if local_control is not None:
+            if self.local_control_forward_mode == "interactive":
+                decoder_maneuver_token = local_control["control_memory"]
+                decoder_maneuver_mask = local_control["control_memory_mask"]
+                decoder_maneuver_position_mask = local_control["control_pos_mask"]
+        else:
+            decoder_maneuver_token = input_dict.get("dag/maneuver_token", input_dict.get("dag_maneuver_token", None))
+            decoder_maneuver_mask = input_dict.get("dag/maneuver_mask", input_dict.get("dag_maneuver_mask", None))
+
         decoded_tokens = self.decoder(
             agent_token=action_token,
             scene_token=scene_token,
-            maneuver_token=input_dict.get("dag/maneuver_token", input_dict.get("dag_maneuver_token", None)),
-            maneuver_token_mask=input_dict.get("dag/maneuver_mask", input_dict.get("dag_maneuver_mask", None)),
+            maneuver_token=decoder_maneuver_token,
+            maneuver_token_mask=decoder_maneuver_mask,
+            maneuver_position_mask=decoder_maneuver_position_mask,
             a2a_info=a2a_info,
             a2t_info=a2t_info,
             a2s_info=a2s_info,
             condition_token=condition_token if self.use_adaln else None,
             use_cache=use_cache,  # We don't need decoder to take care cache.
-            past_key_value_list=past_key_value_list
+            past_key_value_list=past_key_value_list,
+            return_intermediate=runtime_probe_enabled,
         )
 
+        intermediate_outputs = None
         if use_cache:
-            decoded_tokens, past_key_value_list = decoded_tokens
+            if runtime_probe_enabled:
+                decoded_tokens, past_key_value_list, intermediate_outputs = decoded_tokens
+            else:
+                decoded_tokens, past_key_value_list = decoded_tokens
             for l in past_key_value_list:
                 if l:
                     l.append((B * N, real_T))
             input_dict["decoder/cache"] = past_key_value_list
+        elif runtime_probe_enabled:
+            decoded_tokens, intermediate_outputs = decoded_tokens
+
+        if local_control is not None and self.local_control_forward_mode == "strict_local":
+            local_bias = local_control["local_bias"][:, None, None, :]
+            decoded_tokens = decoded_tokens + local_bias * local_control["control_pos_mask"][:, :, :, None]
+            if runtime_probe_enabled:
+                probe_after_control_add = decoded_tokens.clone()
 
         if self.use_adaln:
             output_tokens = self.prediction_adaln_norm(decoded_tokens[action_valid_mask])
@@ -633,6 +819,30 @@ class MotionDecoderGPT(nn.Module):
 
         assert logits.shape == (B, T_skipped, N, self.num_actions)
         input_dict["decoder/output_logit"] = logits
+        input_dict["decoder/decoded_tokens"] = decoded_tokens
+        if runtime_probe_enabled:
+            if probe_after_control_add is None:
+                probe_after_control_add = action_token.clone()
+            if intermediate_outputs is not None and len(intermediate_outputs) > 0:
+                probe_after_next_shared_block = intermediate_outputs[0]
+            else:
+                probe_after_next_shared_block = decoded_tokens
+            if local_control is not None and self.local_control_forward_mode == "strict_local":
+                probe_after_next_shared_block = probe_after_next_shared_block.clone()
+            input_dict["decoder/control_probe_after_control_add"] = probe_after_control_add
+            input_dict["decoder/control_probe_after_next_shared_block"] = probe_after_next_shared_block
+            input_dict["decoder/control_probe_after_full_decoder"] = decoded_tokens
+            input_dict["decoder/control_forward_mode"] = self.local_control_forward_mode
+        if local_control is not None:
+            control_mask = local_control["supervision_pos_mask"] > 0
+            pooled_valid = control_mask.reshape(B, -1).any(dim=-1)
+            pooled_hidden = torch.zeros((B, decoded_tokens.shape[-1]), device=decoded_tokens.device, dtype=decoded_tokens.dtype)
+            if bool(pooled_valid.any()):
+                mask = control_mask.to(dtype=decoded_tokens.dtype)
+                denom = mask.sum(dim=(1, 2)).clamp_min(1.0)
+                pooled_hidden = (decoded_tokens * mask[:, :, :, None]).sum(dim=(1, 2)) / denom[:, None]
+            input_dict["decoder/control_target_hidden"] = pooled_hidden
+            input_dict["decoder/control_target_valid_mask"] = pooled_valid
 
         # from torch.cuda import memory_snapshot
         #

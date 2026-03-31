@@ -257,6 +257,10 @@ class OpenAIPerceptionModel(PerceptionModel):
             "Imagine sitting in the ego vehicle: if its nose rotates toward the vehicle's own left as it moves forward, that is left_turn; if it rotates toward the vehicle's own right, that is right_turn.",
             "A car moving toward the bottom of the frame and then curving toward screen-right is typically making a left turn from the car's perspective, not a right turn.",
             "Do not decide left_turn or right_turn merely from which side of the image the vehicle reaches at the end of the maneuver.",
+            "Do not infer a turn just because the ego approaches an intersection, slows near a stop line, or is adjacent to curved turn geometry.",
+            "Only label left_turn or right_turn if the ego vehicle itself visibly rotates and its center path clearly commits onto a different outgoing road branch.",
+            "If the ego remains in the same inbound lane, queues at the intersection, or only creeps forward without entering the cross street, prefer decelerate or stop rather than a turn.",
+            "Do not infer a turn from nearby lane arrows, curved lane markings, or the shape of the intersection unless the ego actually follows that branch.",
             "Pay attention to whether the ego crosses lane boundaries, lane dividers, or other traffic markings between frames when deciding if a lane change is occurring.",
             "When the ego moves laterally into an adjacent lane while continuing forward motion, label it as lane_change_left or lane_change_right rather than straight.",
             "Reserve left_turn and right_turn for true turning maneuvers at intersections or curved turn geometry, not simple lane shifts.",
@@ -325,11 +329,14 @@ Rules:
 - Always include at least one maneuver segment that covers the end of the horizon (end_s near {max_ts:.2f}s).
 - If the ego performs a late turn (left/right) near the end, include that maneuver explicitly with timestamps.
 - If the ego changes lanes, explicitly use lane_change_left or lane_change_right with timestamps covering the visible lateral transition.
+- If the ego simply approaches an intersection and slows or stops without visibly entering a new outgoing lane, do not label a turn; use decelerate or stop instead.
+- If the ego's heading appears nearly unchanged across the sequence and it remains on the same inbound road branch, that is strong evidence against left_turn/right_turn.
 - Choose outcome labels from the full sequence, not just the initial frames.
 - Use collision_avoided unless the frames show visible contact, overlap, or a clearly imminent collision risk; do not choose collision_possible just because another actor is nearby.
 - Base conclusions primarily on the provided frames. Use side-channel context only as a secondary cross-check.
 - The numeric world_heading values in the side-channel context are auxiliary only; they do not directly map to screen-left or screen-right.
 - In each maneuver reasoning string, explicitly refer to visible frame evidence about the {ego_color_hint.upper()} ego vehicle: where it is in the roadway image, which direction it is heading, whether that heading changes across frames, whether it crosses any lane boundary or traffic marking, and whether left/right is being judged from the ego vehicle's own perspective.
+- Be conservative with turn labels: if the evidence for a turn is ambiguous, prefer straight/decelerate/stop over inventing a left_turn/right_turn.
 """.strip()
 
     def _fallback_extract(self, scene: ScenarioInput, *, reason: str, exc: Exception | None = None) -> VLMFeatures:
@@ -443,7 +450,7 @@ Rules:
                 "outcomes": normalized_outcomes,
                 "raw_response": raw,
                 "n_images_sent": len(images),
-                "prompt_version": "v4_visual_priority_ego_relative_turns",
+                "prompt_version": "v5_visual_priority_turn_requires_commitment",
                 "ego_color_hint": ego_color_hint,
                 "dual_view_enabled": dual_view_enabled,
                 "add_ego_inset": add_ego_inset,

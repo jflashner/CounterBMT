@@ -265,6 +265,8 @@ class MotionLMDAGLatent(MotionLM):
         return dag_maneuver_feat, meta
 
     def apply_dag_conditioning(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        if bool(self.config.MODEL.get("LOCAL_CONTROL_FORWARD_ENABLED", False)):
+            return batch
         if not bool(self.dag_config.enabled):
             return batch
         if bool(batch.get(self._APPLIED_FLAG, False)):

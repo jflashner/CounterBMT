@@ -38,6 +38,8 @@ def main(config):
     # config = cfg_from_yaml_file(cfg_file, global_config)
     exp_name = config.exp_name
     max_epochs = config.epochs  #or config.OPTIMIZATION.NUM_EPOCHS
+    max_steps = int(config.get("max_steps", -1))
+    val_interval = config.get("val_interval", None)
     batch_size = config.batch_size
     val_batch_size = config.val_batch_size
     num_workers = config.num_workers
@@ -109,6 +111,11 @@ def main(config):
         check_val_every_n_epoch=config.get("check_val_every_n_epoch", 1),
         # strategy='ddp_find_unused_parameters_true'
     )
+    if max_steps > 0:
+        trainer_kwargs["max_steps"] = max_steps
+    if val_interval is not None:
+        trainer_kwargs["val_check_interval"] = val_interval
+        trainer_kwargs["check_val_every_n_epoch"] = None
 
     # from lightning.pytorch.profilers import PyTorchProfiler
     # profiler = PyTorchProfiler(filename="profile")
