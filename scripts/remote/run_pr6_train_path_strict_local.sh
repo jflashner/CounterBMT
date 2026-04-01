@@ -42,6 +42,6 @@ python src/Adv-BMT/bmt/train_motion.py \
   CKPT_LOAD_MODE="$CKPT_LOAD_MODE" \
   log_dir="$OUTDIR" \
   seed="$SEED" \
-  max_steps="$MAX_STEPS" \
-  val_interval="$VAL_INTERVAL" \
+  +max_steps="$MAX_STEPS" \
+  +val_interval="$VAL_INTERVAL" \
   wandb=false
