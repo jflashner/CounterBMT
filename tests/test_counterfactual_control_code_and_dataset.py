@@ -221,6 +221,14 @@ from bmt.counterfactual import (
     validate_control_code,
 )
 from bmt.dataset.dataset import InfgenDataset
+from bmt.counterfactual.path_corpus import (
+    DedupConfig,
+    annotate_light_groups,
+    analyze_path_index_redundancy,
+    apply_path_only_safe_mode,
+    cluster_path_rows,
+    split_rows_by_scenario,
+)
 from scripts.counterfactual.build_path_control_index import _is_path_train_view_eligible
 
 
@@ -698,6 +706,289 @@ class CounterfactualControlCodeAndDatasetTests(unittest.TestCase):
         keep, drop_reason = _is_path_train_view_eligible(train_view)
         self.assertFalse(keep)
         self.assertEqual(drop_reason, "path_not_supervisable")
+
+    def test_dataset_attaches_inline_path_index_payload(self) -> None:
+        dataset = InfgenDataset.__new__(InfgenDataset)
+        dataset.counterfactual_control_code_dir = "/tmp/inline_index.jsonl"
+        dataset.counterfactual_control_code_index = {}
+        dataset.sample_control_code_paths = [""]
+        dataset.sample_control_index_entries = [
+            {
+                "scenario_id": "scenario_inline",
+                "agent_id": "41",
+                "decision_time_idx": 12,
+                "path_token": {
+                    "branch_label": "left",
+                    "branch_id": "branch_01",
+                    "target_terminal_pose": {
+                        "x_rel": 10.0,
+                        "y_rel": 2.0,
+                        "sin_heading_rel": 0.0,
+                        "cos_heading_rel": 1.0,
+                    },
+                },
+                "terminal_anchor": {
+                    "target_x_rel": 10.0,
+                    "target_y_rel": 2.0,
+                    "target_sin_heading_rel": 0.0,
+                    "target_cos_heading_rel": 1.0,
+                },
+                "sparse_time_mask": [0.0] * 10 + [1.0] * 5,
+                "conditioning_eligible": True,
+                "target_is_trainable": True,
+                "control_available_at_current": True,
+                "debug": {
+                    "source_target_agent_alignment": {
+                        "target_is_trainable": True,
+                    },
+                    "source_supervision_gates": {
+                        "path_choice_supervisable": True,
+                        "compliance_supervisable": False,
+                        "timing_supervisable": False,
+                    },
+                },
+            }
+        ]
+        dataset.counterfactual_mode = "path_only"
+        dataset.mode = "training"
+        sample = {
+            "decoder/track_name": np.asarray(["41", "99"]),
+            "decoder/agent_position": np.zeros((15, 2, 3), dtype=np.float32),
+        }
+        result = InfgenDataset._maybe_attach_counterfactual_control_fields(dataset, sample, scenario_id="scenario_inline", sample_index=0)
+        self.assertEqual(result["cf/path_supervision_mask"], 1)
+        self.assertEqual(result["cf/decision_agent_mask"].tolist(), [1.0, 0.0])
+        self.assertEqual(result["cf/compliance_token"].tolist(), [0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(result["cf/timing_token"].tolist(), [0.0, 0.0, 0.0])
+        self.assertEqual(result["cf/debug_meta"]["branch_label"], "left")
+
+    def test_light_grouping_and_cluster_rep_selection(self) -> None:
+        rows = [
+            {
+                "scenario_id": "scenario_a",
+                "scenario_pkl": "/tmp/scenario_a.pkl",
+                "scenario_file_name": "scenario_a.pkl",
+                "example_id": "scenario_a__agent_41__light_100__t_010",
+                "agent_id": "41",
+                "agent_role": "forward_loss_vehicle",
+                "decision_time_idx": 10,
+                "window_start_idx": 0,
+                "window_end_idx": 30,
+                "branch_label": "left",
+                "light_id": "100",
+                "signal_state_at_decision": "LANE_STATE_STOP",
+                "stop_point_xy": [0.0, 0.0],
+                "terminal_anchor": {
+                    "target_x_rel": 20.0,
+                    "target_y_rel": -5.0,
+                    "target_sin_heading_rel": 0.0,
+                    "target_cos_heading_rel": 1.0,
+                },
+                "conditioning_eligible": True,
+                "target_is_trainable": True,
+                "control_available_at_current": True,
+                "path_choice_supervisable": True,
+                "compliance_label": "red_light_violation",
+                "branch_margin": 0.8,
+                "downstream_progress_along_branch_m": 10.0,
+                "final_heading_error_rad": 0.2,
+            },
+            {
+                "scenario_id": "scenario_a",
+                "scenario_pkl": "/tmp/scenario_a.pkl",
+                "scenario_file_name": "scenario_a.pkl",
+                "example_id": "scenario_a__agent_41__light_101__t_012",
+                "agent_id": "41",
+                "agent_role": "forward_loss_vehicle",
+                "decision_time_idx": 12,
+                "window_start_idx": 2,
+                "window_end_idx": 32,
+                "branch_label": "left",
+                "light_id": "101",
+                "signal_state_at_decision": "LANE_STATE_STOP",
+                "stop_point_xy": [2.0, 1.0],
+                "terminal_anchor": {
+                    "target_x_rel": 21.0,
+                    "target_y_rel": -5.5,
+                    "target_sin_heading_rel": 0.0,
+                    "target_cos_heading_rel": 1.0,
+                },
+                "conditioning_eligible": True,
+                "target_is_trainable": True,
+                "control_available_at_current": True,
+                "path_choice_supervisable": True,
+                "compliance_label": "none",
+                "branch_margin": 1.5,
+                "downstream_progress_along_branch_m": 14.0,
+                "final_heading_error_rad": 0.1,
+            },
+            {
+                "scenario_id": "scenario_a",
+                "scenario_pkl": "/tmp/scenario_a.pkl",
+                "scenario_file_name": "scenario_a.pkl",
+                "example_id": "scenario_a__agent_41__light_200__t_040",
+                "agent_id": "41",
+                "agent_role": "forward_loss_vehicle",
+                "decision_time_idx": 40,
+                "window_start_idx": 30,
+                "window_end_idx": 60,
+                "branch_label": "right",
+                "light_id": "200",
+                "signal_state_at_decision": "LANE_STATE_GO",
+                "stop_point_xy": [20.0, 20.0],
+                "terminal_anchor": {
+                    "target_x_rel": 8.0,
+                    "target_y_rel": 12.0,
+                    "target_sin_heading_rel": 1.0,
+                    "target_cos_heading_rel": 0.0,
+                },
+                "conditioning_eligible": True,
+                "target_is_trainable": True,
+                "control_available_at_current": True,
+                "path_choice_supervisable": True,
+                "compliance_label": "obey_signal",
+                "branch_margin": 1.2,
+                "downstream_progress_along_branch_m": 18.0,
+                "final_heading_error_rad": 0.05,
+            },
+        ]
+        grouped_rows, light_summary, _ = annotate_light_groups(rows)
+        self.assertEqual(grouped_rows[0]["light_group_id"], grouped_rows[1]["light_group_id"])
+        self.assertEqual(light_summary["num_multi_light_groups"], 1)
+
+        curated_rows, clustered_rows, dedup_stats = cluster_path_rows(grouped_rows, config=DedupConfig())
+        self.assertEqual(len(curated_rows), 2)
+        self.assertEqual(dedup_stats["unique_decision_clusters_estimate"], 2)
+        left_rows = [row for row in clustered_rows if row["branch_label"] == "left"]
+        self.assertEqual(sorted(row["representative_rank_within_cluster"] for row in left_rows), [1, 2])
+        kept_left = [row for row in curated_rows if row["branch_label"] == "left"][0]
+        self.assertEqual(kept_left["light_id"], "101")
+        self.assertEqual(kept_left["cluster_size"], 2)
+
+    def test_path_only_safe_mode_excludes_red_light_violation(self) -> None:
+        rows = [
+            {
+                "scenario_id": "scenario_a",
+                "agent_id": "41",
+                "branch_label": "left",
+                "light_id": "100",
+                "conditioning_eligible": True,
+                "path_choice_supervisable": True,
+                "terminal_anchor": {
+                    "target_x_rel": 1.0,
+                    "target_y_rel": 2.0,
+                    "target_sin_heading_rel": 0.0,
+                    "target_cos_heading_rel": 1.0,
+                },
+                "compliance_label": "red_light_violation",
+            },
+            {
+                "scenario_id": "scenario_a",
+                "agent_id": "41",
+                "branch_label": "straight",
+                "light_id": "101",
+                "conditioning_eligible": True,
+                "path_choice_supervisable": True,
+                "terminal_anchor": {
+                    "target_x_rel": 1.0,
+                    "target_y_rel": 2.0,
+                    "target_sin_heading_rel": 0.0,
+                    "target_cos_heading_rel": 1.0,
+                },
+                "compliance_label": "none",
+            },
+        ]
+        kept, summary = apply_path_only_safe_mode(rows, enabled=True)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["branch_label"], "straight")
+        self.assertEqual(summary["drop_reason_counts"]["red_light_violation_excluded"], 1)
+
+    def test_split_rows_by_scenario_has_zero_overlap(self) -> None:
+        rows = [
+            {"scenario_id": "s1", "branch_label": "left"},
+            {"scenario_id": "s1", "branch_label": "right"},
+            {"scenario_id": "s2", "branch_label": "straight"},
+            {"scenario_id": "s3", "branch_label": "left"},
+        ]
+        train_rows, val_rows, summary = split_rows_by_scenario(rows, seed=0, val_fraction=0.34)
+        train_ids = {row["scenario_id"] for row in train_rows}
+        val_ids = {row["scenario_id"] for row in val_rows}
+        self.assertFalse(train_ids & val_ids)
+        self.assertEqual(summary["scenario_overlap_count"], 0)
+        self.assertEqual(summary["num_train_rows"] + summary["num_val_rows"], len(rows))
+
+    def test_analyze_path_index_redundancy_reports_duplicate_counts(self) -> None:
+        rows = [
+            {
+                "scenario_id": "scenario_a",
+                "agent_id": "41",
+                "branch_label": "left",
+                "light_id": "100",
+                "decision_time_idx": 10,
+                "window_start_idx": 0,
+                "window_end_idx": 30,
+                "stop_point_xy": [0.0, 0.0],
+                "signal_state_at_decision": "LANE_STATE_STOP",
+                "terminal_anchor": {
+                    "target_x_rel": 20.0,
+                    "target_y_rel": -5.0,
+                    "target_sin_heading_rel": 0.0,
+                    "target_cos_heading_rel": 1.0,
+                },
+                "conditioning_eligible": True,
+                "path_choice_supervisable": True,
+                "control_available_at_current": True,
+                "compliance_label": "none",
+            },
+            {
+                "scenario_id": "scenario_a",
+                "agent_id": "41",
+                "branch_label": "left",
+                "light_id": "101",
+                "decision_time_idx": 12,
+                "window_start_idx": 2,
+                "window_end_idx": 32,
+                "stop_point_xy": [2.0, 1.0],
+                "signal_state_at_decision": "LANE_STATE_STOP",
+                "terminal_anchor": {
+                    "target_x_rel": 21.0,
+                    "target_y_rel": -5.5,
+                    "target_sin_heading_rel": 0.0,
+                    "target_cos_heading_rel": 1.0,
+                },
+                "conditioning_eligible": True,
+                "path_choice_supervisable": True,
+                "control_available_at_current": True,
+                "compliance_label": "red_light_violation",
+            },
+            {
+                "scenario_id": "scenario_a",
+                "agent_id": "41",
+                "branch_label": "right",
+                "light_id": "102",
+                "decision_time_idx": 20,
+                "window_start_idx": 10,
+                "window_end_idx": 40,
+                "stop_point_xy": [10.0, 10.0],
+                "signal_state_at_decision": "LANE_STATE_GO",
+                "terminal_anchor": {
+                    "target_x_rel": 5.0,
+                    "target_y_rel": 12.0,
+                    "target_sin_heading_rel": 1.0,
+                    "target_cos_heading_rel": 0.0,
+                },
+                "conditioning_eligible": True,
+                "path_choice_supervisable": True,
+                "control_available_at_current": True,
+                "compliance_label": "obey_signal",
+            },
+        ]
+        analysis = analyze_path_index_redundancy(rows, dedup_config=DedupConfig())
+        summary = analysis["redundancy_summary"]
+        self.assertEqual(summary["num_rows_total"], 3)
+        self.assertEqual(summary["num_duplicate_rows_by_same_(scenario_id,agent_id,branch_label)"], 1)
+        self.assertEqual(summary["count_compliance_label_red_light_violation"], 1)
+        self.assertGreaterEqual(summary["unique_decision_clusters_estimate"], 2)
 
 
 if __name__ == "__main__":

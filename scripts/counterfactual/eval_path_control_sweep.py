@@ -24,8 +24,10 @@ if __package__ is None or __package__ == "":
 from bmt.counterfactual import build_counterfactual_dataset_fields, default_counterfactual_dataset_fields, load_control_code
 from bmt.dataset.preprocessor import preprocess_scenario_description
 from bmt.tokenization import get_tokenizer
+from bmt.utils.checkpoint_loading import load_model_from_checkpoint_forgiving
 from bmt.utils import utils
 from bmt.utils.config import REPO_ROOT, cfg_from_yaml_file, global_config
+from scripts.counterfactual.mine_local_interventions import materialize_candidate_debug_bundle
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--config", type=str, default="")
+    parser.add_argument(
+        "--load-mode",
+        type=str,
+        default="forgiving_state_dict",
+        choices=("forgiving_state_dict", "strict_state_dict", "legacy_merge"),
+    )
     return parser.parse_args()
 
 
@@ -65,17 +73,19 @@ def main() -> int:
         return 0
 
     config = _load_config(args)
-    model = _load_model(config=config, ckpt_path=args.ckpt)
+    model, load_report = _load_model(config=config, ckpt_path=args.ckpt, load_mode=args.load_mode)
     tokenizer = get_tokenizer(config)
 
     rows: List[Dict[str, Any]] = []
     for entry in selected_entries:
-        rows.extend(_evaluate_entry(entry, config=config, model=model, tokenizer=tokenizer))
+        rows.extend(_evaluate_entry(entry, config=config, model=model, tokenizer=tokenizer, outdir=outdir))
 
     summary = {
         "ran": True,
         "control_index": str(Path(args.control_index).expanduser()),
         "ckpt": str(Path(args.ckpt).expanduser()),
+        "load_mode": str(args.load_mode),
+        "checkpoint_load_report": load_report,
         "num_examples_requested": int(args.num_examples),
         "num_examples_selected": len(selected_entries),
         "num_rows": len(rows),
@@ -92,39 +102,60 @@ def main() -> int:
 def _load_config(args: argparse.Namespace):
     config = copy.deepcopy(global_config)
     default_cfg = REPO_ROOT / "cfgs" / "0202_midgpt.yaml"
+    if default_cfg.is_file():
+        config = cfg_from_yaml_file(default_cfg, config)
     if args.config:
         cfg_path = Path(args.config).expanduser()
         if not cfg_path.is_absolute():
             cfg_path = (REPO_ROOT / cfg_path).resolve()
         config = cfg_from_yaml_file(cfg_path, config)
-    elif default_cfg.is_file():
-        config = cfg_from_yaml_file(default_cfg, config)
     config.MODEL.LOCAL_CONTROL_FORWARD_ENABLED = True
     config.MODEL.LOCAL_CONTROL_FORWARD_MODE = "strict_local"
     return config
 
 
-def _load_model(*, config: Any, ckpt_path: str):
+def _load_model(*, config: Any, ckpt_path: str, load_mode: str):
     from bmt.models.motionlm_lightning import MotionLMLightning
 
     default_config = cfg_from_yaml_file(REPO_ROOT / "cfgs/motion_default.yaml", global_config)
     resolved_ckpt = Path(ckpt_path).expanduser()
     if not resolved_ckpt.is_absolute():
         resolved_ckpt = (REPO_ROOT / resolved_ckpt).resolve()
-    model = utils.load_from_checkpoint(
-        checkpoint_path=str(resolved_ckpt),
-        cls=MotionLMLightning,
-        config=config,
-        default_config=default_config,
-        strict=False,
-        checkpoint_surgery_func=utils.checkpoint_surgery_func,
-        map_location="cpu",
-    )
+    if load_mode == "legacy_merge":
+        model = utils.load_from_checkpoint(
+            checkpoint_path=str(resolved_ckpt),
+            cls=MotionLMLightning,
+            config=config,
+            default_config=default_config,
+            strict=False,
+            checkpoint_surgery_func=utils.checkpoint_surgery_func,
+            map_location="cpu",
+        )
+        load_report = {
+            "ckpt_path": str(resolved_ckpt),
+            "load_mode": "legacy_merge",
+            "num_ckpt_state_dict_keys": None,
+            "num_loaded_keys": None,
+            "num_missing_keys": None,
+            "num_unexpected_keys": None,
+            "num_shape_mismatch_keys": None,
+            "strict_state_dict_used": False,
+        }
+    else:
+        model, load_report = load_model_from_checkpoint_forgiving(
+            config=config,
+            ckpt_path=str(resolved_ckpt),
+            load_mode=load_mode,
+            strict_state_dict=(load_mode == "strict_state_dict"),
+            map_location="cpu",
+            checkpoint_surgery_func=utils.checkpoint_surgery_func,
+        )
     model.eval()
-    return model
+    return model, load_report
 
 
-def _evaluate_entry(entry: Dict[str, Any], *, config: Any, model: Any, tokenizer: Any) -> List[Dict[str, Any]]:
+def _evaluate_entry(entry: Dict[str, Any], *, config: Any, model: Any, tokenizer: Any, outdir: Path) -> List[Dict[str, Any]]:
+    entry = _ensure_entry_debug_bundle(entry, outdir=outdir, config=config)
     raw_scenario = _load_raw_scenario(entry["scenario_pkl"])
     base_sample = preprocess_scenario_description(
         scenario=raw_scenario,
@@ -143,7 +174,7 @@ def _evaluate_entry(entry: Dict[str, Any], *, config: Any, model: Any, tokenizer
         model=model,
         tokenizer=tokenizer,
     )
-    factual_control = load_control_code(entry["factual_control_code_path"])
+    factual_control = dict(entry) if not str(entry.get("factual_control_code_path", "")).strip() else load_control_code(entry["factual_control_code_path"])
     factual = _run_variant(
         mode_name="factual",
         sample=base_sample,
@@ -153,7 +184,7 @@ def _evaluate_entry(entry: Dict[str, Any], *, config: Any, model: Any, tokenizer
     )
 
     alternative_rows = []
-    for alt in _load_json(Path(entry["alternative_control_codes_path"])):
+    for alt in _load_json(Path(entry["alternative_control_codes_path"])) if str(entry.get("alternative_control_codes_path", "")).strip() else []:
         alt_control = dict(alt.get("control_code", {}))
         if not alt_control:
             continue
@@ -168,7 +199,7 @@ def _evaluate_entry(entry: Dict[str, Any], *, config: Any, model: Any, tokenizer
             )
         )
 
-    branch_candidates = _load_json(Path(entry["train_view_path"]).parent / "branch_candidates.json")
+    branch_candidates = _load_json(Path(entry["train_view_path"]).parent / "branch_candidates.json") if str(entry.get("train_view_path", "")).strip() else {"branch_candidates": []}
     all_rows = [no_control, factual] + alternative_rows
     baseline_positions = no_control["target_positions"]
     for row in all_rows:
@@ -457,6 +488,37 @@ def _load_raw_scenario(path: str | Path):
 
     with Path(path).expanduser().open("rb") as f:
         return pickle.load(f)
+
+
+def _ensure_entry_debug_bundle(entry: Dict[str, Any], *, outdir: Path, config: Any) -> Dict[str, Any]:
+    if str(entry.get("train_view_path", "")).strip() and str(entry.get("alternative_control_codes_path", "")).strip():
+        return dict(entry)
+    if not str(entry.get("scenario_pkl", "")).strip():
+        return dict(entry)
+    light_id = str(entry.get("light_id", "")).strip()
+    agent_id = str(entry.get("agent_id", "")).strip()
+    if not light_id or not agent_id:
+        return dict(entry)
+    materialized_root = outdir / "materialized_eval_inputs"
+    result = materialize_candidate_debug_bundle(
+        scenario_pkl=str(entry["scenario_pkl"]),
+        light_id=light_id,
+        agent_id=agent_id,
+        outdir=materialized_root,
+        config=config,
+        include_pngs=False,
+    )
+    if result is None:
+        return dict(entry)
+    merged = dict(entry)
+    merged.update(
+        {
+            "train_view_path": result.get("train_view_path", ""),
+            "factual_control_code_path": result.get("factual_control_code_path", ""),
+            "alternative_control_codes_path": result.get("alternative_control_codes_path", ""),
+        }
+    )
+    return merged
 
 
 def _load_json(path: Path):

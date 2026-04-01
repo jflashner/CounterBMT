@@ -430,6 +430,12 @@ class MotionLMLightning(pl.LightningModule):
         # For profiling GPU usage.
         # torch.cuda.empty_cache()
 
+        if "in_evaluation" in data_dict:
+            in_evaluation = data_dict["in_evaluation"]
+            if not torch.is_tensor(in_evaluation):
+                in_evaluation = torch.as_tensor(in_evaluation)
+            data_dict["in_evaluation"] = torch.zeros_like(in_evaluation, dtype=torch.bool)
+
         data_dict = self(data_dict)
 
         loss, loss_stat = self.get_loss(data_dict)
@@ -470,7 +476,7 @@ class MotionLMLightning(pl.LightningModule):
 
     def validation_step(self, data_dict, batch_idx):
 
-        if self.config.EVAL_MOTION:
+        if self.config.EVAL_MOTION and hasattr(self, "evaluator"):
 
             if data_dict["encoder/map_valid_mask"].shape[1] == 0:
                 sid = data_dict["scenario_id"]
@@ -497,13 +503,39 @@ class MotionLMLightning(pl.LightningModule):
                 msg = f"Error in validation_step: {batch_idx=}, {scenario_ids=}, {rank=}, {error=}"
                 print(msg)
                 raise RuntimeError(msg) from error
+            return None
+
+        if "in_evaluation" in data_dict:
+            in_evaluation = data_dict["in_evaluation"]
+            if not torch.is_tensor(in_evaluation):
+                in_evaluation = torch.as_tensor(in_evaluation)
+            data_dict["in_evaluation"] = torch.zeros_like(in_evaluation, dtype=torch.bool)
+
+        data_dict = self(data_dict)
+        loss, loss_stat = self.get_loss(data_dict)
+        motion_stat = {k: v for k, v in loss_stat.items() if k.startswith("motion_stat")}
+        loss_stat = {k: v for k, v in loss_stat.items() if not k.startswith("motion_stat")}
+
+        self.log_dict(
+            {f"val/{k}": float(v) for k, v in loss_stat.items()},
+            batch_size=data_dict["encoder/map_feature"].shape[0],
+            prog_bar=False,
+        )
+        if motion_stat:
+            self.log_dict(
+                {f"val/{k}": float(v) for k, v in motion_stat.items()},
+                batch_size=data_dict["encoder/map_feature"].shape[0],
+                prog_bar=False,
+            )
+        self.log("val/monitoring_step", float(self.global_step))
+        return loss
 
     def on_validation_epoch_end(self):
         """
         This function gathers intermediate evaluation result and pass them to the Waymo
         evaluation pipeline together and log the final results.
         """
-        if self.config.EVAL_MOTION:
+        if self.config.EVAL_MOTION and hasattr(self, "evaluator"):
             self.log("monitoring_step", float(self.global_step))
             self.evaluator.on_validation_epoch_end(
                 global_rank=self.global_rank,

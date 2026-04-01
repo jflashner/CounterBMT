@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", type=str, default="training", choices=("training", "test"))
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--require-nonzero", action="store_true")
     return parser.parse_args()
 
 
@@ -53,11 +54,15 @@ def main() -> int:
         branch_payload = decode_path_token_tensor(_to_numpy(batch["cf/path_token"])[sample_idx])
         if int(_to_numpy(batch["cf/path_supervision_mask"])[sample_idx]) > 0:
             branch_labels_present.append(str(branch_payload["branch_label"]))
+        sample_debug_meta = dict(batch["cf/debug_meta"][sample_idx]) if isinstance(batch.get("cf/debug_meta"), list) else {}
         decoded_mask = decode_decision_agent_mask(
             _to_numpy(batch["cf/decision_agent_mask"])[sample_idx],
             decoder_track_names=decoder_track_names[sample_idx] if decoder_track_names else None,
         )
-        raw_track_ids.extend(str(value) for value in decoded_mask["active_track_names"])
+        active_track_names = [str(value) for value in decoded_mask["active_track_names"]]
+        if not active_track_names and sample_debug_meta.get("agent_id"):
+            active_track_names = [str(sample_debug_meta["agent_id"])]
+        raw_track_ids.extend(active_track_names)
         model_agent_slots.extend(int(value) for value in decoded_mask["active_agent_indices"])
 
     summary = {
@@ -73,8 +78,21 @@ def main() -> int:
         "model_agent_slots": model_agent_slots,
         "scenario_ids": _to_numpy(batch["metadata/scenario_id"]).astype(str).tolist(),
     }
+    checks = {
+        "path_active_mask_sum_gt_zero": bool(summary["path_active_mask_sum"] > 0),
+        "anchor_active_mask_sum_gt_zero": bool(summary["anchor_active_mask_sum"] > 0),
+        "branch_labels_present_nonempty": bool(len(summary["branch_labels_present"]) > 0),
+        "raw_track_ids_nonempty": bool(len(summary["raw_track_ids"]) > 0),
+        "model_agent_slots_nonempty": bool(len(summary["model_agent_slots"]) > 0),
+    }
+    failures = [name for name, passed in checks.items() if not passed]
+    summary["checks"] = checks
+    summary["failures"] = failures
     out_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))
+    if args.require_nonzero and failures:
+        print("Path-only batch smoke failed required checks: " + ", ".join(failures), file=sys.stderr)
+        return 1
     return 0
 
 

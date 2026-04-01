@@ -555,7 +555,13 @@ class InfgenDataset(Dataset):
         return data_dict
 
     def _resolve_counterfactual_control_code_dir(self):
-        control_source = str(self.config.DATA.get("COUNTERFACTUAL_CONTROL_INDEX", "")).strip()
+        mode_specific_index_key = "COUNTERFACTUAL_CONTROL_INDEX_TRAIN" if self.mode == "training" else "COUNTERFACTUAL_CONTROL_INDEX_VAL"
+        mode_specific_dir_key = "COUNTERFACTUAL_CONTROL_CODE_DIR_TRAIN" if self.mode == "training" else "COUNTERFACTUAL_CONTROL_CODE_DIR_VAL"
+        control_source = str(self.config.DATA.get(mode_specific_index_key, "")).strip()
+        if not control_source:
+            control_source = str(self.config.DATA.get("COUNTERFACTUAL_CONTROL_INDEX", "")).strip()
+        if not control_source:
+            control_source = str(self.config.DATA.get(mode_specific_dir_key, "")).strip()
         if not control_source:
             control_source = str(self.config.DATA.get("COUNTERFACTUAL_CONTROL_CODE_DIR", "")).strip()
         if not control_source:
@@ -597,9 +603,14 @@ class InfgenDataset(Dataset):
         missing = 0
         for row in rows:
             control_code_path = str(row.get("factual_control_code_path") or row.get("control_code_path") or "").strip()
-            if not control_code_path:
+            has_inline_payload = self._index_entry_has_inline_control_payload(row)
+            if not control_code_path and not has_inline_payload:
                 continue
             file_name = str(row.get("scenario_file_name") or "").strip()
+            if not file_name:
+                scenario_pkl = str(row.get("scenario_pkl") or "").strip()
+                if scenario_pkl:
+                    file_name = pathlib.Path(scenario_pkl).name
             if not file_name:
                 scenario_key = str(row.get("scenario_id") or "").strip()
                 file_name = file_name_lookup.get(scenario_key, "")
@@ -625,6 +636,11 @@ class InfgenDataset(Dataset):
             lookup[file_name] = file_name
         return lookup
 
+    def _index_entry_has_inline_control_payload(self, row):
+        if not isinstance(row, dict):
+            return False
+        return "path_token" in row and "terminal_anchor" in row and "sparse_time_mask" in row
+
     def _maybe_attach_counterfactual_control_fields(self, sample, *, scenario_id, sample_index=None):
         if not self.counterfactual_control_code_dir:
             return sample
@@ -647,11 +663,18 @@ class InfgenDataset(Dataset):
 
         control_code = None
         control_code_path = ""
+        inline_control_code = None
+        if self.sample_control_index_entries is not None and sample_index is not None and 0 <= int(sample_index) < len(self.sample_control_index_entries):
+            inline_row = dict(self.sample_control_index_entries[int(sample_index)])
+            if self._index_entry_has_inline_control_payload(inline_row):
+                inline_control_code = inline_row
         if self.sample_control_code_paths is not None and sample_index is not None and 0 <= int(sample_index) < len(self.sample_control_code_paths):
             control_code_path = str(self.sample_control_code_paths[int(sample_index)])
-        if not control_code_path:
+        if inline_control_code is not None:
+            control_code = inline_control_code
+        elif not control_code_path:
             control_code_path = self.counterfactual_control_code_index.get(scenario_id, "")
-        if control_code_path:
+        if control_code is None and control_code_path:
             control_code = load_control_code(control_code_path)
 
         output = dict(sample)

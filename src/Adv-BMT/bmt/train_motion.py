@@ -5,7 +5,6 @@ import pathlib
 import hydra
 import lightning.pytorch as pl
 import torch
-import wandb
 from lightning.pytorch.callbacks import LearningRateMonitor
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
@@ -15,9 +14,29 @@ from omegaconf import OmegaConf
 import bmt.utils as utils
 from bmt.dataset.datamodule import InfgenDataModule
 from bmt.models.motionlm_lightning import MotionLMLightning
+from bmt.utils.checkpoint_loading import load_model_from_checkpoint_forgiving
 from bmt.utils import REPO_ROOT, get_time_str
 
 torch.set_float32_matmul_precision('high')
+
+
+def _wrap_tensorboard_hparams_logger(logger):
+    if not isinstance(logger, TensorBoardLogger):
+        return logger
+
+    original_log_hyperparams = logger.log_hyperparams
+
+    def _safe_log_hyperparams(*args, **kwargs):
+        try:
+            return original_log_hyperparams(*args, **kwargs)
+        except AttributeError as exc:
+            if "np.string_" not in str(exc):
+                raise
+            print("Skipping TensorBoard hparams logging due to NumPy/TensorBoard compatibility issue:", exc)
+            return None
+
+    logger.log_hyperparams = _safe_log_hyperparams
+    return logger
 
 
 @hydra.main(version_base=None, config_path=str(REPO_ROOT / "cfgs"), config_name="motion_default.yaml")
@@ -56,6 +75,8 @@ def main(config):
     else:
         save_dir = pathlib.Path(os.path.join(REPO_ROOT, "lightning_logs"))
     if config.wandb and not config.eval:
+        import wandb
+
         with open(os.path.abspath(os.path.expanduser("~/wandb_api_key_file.txt")), "rt") as fp:
             api_key = fp.readline().strip()
         wandb.login(key=api_key)
@@ -69,6 +90,7 @@ def main(config):
         )
     else:
         logger = TensorBoardLogger(save_dir=save_dir / "infgen", name=name)
+        logger = _wrap_tensorboard_hparams_logger(logger)
 
     ckpt_save_dir = pathlib.Path(save_dir).absolute() / "infgen" / name
 
@@ -190,15 +212,37 @@ def main(config):
             print("CUDA is not available. Loading model on CPU!")
             map_location = "cpu"
 
-        model = utils.load_from_checkpoint(
-            checkpoint_path=pretrained_path,
-            cls=MotionLMLightning,
-            config=config,
-            default_config=default_config,
-            strict=True,
-            checkpoint_surgery_func=utils.checkpoint_surgery_func,
-            map_location=map_location
-        )
+        ckpt_load_mode = str(config.get("CKPT_LOAD_MODE", "legacy_merge"))
+        if ckpt_load_mode == "forgiving_state_dict":
+            model, load_report = load_model_from_checkpoint_forgiving(
+                config=config,
+                ckpt_path=pretrained_path,
+                load_mode=ckpt_load_mode,
+                strict_state_dict=False,
+                map_location=map_location,
+                checkpoint_surgery_func=utils.checkpoint_surgery_func,
+            )
+            print("==============================")
+            print(
+                "Forgiving warm-start report:",
+                {
+                    "num_loaded_keys": load_report["num_loaded_keys"],
+                    "num_missing_keys": load_report["num_missing_keys"],
+                    "num_unexpected_keys": load_report["num_unexpected_keys"],
+                    "num_shape_mismatch_keys": load_report["num_shape_mismatch_keys"],
+                },
+            )
+            print("==============================")
+        else:
+            model = utils.load_from_checkpoint(
+                checkpoint_path=pretrained_path,
+                cls=MotionLMLightning,
+                config=config,
+                default_config=default_config,
+                strict=True,
+                checkpoint_surgery_func=utils.checkpoint_surgery_func,
+                map_location=map_location
+            )
         # model = MotionLMLightning.load_from_checkpoint(checkpoint_path=pretrained_path, strict=strict, **config)
     else:
         model = MotionLMLightning(config=config)

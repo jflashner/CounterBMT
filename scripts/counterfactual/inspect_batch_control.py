@@ -253,6 +253,10 @@ from bmt.counterfactual.runtime_probe import (
     summarize_probe_stages,
 )
 from bmt.dataset.dataset import InfgenDataset
+from bmt.utils.checkpoint_loading import (
+    load_model_from_checkpoint_forgiving,
+    summarize_load_report_by_module,
+)
 from bmt.utils import utils
 from bmt.utils.config import REPO_ROOT, cfg_from_yaml_file, global_config
 
@@ -274,6 +278,13 @@ def parse_args() -> argparse.Namespace:
         default="interactive",
         choices=("interactive", "strict_local"),
         help="Forward-only local control mode to use during the forward smoke.",
+    )
+    parser.add_argument(
+        "--load-mode",
+        type=str,
+        default="forgiving_state_dict",
+        choices=("forgiving_state_dict", "strict_state_dict", "legacy_merge"),
+        help="Checkpoint load mode for forward/runtime smoke.",
     )
     return parser.parse_args()
 
@@ -360,6 +371,7 @@ def main() -> int:
             batch=batch,
             selected_example_idx=selected_example_idx,
             ckpt_path=args.ckpt,
+            load_mode=args.load_mode,
         )
         predicted_branch_eval.update(
             {
@@ -416,13 +428,13 @@ def main() -> int:
 def _load_config(args: argparse.Namespace):
     config = copy.deepcopy(global_config)
     default_forward_cfg = REPO_ROOT / "cfgs" / "0202_midgpt.yaml"
+    if default_forward_cfg.is_file():
+        config = cfg_from_yaml_file(default_forward_cfg, config)
     if args.config:
         cfg_path = Path(args.config).expanduser()
         if not cfg_path.is_absolute():
             cfg_path = (REPO_ROOT / cfg_path).resolve()
         config = cfg_from_yaml_file(cfg_path, config)
-    elif args.run_forward and default_forward_cfg.is_file():
-        config = cfg_from_yaml_file(default_forward_cfg, config)
     config.DATA.COUNTERFACTUAL_CONTROL_CODE_DIR = str(Path(args.control_code_dir).expanduser())
     if args.data_dir:
         if args.mode == "training":
@@ -435,12 +447,23 @@ def _load_config(args: argparse.Namespace):
     return config
 
 
-def _run_forward_smoke(*, config: Any, batch: Dict[str, Any], selected_example_idx: int, ckpt_path: str = "") -> Dict[str, Any]:
+def _run_forward_smoke(
+    *,
+    config: Any,
+    batch: Dict[str, Any],
+    selected_example_idx: int,
+    ckpt_path: str = "",
+    load_mode: str = "forgiving_state_dict",
+) -> Dict[str, Any]:
 
     if str(config.MODEL.NAME) != "gpt":
         raise ValueError("Forward smoke requires a GPT decoder config so local control can be injected.")
 
-    model = _load_motion_model_for_smoke(config=config, ckpt_path=ckpt_path)
+    model, load_report, loaded_module_summary = _load_motion_model_for_smoke(
+        config=config,
+        ckpt_path=ckpt_path,
+        load_mode=load_mode,
+    )
     model.eval()
 
     controlled_batch = copy.deepcopy(batch)
@@ -495,30 +518,6 @@ def _run_forward_smoke(*, config: Any, batch: Dict[str, Any], selected_example_i
         "after_next_shared_block": "decoder/control_probe_after_next_shared_block",
         "after_full_decoder": "decoder/control_probe_after_full_decoder",
     }
-
-
-def _load_motion_model_for_smoke(*, config: Any, ckpt_path: str = ""):
-    if not ckpt_path:
-        from bmt.models.motionlm import MotionLM
-
-        return MotionLM(config)
-
-    from bmt.models.motionlm_lightning import MotionLMLightning
-
-    default_config = cfg_from_yaml_file(REPO_ROOT / "cfgs/motion_default.yaml", global_config)
-    resolved_ckpt = Path(ckpt_path).expanduser()
-    if not resolved_ckpt.is_absolute():
-        resolved_ckpt = (REPO_ROOT / resolved_ckpt).resolve()
-    lightning_model = utils.load_from_checkpoint(
-        checkpoint_path=str(resolved_ckpt),
-        cls=MotionLMLightning,
-        config=config,
-        default_config=default_config,
-        strict=False,
-        checkpoint_surgery_func=utils.checkpoint_surgery_func,
-        map_location="cpu",
-    )
-    return lightning_model.model
     controlled_probes = {
         stage_name: _to_numpy(controlled_out.get(key, controlled_out["decoder/decoded_tokens"]))
         for stage_name, key in probe_keys.items()
@@ -538,6 +537,8 @@ def _load_motion_model_for_smoke(*, config: Any, ckpt_path: str = ""):
     probe_behavior = classify_probe_behavior(stage_summaries)
 
     return {
+        "checkpoint_load_report": load_report,
+        "loaded_module_summary": loaded_module_summary,
         "control_forward_mode": str(
             controlled_out.get("decoder/control_forward_mode", getattr(config.MODEL, "LOCAL_CONTROL_FORWARD_MODE", "interactive"))
         ),
@@ -562,6 +563,57 @@ def _load_motion_model_for_smoke(*, config: Any, ckpt_path: str = ""):
         "non_target_delta_max_abs": float(np.max(np.abs(token_delta[non_target_mask]))) if bool(non_target_mask.any()) else 0.0,
         "supervision_only_delta_max_abs": float(np.max(np.abs(token_delta[supervision_only_mask]))) if bool(supervision_only_mask.any()) else 0.0,
     }
+
+
+def _load_motion_model_for_smoke(
+    *,
+    config: Any,
+    ckpt_path: str = "",
+    load_mode: str = "forgiving_state_dict",
+):
+    if not ckpt_path:
+        from bmt.models.motionlm import MotionLM
+
+        return MotionLM(config), {"load_mode": "none", "ckpt_path": "", "num_loaded_keys": 0}, {}
+
+    from bmt.models.motionlm_lightning import MotionLMLightning
+
+    default_config = cfg_from_yaml_file(REPO_ROOT / "cfgs/motion_default.yaml", global_config)
+    resolved_ckpt = Path(ckpt_path).expanduser()
+    if not resolved_ckpt.is_absolute():
+        resolved_ckpt = (REPO_ROOT / resolved_ckpt).resolve()
+    if load_mode == "legacy_merge":
+        lightning_model = utils.load_from_checkpoint(
+            checkpoint_path=str(resolved_ckpt),
+            cls=MotionLMLightning,
+            config=config,
+            default_config=default_config,
+            strict=False,
+            checkpoint_surgery_func=utils.checkpoint_surgery_func,
+            map_location="cpu",
+        )
+        load_report = {
+            "ckpt_path": str(resolved_ckpt),
+            "load_mode": "legacy_merge",
+            "num_ckpt_state_dict_keys": None,
+            "num_loaded_keys": None,
+            "num_missing_keys": None,
+            "num_unexpected_keys": None,
+            "num_shape_mismatch_keys": None,
+            "strict_state_dict_used": False,
+        }
+        loaded_module_summary = {}
+    else:
+        lightning_model, load_report = load_model_from_checkpoint_forgiving(
+            config=config,
+            ckpt_path=str(resolved_ckpt),
+            load_mode=load_mode,
+            strict_state_dict=(load_mode == "strict_state_dict"),
+            map_location="cpu",
+            checkpoint_surgery_func=utils.checkpoint_surgery_func,
+        )
+        loaded_module_summary = summarize_load_report_by_module(load_report)
+    return lightning_model.model, load_report, loaded_module_summary
 
 
 def _force_eval_flag(value: Any, *, device: torch.device) -> torch.Tensor:

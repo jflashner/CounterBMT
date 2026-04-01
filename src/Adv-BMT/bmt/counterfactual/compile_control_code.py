@@ -724,6 +724,7 @@ def build_counterfactual_dataset_fields(
         "conditioning_eligible": conditioning_eligible,
         "auxiliary_supervision_eligible": auxiliary_supervision_eligible,
         "scenario_id": str(payload.get("scenario_id", scenario_id)),
+        "agent_id": str(payload.get("agent_id", "")),
         "schema_version": payload.get("schema_version"),
         "control_code_path": str(control_code_path),
         "view_type": payload.get("view_type", _coerce_mapping(payload.get("debug", {})).get("source_view_type")),

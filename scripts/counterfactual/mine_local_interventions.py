@@ -143,6 +143,7 @@ def _mine_candidate_for_trainable_agents(
     config: Any,
     artifact_mode: str = "full",
     max_agents: int | None = None,
+    include_pngs: bool = True,
 ) -> List[Dict[str, Any]]:
     raw_scenario = load_raw_scenario(candidate.scenario_pkl)
     canonical = load_and_normalize_scenario(candidate.scenario_pkl)
@@ -170,6 +171,7 @@ def _mine_candidate_for_trainable_agents(
             forward_summary=forward_summary,
             outdir=outdir,
             artifact_mode=artifact_mode,
+            include_pngs=include_pngs,
         )
         if record is not None:
             records.append(record)
@@ -186,6 +188,7 @@ def _mine_one_agent_candidate(
     forward_summary: Any,
     outdir: Path,
     artifact_mode: str = "full",
+    include_pngs: bool = True,
 ) -> Optional[Dict[str, Any]]:
     agent_role = "sdc" if str(agent_id) == str(canonical.sdc_id) else "forward_loss_vehicle"
     try:
@@ -377,13 +380,14 @@ def _mine_one_agent_candidate(
                 "local_patch": local_patch.to_dict(),
             },
         )
-        render_local_patch(
-            stop_point_xy=candidate.stop_point_xy,
-            radius_m=30.0,
-            lane_features=[feature.to_dict() for feature in local_patch.lane_features],
-            nearby_tracks=[track.to_dict() for track in local_patch.nearby_tracks],
-            out_path=local_patch_png,
-        )
+        if include_pngs:
+            render_local_patch(
+                stop_point_xy=candidate.stop_point_xy,
+                radius_m=30.0,
+                lane_features=[feature.to_dict() for feature in local_patch.lane_features],
+                nearby_tracks=[track.to_dict() for track in local_patch.nearby_tracks],
+                out_path=local_patch_png,
+            )
         _write_json(
             decision_window_json,
             {
@@ -397,22 +401,23 @@ def _mine_one_agent_candidate(
         decision_xy = tuple(float(v) for v in target_track.position_xy[decision_window.decision_time_idx])
         current_xy = tuple(float(v) for v in target_track.position_xy[canonical.current_time_index])
         current_heading = float(target_track.heading[canonical.current_time_index]) if np.isfinite(target_track.heading[canonical.current_time_index]) else float(decision_window.approach_heading)
-        render_branch_candidates(
-            stop_point_xy=candidate.stop_point_xy,
-            lane_features=[feature.to_dict() for feature in local_patch.lane_features],
-            branch_candidates=branch_list,
-            sdc_past_xy=past_xy,
-            sdc_future_xy=future_xy,
-            current_xy=current_xy,
-            decision_xy=decision_xy,
-            approach_heading=float(decision_window.approach_heading),
-            current_heading=current_heading,
-            current_time_idx=int(canonical.current_time_index),
-            decision_time_idx=int(decision_window.decision_time_idx),
-            agent_id=str(agent_id),
-            gt_branch_id=str(recovered_decision.branch_id or ""),
-            out_path=branch_candidates_png,
-        )
+        if include_pngs:
+            render_branch_candidates(
+                stop_point_xy=candidate.stop_point_xy,
+                lane_features=[feature.to_dict() for feature in local_patch.lane_features],
+                branch_candidates=branch_list,
+                sdc_past_xy=past_xy,
+                sdc_future_xy=future_xy,
+                current_xy=current_xy,
+                decision_xy=decision_xy,
+                approach_heading=float(decision_window.approach_heading),
+                current_heading=current_heading,
+                current_time_idx=int(canonical.current_time_index),
+                decision_time_idx=int(decision_window.decision_time_idx),
+                agent_id=str(agent_id),
+                gt_branch_id=str(recovered_decision.branch_id or ""),
+                out_path=branch_candidates_png,
+            )
         _write_json(
             conflict_agents_json,
             {
@@ -422,13 +427,14 @@ def _mine_one_agent_candidate(
             },
         )
         _write_eta_table_csv(eta_table_csv, conflict_result.eta_table)
-        render_conflict_plot(
-            stop_point_xy=candidate.stop_point_xy,
-            core_radius_m=conflict_result.core_radius_m,
-            sdc_position_xy=decision_xy,
-            eta_table=[record.to_dict() for record in conflict_result.eta_table],
-            out_path=conflict_plot_png,
-        )
+        if include_pngs:
+            render_conflict_plot(
+                stop_point_xy=candidate.stop_point_xy,
+                core_radius_m=conflict_result.core_radius_m,
+                sdc_position_xy=decision_xy,
+                eta_table=[record.to_dict() for record in conflict_result.eta_table],
+                out_path=conflict_plot_png,
+            )
         _write_json(compatibility_intervention_json, train_view.to_dict())
         _write_json(intervention_dag_json, dag.to_dict())
         _write_json(compatibility_control_json, factual_control_code.to_dict())
@@ -471,6 +477,44 @@ def _mine_one_agent_candidate(
         "alternative_control_codes_path": str(alternative_control_json),
         "score_key": list(score_key),
     }
+
+
+def materialize_candidate_debug_bundle(
+    *,
+    scenario_pkl: str | Path,
+    light_id: str,
+    agent_id: str,
+    outdir: str | Path,
+    config: Any,
+    include_pngs: bool = True,
+) -> Optional[Dict[str, Any]]:
+    scenario_pkl = str(Path(scenario_pkl).expanduser())
+    candidates = select_signalized_candidates_for_scenario(scenario_pkl).candidates
+    selected_candidate = None
+    for candidate in candidates:
+        if str(candidate.light_id) == str(light_id):
+            selected_candidate = candidate
+            break
+    if selected_candidate is None:
+        return None
+
+    raw_scenario = load_raw_scenario(scenario_pkl)
+    canonical = load_and_normalize_scenario(scenario_pkl)
+    if str(light_id) not in canonical.traffic_lights:
+        return None
+    light = canonical.traffic_lights[str(light_id)]
+    forward_summary = summarize_forward_supervision_for_raw_scenario(raw_scenario, config=config)
+    return _mine_one_agent_candidate(
+        selected_candidate,
+        canonical=canonical,
+        raw_scenario=raw_scenario,
+        light=light,
+        agent_id=str(agent_id),
+        forward_summary=forward_summary,
+        outdir=Path(outdir).expanduser(),
+        artifact_mode="full",
+        include_pngs=include_pngs,
+    )
 
 
 def _enumerate_branches(local_patch: Any, stop_point_xy: tuple[float, float], approach_heading: float) -> List[Any]:

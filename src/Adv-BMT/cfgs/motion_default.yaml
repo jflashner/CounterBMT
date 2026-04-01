@@ -20,6 +20,7 @@ prefetch_factor: 2
 ckpt: Null
 eval: False
 pretrain: Null
+CKPT_LOAD_MODE: legacy_merge
 deterministic: False
 detect_anomaly: False
 check_val_every_n_epoch: 1
@@ -76,6 +77,10 @@ DATA:
     USE_CACHE: false
     COUNTERFACTUAL_CONTROL_CODE_DIR: ''
     COUNTERFACTUAL_CONTROL_INDEX: ''
+    COUNTERFACTUAL_CONTROL_CODE_DIR_TRAIN: ''
+    COUNTERFACTUAL_CONTROL_CODE_DIR_VAL: ''
+    COUNTERFACTUAL_CONTROL_INDEX_TRAIN: ''
+    COUNTERFACTUAL_CONTROL_INDEX_VAL: ''
     COUNTERFACTUAL_MODE: 'default'
     COUNTERFACTUAL_WEIGHTED_SAMPLER: false
 
@@ -120,7 +125,7 @@ MODEL:
     LOCAL_CONTROL_TRAIN_OUTPUT_HEAD: false
     NUM_ATTN_LAYERS: 4
     NUM_ATTN_HEAD: 8
-#    DROPOUT_OF_ATTN: 0.0
+    DROPOUT_OF_ATTN: 0.0
     DROPOUT: 0.0
     NUM_DECODER_LAYERS: 6
     ADD_PE_FOR_TOKEN: true
