@@ -131,6 +131,14 @@ export MAX_STEPS=5000
 export VAL_INTERVAL=500
 export SEED=0
 export CKPT_LOAD_MODE=forgiving_state_dict
+export WANDB_ENABLED=true
+export WANDB_PROJECT=infgen
+export WANDB_ENTITY=your_wandb_entity
+export WANDB_GROUP=pr6_path_control
+# Prefer one of:
+export WANDB_API_KEY=your_wandb_api_key
+# or:
+# export WANDB_API_KEY_FILE=$HOME/wandb_api_key_file.txt
 ```
 
 Exact copy-paste command:
@@ -169,6 +177,7 @@ Common failure modes:
 - Missing checkpoint path.
 - Mismatched curated split and dataset root.
 - Expected missing path-control keys during warm-start; inspect the checkpoint load report before treating this as a failure.
+- WandB auth missing; set `WANDB_API_KEY` or `WANDB_API_KEY_FILE`.
 - OOM with large `BATCH_SIZE`; reduce batch size or workers.
 
 What artifacts to inspect first:

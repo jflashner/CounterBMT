@@ -39,6 +39,28 @@ def _wrap_tensorboard_hparams_logger(logger):
     return logger
 
 
+def _resolve_wandb_api_key() -> str:
+    api_key = str(os.environ.get("WANDB_API_KEY", "")).strip()
+    if api_key:
+        return api_key
+
+    api_key_file = os.path.abspath(
+        os.path.expanduser(
+            str(os.environ.get("WANDB_API_KEY_FILE", "~/wandb_api_key_file.txt"))
+        )
+    )
+    if not os.path.isfile(api_key_file):
+        raise FileNotFoundError(
+            "WandB logging is enabled, but no API key was found. "
+            "Set WANDB_API_KEY or WANDB_API_KEY_FILE."
+        )
+    with open(api_key_file, "rt", encoding="utf-8") as fp:
+        api_key = fp.readline().strip()
+    if not api_key:
+        raise RuntimeError(f"WandB API key file is empty: {api_key_file}")
+    return api_key
+
+
 @hydra.main(version_base=None, config_path=str(REPO_ROOT / "cfgs"), config_name="motion_default.yaml")
 def main(config):
     # Unfreeze the config to allow modification
@@ -77,16 +99,20 @@ def main(config):
     if config.wandb and not config.eval:
         import wandb
 
-        with open(os.path.abspath(os.path.expanduser("~/wandb_api_key_file.txt")), "rt") as fp:
-            api_key = fp.readline().strip()
+        api_key = _resolve_wandb_api_key()
+        wandb_project = str(os.environ.get("WANDB_PROJECT", "infgen")).strip() or "infgen"
+        wandb_entity = str(os.environ.get("WANDB_ENTITY", "")).strip() or None
+        wandb_group = str(os.environ.get("WANDB_GROUP", exp_name)).strip() or exp_name
+        wandb_run_name = str(os.environ.get("WANDB_RUN_NAME", name)).strip() or name
         wandb.login(key=api_key)
         logger = WandbLogger(
-            name=name,
+            name=wandb_run_name,
             save_dir=save_dir,
-            id=name,
-            project="infgen",
+            id=wandb_run_name,
+            project=wandb_project,
+            entity=wandb_entity,
             log_model=False,
-            group=exp_name,
+            group=wandb_group,
         )
     else:
         logger = TensorBoardLogger(save_dir=save_dir / "infgen", name=name)

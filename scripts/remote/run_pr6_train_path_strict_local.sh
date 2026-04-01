@@ -16,10 +16,21 @@ MAX_STEPS="${MAX_STEPS:-5000}"
 VAL_INTERVAL="${VAL_INTERVAL:-500}"
 SEED="${SEED:-0}"
 CKPT_LOAD_MODE="${CKPT_LOAD_MODE:-forgiving_state_dict}"
+WANDB_ENABLED="${WANDB_ENABLED:-true}"
+WANDB_PROJECT="${WANDB_PROJECT:-infgen}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+WANDB_GROUP="${WANDB_GROUP:-pr6_path_control}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 
 cd "$REPO_ROOT"
 export PYTHONPATH
 export CUDA_VISIBLE_DEVICES
+export WANDB_PROJECT
+export WANDB_ENTITY
+export WANDB_GROUP
+if [[ -n "$WANDB_RUN_NAME" ]]; then
+  export WANDB_RUN_NAME
+fi
 
 if [[ -n "$CONTROL_INDEX_DIR" ]]; then
   CONTROL_INDEX_TRAIN="${CONTROL_INDEX_TRAIN:-$CONTROL_INDEX_DIR/path_index_curated_train.jsonl}"
@@ -44,4 +55,4 @@ python src/Adv-BMT/bmt/train_motion.py \
   seed="$SEED" \
   +max_steps="$MAX_STEPS" \
   +val_interval="$VAL_INTERVAL" \
-  wandb=false
+  wandb="$WANDB_ENABLED"
