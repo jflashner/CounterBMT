@@ -414,6 +414,16 @@ def main() -> int:
             json.dumps(forward_runtime_summary, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+    posttrain_probe_summary = {
+        "batch_control_summary": summary,
+        "selected_control": selected_control,
+        "predicted_branch_eval": predicted_branch_eval,
+        "forward_control_runtime": forward_runtime_summary,
+    }
+    (outdir / "posttrain_probe_summary.json").write_text(
+        json.dumps(posttrain_probe_summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     np.save(outdir / "selected_control_tokens.npy", selected_tokens.astype(np.float32))
     np.save(outdir / "control_pos_mask.npy", control_pos_mask.astype(np.float32))
     control_code_path = str(debug_meta[selected_example_idx].get("control_code_path", ""))

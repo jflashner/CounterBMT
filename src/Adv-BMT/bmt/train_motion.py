@@ -1,6 +1,8 @@
 import datetime
+import json
 import os
 import pathlib
+import traceback
 
 import hydra
 import lightning.pytorch as pl
@@ -59,6 +61,73 @@ def _resolve_wandb_api_key() -> str:
     if not api_key:
         raise RuntimeError(f"WandB API key file is empty: {api_key_file}")
     return api_key
+
+
+def _serialize_metric_mapping(values):
+    serialized = {}
+    for key, value in dict(values).items():
+        if hasattr(value, "detach"):
+            tensor = value.detach().cpu()
+            if tensor.numel() == 1:
+                serialized[str(key)] = float(tensor.item())
+            else:
+                serialized[str(key)] = tensor.tolist()
+        elif isinstance(value, (int, float, bool, str)):
+            serialized[str(key)] = value
+        elif value is None:
+            serialized[str(key)] = None
+        else:
+            serialized[str(key)] = str(value)
+    return serialized
+
+
+def _write_training_artifacts(
+    *,
+    artifact_root: pathlib.Path,
+    config,
+    trainer: pl.Trainer,
+    run_name: str,
+    exp_name: str,
+    ckpt_path: str | None,
+    pretrained_path: str | None,
+    checkpoint_load_report,
+    completed: bool,
+    failed: bool,
+    failure_reason,
+):
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    summary_path = artifact_root / "path_control_train_summary.json"
+    metrics_path = artifact_root / "path_control_train_metrics.json"
+
+    summary = {
+        "run_name": str(run_name),
+        "exp_name": str(exp_name),
+        "completed": bool(completed),
+        "failed": bool(failed),
+        "failure_reason": failure_reason,
+        "global_step": int(getattr(trainer, "global_step", 0)),
+        "current_epoch": int(getattr(trainer, "current_epoch", 0)),
+        "ckpt_path": ckpt_path,
+        "pretrained_path": pretrained_path,
+        "ckpt_load_mode": str(config.get("CKPT_LOAD_MODE", "legacy_merge")),
+        "checkpoint_load_report": checkpoint_load_report,
+        "wandb_enabled": bool(config.wandb and not config.eval),
+        "wandb_project": str(os.environ.get("WANDB_PROJECT", "infgen")).strip() or "infgen",
+        "wandb_entity": str(os.environ.get("WANDB_ENTITY", "")).strip() or None,
+        "wandb_group": str(os.environ.get("WANDB_GROUP", exp_name)).strip() or exp_name,
+        "wandb_run_name": str(os.environ.get("WANDB_RUN_NAME", run_name)).strip() or run_name,
+        "log_dir": str(artifact_root),
+        "lightning_log_dir": str((artifact_root / "lightning_logs").resolve()) if artifact_root.name != "lightning_logs" else str(artifact_root.resolve()),
+    }
+
+    metrics = {
+        "callback_metrics": _serialize_metric_mapping(getattr(trainer, "callback_metrics", {})),
+        "logged_metrics": _serialize_metric_mapping(getattr(trainer, "logged_metrics", {})),
+        "progress_bar_metrics": _serialize_metric_mapping(getattr(trainer, "progress_bar_metrics", {})),
+    }
+
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
 
 
 @hydra.main(version_base=None, config_path=str(REPO_ROOT / "cfgs"), config_name="motion_default.yaml")
@@ -207,6 +276,7 @@ def main(config):
 
     # Set up model
     ckpt_path = config.ckpt
+    load_report = None
     if ckpt_path is not None:
         ckpt_path = REPO_ROOT / pathlib.Path(ckpt_path).expanduser()
         if ckpt_path.is_dir():
@@ -290,10 +360,37 @@ def main(config):
     print("Rank {} is done setting up the model.".format(trainer.global_rank))
     OmegaConf.save(config, config_save_path)
 
-    if config.eval:
-        trainer.validate(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
-    else:
-        trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
+    artifact_root = pathlib.Path(log_dir).absolute() if log_dir is not None else ckpt_save_dir
+    run_completed = False
+    run_failed = False
+    failure_reason = None
+    try:
+        if config.eval:
+            trainer.validate(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
+        else:
+            trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
+        run_completed = True
+    except Exception as exc:
+        run_failed = True
+        failure_reason = {
+            "message": str(exc),
+            "traceback_tail": traceback.format_exc().splitlines()[-40:],
+        }
+        raise
+    finally:
+        _write_training_artifacts(
+            artifact_root=artifact_root,
+            config=config,
+            trainer=trainer,
+            run_name=name,
+            exp_name=exp_name,
+            ckpt_path=ckpt_path,
+            pretrained_path=pretrained_path,
+            checkpoint_load_report=load_report,
+            completed=run_completed,
+            failed=run_failed,
+            failure_reason=failure_reason,
+        )
 
 
 if __name__ == '__main__':

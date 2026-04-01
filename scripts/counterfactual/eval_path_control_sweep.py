@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -39,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-control-sweep-images", type=int, default=6)
     parser.add_argument("--config", type=str, default="")
     parser.add_argument(
         "--load-mode",
@@ -56,8 +58,12 @@ def main() -> int:
 
     entries = _load_jsonl(Path(args.control_index).expanduser())
     selected_entries = _select_entries(entries, num_examples=int(args.num_examples), seed=int(args.seed))
-    summary_path = outdir / "eval_smoke_summary.json"
-    examples_path = outdir / "eval_smoke_examples.jsonl"
+    summary_path = outdir / "path_control_eval_summary.json"
+    examples_path = outdir / "path_control_eval_per_example.jsonl"
+    legacy_summary_path = outdir / "eval_smoke_summary.json"
+    legacy_examples_path = outdir / "eval_smoke_examples.jsonl"
+    confusion_path = outdir / "path_control_eval_confusion_matrix.json"
+    breakdown_path = outdir / "path_control_eval_branch_breakdown.json"
 
     if not args.ckpt or not Path(args.ckpt).expanduser().exists():
         summary = {
@@ -67,8 +73,12 @@ def main() -> int:
             "num_examples_selected": len(selected_entries),
             "control_index": str(Path(args.control_index).expanduser()),
         }
-        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        _write_json(summary_path, summary)
+        _write_json(legacy_summary_path, summary)
         examples_path.write_text("", encoding="utf-8")
+        legacy_examples_path.write_text("", encoding="utf-8")
+        _write_json(confusion_path, {"ran": False, "labels": ["left", "straight", "right"], "matrix": {}})
+        _write_json(breakdown_path, {"ran": False, "breakdown_by_requested_class": {}})
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
 
@@ -77,8 +87,21 @@ def main() -> int:
     tokenizer = get_tokenizer(config)
 
     rows: List[Dict[str, Any]] = []
-    for entry in selected_entries:
-        rows.extend(_evaluate_entry(entry, config=config, model=model, tokenizer=tokenizer, outdir=outdir))
+    control_sweep_pngs: List[str] = []
+    for entry_idx, entry in enumerate(selected_entries):
+        evaluation = _evaluate_entry(
+            entry,
+            config=config,
+            model=model,
+            tokenizer=tokenizer,
+            outdir=outdir,
+            control_sweep_index=(entry_idx if entry_idx < int(args.num_control_sweep_images) else None),
+        )
+        rows.extend(evaluation["rows"])
+        if evaluation.get("control_sweep_png"):
+            control_sweep_pngs.append(str(evaluation["control_sweep_png"]))
+
+    confusion_matrix, branch_breakdown = _build_branch_breakdown(rows)
 
     summary = {
         "ran": True,
@@ -89,12 +112,25 @@ def main() -> int:
         "num_examples_requested": int(args.num_examples),
         "num_examples_selected": len(selected_entries),
         "num_rows": len(rows),
+        "num_controlled_rows": sum(1 for row in rows if row.get("mode_bucket") != "no_control"),
+        "num_control_sweep_pngs": len(control_sweep_pngs),
+        "control_sweep_pngs": control_sweep_pngs,
         "requested_branch_match_rate": _fraction(sum(bool(row.get("requested_branch_match")) for row in rows if row.get("mode") != "no_control"), sum(1 for row in rows if row.get("mode") != "no_control")),
         "factual_ade_mean": _mean(row.get("ade_factual") for row in rows if row.get("mode") == "factual"),
         "factual_fde_mean": _mean(row.get("fde_factual") for row in rows if row.get("mode") == "factual"),
+        "artifacts": {
+            "path_control_eval_summary_json": str(summary_path),
+            "path_control_eval_per_example_jsonl": str(examples_path),
+            "path_control_eval_confusion_matrix_json": str(confusion_path),
+            "path_control_eval_branch_breakdown_json": str(breakdown_path),
+        },
     }
-    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-    examples_path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
+    _write_json(summary_path, summary)
+    _write_json(legacy_summary_path, summary)
+    _write_jsonl(examples_path, rows)
+    _write_jsonl(legacy_examples_path, rows)
+    _write_json(confusion_path, confusion_matrix)
+    _write_json(breakdown_path, branch_breakdown)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
@@ -154,7 +190,15 @@ def _load_model(*, config: Any, ckpt_path: str, load_mode: str):
     return model, load_report
 
 
-def _evaluate_entry(entry: Dict[str, Any], *, config: Any, model: Any, tokenizer: Any, outdir: Path) -> List[Dict[str, Any]]:
+def _evaluate_entry(
+    entry: Dict[str, Any],
+    *,
+    config: Any,
+    model: Any,
+    tokenizer: Any,
+    outdir: Path,
+    control_sweep_index: Optional[int] = None,
+) -> Dict[str, Any]:
     entry = _ensure_entry_debug_bundle(entry, outdir=outdir, config=config)
     raw_scenario = _load_raw_scenario(entry["scenario_pkl"])
     base_sample = preprocess_scenario_description(
@@ -237,7 +281,20 @@ def _evaluate_entry(entry: Dict[str, Any], *, config: Any, model: Any, tokenizer
     factual["ade_factual"] = factual_ade
     factual["fde_factual"] = factual_fde
 
-    return [_prune_row(row) for row in all_rows]
+    control_sweep_png = None
+    if control_sweep_index is not None:
+        control_sweep_png = outdir / f"control_sweep_{int(control_sweep_index):03d}.png"
+        _write_control_sweep_png(
+            entry=entry,
+            rows=all_rows,
+            branch_candidates=branch_candidates.get("branch_candidates", []),
+            output_path=control_sweep_png,
+        )
+
+    return {
+        "rows": [_prune_row(row, entry=entry, control_sweep_png=control_sweep_png) for row in all_rows],
+        "control_sweep_png": (str(control_sweep_png) if control_sweep_png is not None else None),
+    }
 
 
 def _run_variant(
@@ -414,13 +471,24 @@ def _non_target_displacement(pred: np.ndarray, base: np.ndarray) -> Tuple[float,
 
 
 def _ade_fde(pred: np.ndarray, pred_valid: np.ndarray, gt: np.ndarray, gt_valid: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
-    mask = np.asarray(pred_valid, dtype=bool) & np.asarray(gt_valid, dtype=bool)
+    pred = np.asarray(pred)
+    pred_valid = np.asarray(pred_valid, dtype=bool)
+    gt = np.asarray(gt)
+    gt_valid = np.asarray(gt_valid, dtype=bool)
+    length = min(int(pred.shape[0]), int(gt.shape[0]), int(pred_valid.shape[0]), int(gt_valid.shape[0]))
+    if length <= 0:
+        return None, None
+    pred = pred[:length]
+    pred_valid = pred_valid[:length]
+    gt = gt[:length]
+    gt_valid = gt_valid[:length]
+    mask = pred_valid & gt_valid
     if not bool(mask.any()):
         return None, None
-    errors = np.linalg.norm(np.asarray(pred)[mask] - np.asarray(gt)[mask], axis=-1)
+    errors = np.linalg.norm(pred[mask] - gt[mask], axis=-1)
     ade = float(np.mean(errors))
     final_idx = int(np.flatnonzero(mask)[-1])
-    fde = float(np.linalg.norm(np.asarray(pred)[final_idx] - np.asarray(gt)[final_idx]))
+    fde = float(np.linalg.norm(pred[final_idx] - gt[final_idx]))
     return ade, fde
 
 
@@ -558,12 +626,15 @@ def _mean(values: Iterable[Optional[float]]) -> Optional[float]:
     return float(np.mean(np.asarray(filtered, dtype=np.float32)))
 
 
-def _prune_row(row: Dict[str, Any]) -> Dict[str, Any]:
+def _prune_row(row: Dict[str, Any], *, entry: Dict[str, Any], control_sweep_png: Optional[Path]) -> Dict[str, Any]:
     return {
+        "example_id": str(entry.get("example_id", "")),
         "scenario_id": row["scenario_id"],
         "agent_id": row["agent_id"],
+        "light_id": str(row.get("light_id", entry.get("light_id", ""))),
         "decision_time_idx": row["decision_time_idx"],
         "mode": row["mode"],
+        "mode_bucket": _mode_bucket(str(row["mode"])),
         "predicted_branch_label": row["predicted_branch_label"],
         "requested_branch_label": row["requested_branch_label"],
         "requested_branch_match": row["requested_branch_match"],
@@ -575,7 +646,173 @@ def _prune_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "changed_from_no_control": row["changed_from_no_control"],
         "non_target_mean_displacement_vs_no_control": row["non_target_mean_displacement_vs_no_control"],
         "non_target_max_displacement_vs_no_control": row["non_target_max_displacement_vs_no_control"],
+        "control_sweep_png": (str(control_sweep_png) if control_sweep_png is not None else None),
     }
+
+
+def _mode_bucket(mode: str) -> str:
+    if mode == "no_control":
+        return "no_control"
+    if mode == "factual":
+        return "factual"
+    if mode.startswith("alternative_"):
+        return "alternative"
+    return str(mode)
+
+
+def _build_branch_breakdown(rows: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    requested_labels = ["left", "straight", "right"]
+    predicted_labels = ["left", "straight", "right", "none", "other"]
+    confusion_counts = {
+        requested_label: {predicted_label: 0 for predicted_label in predicted_labels}
+        for requested_label in requested_labels
+    }
+    breakdown: Dict[str, Dict[str, Any]] = {}
+
+    for label in requested_labels:
+        label_rows = [
+            row for row in rows
+            if row.get("mode_bucket") != "no_control" and str(row.get("requested_branch_label")) == label
+        ]
+        factual_rows = [row for row in label_rows if row.get("mode_bucket") == "factual"]
+        alternative_rows = [row for row in label_rows if row.get("mode_bucket") == "alternative"]
+        for row in label_rows:
+            predicted_label = _normalize_predicted_label(row.get("predicted_branch_label"))
+            confusion_counts[label][predicted_label] += 1
+        breakdown[label] = {
+            "num_rows": len(label_rows),
+            "num_matches": sum(bool(row.get("requested_branch_match")) for row in label_rows),
+            "match_rate": _fraction(
+                sum(bool(row.get("requested_branch_match")) for row in label_rows),
+                len(label_rows),
+            ),
+            "factual_rows": len(factual_rows),
+            "factual_match_rate": _fraction(
+                sum(bool(row.get("requested_branch_match")) for row in factual_rows),
+                len(factual_rows),
+            ),
+            "alternative_rows": len(alternative_rows),
+            "alternative_match_rate": _fraction(
+                sum(bool(row.get("requested_branch_match")) for row in alternative_rows),
+                len(alternative_rows),
+            ),
+            "mean_branch_score_margin": _mean(row.get("branch_score_margin") for row in label_rows),
+            "mean_final_pose_to_requested_anchor_m": _mean(
+                row.get("final_pose_to_requested_anchor_m") for row in label_rows
+            ),
+            "mean_final_heading_error_to_requested_anchor_rad": _mean(
+                row.get("final_heading_error_to_requested_anchor_rad") for row in label_rows
+            ),
+            "mean_non_target_mean_displacement_vs_no_control": _mean(
+                row.get("non_target_mean_displacement_vs_no_control") for row in label_rows
+            ),
+        }
+
+    confusion_matrix = {
+        "labels": requested_labels,
+        "predicted_labels": predicted_labels,
+        "matrix": confusion_counts,
+    }
+    branch_breakdown = {
+        "requested_labels": requested_labels,
+        "breakdown_by_requested_class": breakdown,
+    }
+    return confusion_matrix, branch_breakdown
+
+
+def _normalize_predicted_label(value: Any) -> str:
+    if value is None:
+        return "none"
+    label = str(value)
+    if label in {"left", "straight", "right"}:
+        return label
+    if not label or label.lower() == "none":
+        return "none"
+    return "other"
+
+
+def _write_control_sweep_png(
+    *,
+    entry: Dict[str, Any],
+    rows: Sequence[Dict[str, Any]],
+    branch_candidates: Sequence[Dict[str, Any]],
+    output_path: Path,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    fig, ax = plt.subplots(figsize=(7.5, 7.5))
+    branch_colors = {"left": "#d55e00", "straight": "#0072b2", "right": "#009e73", "u_turn": "#cc79a7"}
+    mode_colors = {
+        "no_control": "#444444",
+        "factual": "#e69f00",
+        "alternative": "#56b4e9",
+    }
+
+    for candidate in branch_candidates:
+        polyline = np.asarray(candidate.get("polyline_xy", []), dtype=np.float32)
+        if polyline.ndim == 2 and polyline.shape[0] >= 2 and polyline.shape[1] >= 2:
+            color = branch_colors.get(str(candidate.get("branch_label")), "#bbbbbb")
+            ax.plot(polyline[:, 0], polyline[:, 1], linestyle="--", linewidth=1.25, color=color, alpha=0.35)
+
+    gt_drawn = False
+    for row in rows:
+        mode_bucket = _mode_bucket(str(row.get("mode")))
+        positions = np.asarray(row.get("target_positions", []), dtype=np.float32)
+        valid_mask = np.asarray(row.get("target_valid_mask", []), dtype=bool)
+        if positions.ndim != 2 or positions.shape[0] == 0:
+            continue
+        if valid_mask.shape[0] == positions.shape[0] and bool(valid_mask.any()):
+            positions = positions[valid_mask]
+        color = mode_colors.get(mode_bucket, "#666666")
+        label = str(row.get("mode"))
+        requested_branch = row.get("requested_branch_label")
+        if requested_branch is not None:
+            label = f"{label}:{requested_branch}"
+        ax.plot(positions[:, 0], positions[:, 1], linewidth=2.2, color=color, label=label)
+        ax.scatter([positions[0, 0]], [positions[0, 1]], color=color, s=16, alpha=0.8)
+        ax.scatter([positions[-1, 0]], [positions[-1, 1]], color=color, s=28, alpha=0.95, marker="o")
+
+        if not gt_drawn:
+            gt_positions = np.asarray(row.get("gt_target_positions", []), dtype=np.float32)
+            gt_valid_mask = np.asarray(row.get("gt_target_valid_mask", []), dtype=bool)
+            if gt_positions.ndim == 2 and gt_positions.shape[0] > 0:
+                if gt_valid_mask.shape[0] == gt_positions.shape[0] and bool(gt_valid_mask.any()):
+                    gt_positions = gt_positions[gt_valid_mask]
+                ax.plot(gt_positions[:, 0], gt_positions[:, 1], linewidth=2.0, color="#111111", linestyle=":", label="ground_truth")
+                gt_drawn = True
+
+    title = (
+        f"{entry.get('scenario_id', '')} | agent {entry.get('agent_id', '')} | "
+        f"t={entry.get('decision_time_idx', '')}"
+    )
+    ax.set_title(title)
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.grid(alpha=0.25)
+    ax.set_aspect("equal", adjustable="box")
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        dedup = {}
+        for handle, label in zip(handles, labels):
+            dedup.setdefault(label, handle)
+        ax.legend(dedup.values(), dedup.keys(), fontsize=8, loc="best")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
 
 
 if __name__ == "__main__":

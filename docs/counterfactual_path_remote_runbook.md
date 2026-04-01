@@ -168,6 +168,8 @@ python "$REPO_ROOT/src/Adv-BMT/bmt/train_motion.py" \
 Expected output files:
 - `$OUTDIR/lightning_logs/.../last.ckpt`
 - `$OUTDIR/lightning_logs/.../config.yaml`
+- `$OUTDIR/path_control_train_summary.json`
+- `$OUTDIR/path_control_train_metrics.json`
 
 How to resume/restart:
 - Keep train and val indexes fixed for a given run.
@@ -182,6 +184,8 @@ Common failure modes:
 
 What artifacts to inspect first:
 - saved `config.yaml`
+- `path_control_train_summary.json`
+- `path_control_train_metrics.json`
 - path-head and anchor-loss curves
 - batch-level control availability on the curated train split
 
@@ -211,8 +215,11 @@ bash "$REPO_ROOT/scripts/remote/run_pr6_eval_path_control.sh"
 ```
 
 Expected output files:
-- `$OUTDIR/eval_smoke_summary.json`
-- `$OUTDIR/eval_smoke_examples.jsonl`
+- `$OUTDIR/path_control_eval_summary.json`
+- `$OUTDIR/path_control_eval_per_example.jsonl`
+- `$OUTDIR/path_control_eval_confusion_matrix.json`
+- `$OUTDIR/path_control_eval_branch_breakdown.json`
+- `$OUTDIR/control_sweep_*.png`
 - `$OUTDIR/materialized_eval_inputs/...` for lazily materialized debug inputs when needed
 
 How to resume/restart:
@@ -226,8 +233,10 @@ Common failure modes:
 - Checkpoint warm-start reporting expected missing path-control keys from an older forward-only checkpoint.
 
 What artifacts to inspect first:
-- `eval_smoke_summary.json`
-- a handful of rows from `eval_smoke_examples.jsonl`
+- `path_control_eval_summary.json`
+- `path_control_eval_confusion_matrix.json`
+- `path_control_eval_branch_breakdown.json`
+- a handful of rows from `path_control_eval_per_example.jsonl`
 
 ## Remote post-train runtime probe
 Prerequisites:
@@ -257,6 +266,7 @@ Expected output files:
 - `$OUTDIR/forward_control_runtime.json`
 - `$OUTDIR/selected_control.json`
 - `$OUTDIR/control_pos_mask.npy`
+- `$OUTDIR/posttrain_probe_summary.json`
 
 How to resume/restart:
 - Reuse `OUTDIR` only if overwriting is acceptable.
@@ -268,6 +278,7 @@ Common failure modes:
 - Checkpoint config mismatch; use `CKPT_LOAD_MODE=forgiving_state_dict` for forward-only warm-start compatibility.
 
 What artifacts to inspect first:
+- `posttrain_probe_summary.json`
 - `forward_control_runtime.json`
 - `batch_control_summary.json`
 
