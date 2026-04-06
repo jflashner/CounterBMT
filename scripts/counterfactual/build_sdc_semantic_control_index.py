@@ -193,6 +193,42 @@ def _default_extent_by_track_type(track_type: str) -> tuple[float, float, float]
     return (4.5, 1.8, 1.5)
 
 
+def _normalize_traffic_light_state(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        state_id = int(value)
+    except Exception:
+        return str(value)
+    mapping = {
+        -1: "LANE_STATE_UNKNOWN",
+        0: "LANE_STATE_UNKNOWN",
+        1: "LANE_STATE_ARROW_STOP",
+        2: "LANE_STATE_ARROW_CAUTION",
+        3: "LANE_STATE_ARROW_GO",
+        4: "LANE_STATE_STOP",
+        5: "LANE_STATE_CAUTION",
+        6: "LANE_STATE_GO",
+        7: "LANE_STATE_FLASHING_STOP",
+        8: "LANE_STATE_FLASHING_CAUTION",
+    }
+    return mapping.get(state_id, "LANE_STATE_UNKNOWN")
+
+
+def _normalize_traffic_light_state_array(value: Any) -> np.ndarray:
+    if value is None:
+        return np.zeros((0,), dtype=object)
+    if isinstance(value, np.ndarray):
+        items = value.reshape(-1).tolist()
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+    return np.asarray([_normalize_traffic_light_state(item) for item in items], dtype=object)
+
+
 def _coerce_training_scenario_arrays(raw_scenario: Mapping[str, Any]) -> Dict[str, Any]:
     raw = dict(raw_scenario)
 
@@ -238,11 +274,12 @@ def _coerce_training_scenario_arrays(raw_scenario: Mapping[str, Any]) -> Dict[st
     dynamic_map_states_out: Dict[str, Any] = {}
     for light_id, light in dict(raw.get("dynamic_map_states", {}) or {}).items():
         light_dict = dict(light)
+        light_dict["type"] = light_dict.get("type") or "TRAFFIC_LIGHT"
         if "stop_point" in light_dict:
             light_dict["stop_point"] = np.asarray(light_dict["stop_point"], dtype=np.float32)
         state = dict(light_dict.get("state", {}) or {})
         if "object_state" in state:
-            state["object_state"] = np.asarray(state["object_state"])
+            state["object_state"] = _normalize_traffic_light_state_array(state["object_state"])
         light_dict["state"] = state
         dynamic_map_states_out[str(light_id)] = light_dict
     raw["dynamic_map_states"] = dynamic_map_states_out

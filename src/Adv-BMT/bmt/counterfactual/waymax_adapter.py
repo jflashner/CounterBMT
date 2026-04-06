@@ -155,6 +155,30 @@ def _default_extent_by_object_type(type_name: str) -> tuple[float, float, float]
     return (4.5, 1.8, 1.5)
 
 
+def _normalize_waymax_traffic_light_state(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        state_id = int(value)
+    except Exception:
+        return str(value)
+    mapping = {
+        -1: "LANE_STATE_UNKNOWN",
+        0: "LANE_STATE_UNKNOWN",
+        1: "LANE_STATE_ARROW_STOP",
+        2: "LANE_STATE_ARROW_CAUTION",
+        3: "LANE_STATE_ARROW_GO",
+        4: "LANE_STATE_STOP",
+        5: "LANE_STATE_CAUTION",
+        6: "LANE_STATE_GO",
+        7: "LANE_STATE_FLASHING_STOP",
+        8: "LANE_STATE_FLASHING_CAUTION",
+    }
+    return mapping.get(state_id, "LANE_STATE_UNKNOWN")
+
+
 def _extract_scenario_id(source: Any, *, fallback: str) -> str:
     for key in ("scenario_id", "id", "scenario/name", "scenario/id"):
         value = _get_any(source, (key,), default=None)
@@ -275,10 +299,14 @@ def _extract_dynamic_map_states(state: Any, *, horizon: int) -> Dict[str, Any]:
         if valid_rows.size > 0:
             stop_xyz = np.asarray(coords[int(valid_rows[0])], dtype=np.float32)
         rows[light_id] = {
+            "type": "TRAFFIC_LIGHT",
             "lane": None if index >= lane_ids.shape[0] or int(lane_ids[index]) < 0 else str(int(lane_ids[index])),
             "stop_point": stop_xyz.astype(np.float32).tolist(),
             "state": {
-                "object_state": state_arr[index, : min(state_arr.shape[1], horizon)].astype(np.int64).tolist(),
+                "object_state": [
+                    _normalize_waymax_traffic_light_state(item)
+                    for item in state_arr[index, : min(state_arr.shape[1], horizon)].reshape(-1).tolist()
+                ],
             },
             "metadata": {
                 "raw_light_id": int(ids[index]),

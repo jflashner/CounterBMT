@@ -372,6 +372,30 @@ def _coerce_valid_mask(value: Any, *, length: int, fallback_xy: np.ndarray) -> n
     return np.isfinite(fallback_xy).all(axis=-1)
 
 
+def _normalize_traffic_light_state(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        state_id = int(value)
+    except Exception:
+        return str(value)
+    mapping = {
+        -1: "LANE_STATE_UNKNOWN",
+        0: "LANE_STATE_UNKNOWN",
+        1: "LANE_STATE_ARROW_STOP",
+        2: "LANE_STATE_ARROW_CAUTION",
+        3: "LANE_STATE_ARROW_GO",
+        4: "LANE_STATE_STOP",
+        5: "LANE_STATE_CAUTION",
+        6: "LANE_STATE_GO",
+        7: "LANE_STATE_FLASHING_STOP",
+        8: "LANE_STATE_FLASHING_CAUTION",
+    }
+    return mapping.get(state_id, "LANE_STATE_UNKNOWN")
+
+
 def _coerce_traffic_light_states(value: Any, *, length: int) -> tuple[Optional[str], ...]:
     out: list[Optional[str]] = [None] * max(length, 0)
     if length <= 0 or value is None:
@@ -387,12 +411,7 @@ def _coerce_traffic_light_states(value: Any, *, length: int) -> tuple[Optional[s
     for idx, item in enumerate(items):
         if idx >= length:
             break
-        if item is None:
-            out[idx] = None
-        elif isinstance(item, str):
-            out[idx] = item
-        else:
-            out[idx] = str(item)
+        out[idx] = _normalize_traffic_light_state(item)
     return tuple(out)
 
 

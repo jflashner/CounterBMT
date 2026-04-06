@@ -26,6 +26,42 @@ def _default_agent_extent(track_type):
     return (4.5, 1.8, 1.5)
 
 
+def _normalize_traffic_light_state(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        state_id = int(value)
+    except Exception:
+        return str(value)
+    mapping = {
+        -1: "LANE_STATE_UNKNOWN",
+        0: "LANE_STATE_UNKNOWN",
+        1: "LANE_STATE_ARROW_STOP",
+        2: "LANE_STATE_ARROW_CAUTION",
+        3: "LANE_STATE_ARROW_GO",
+        4: "LANE_STATE_STOP",
+        5: "LANE_STATE_CAUTION",
+        6: "LANE_STATE_GO",
+        7: "LANE_STATE_FLASHING_STOP",
+        8: "LANE_STATE_FLASHING_CAUTION",
+    }
+    return mapping.get(state_id, "LANE_STATE_UNKNOWN")
+
+
+def _normalize_traffic_light_state_array(value):
+    if value is None:
+        return np.zeros((0,), dtype=object)
+    if isinstance(value, np.ndarray):
+        items = value.reshape(-1).tolist()
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+    return np.asarray([_normalize_traffic_light_state(item) for item in items], dtype=object)
+
+
 def _coerce_scenario_arrays_for_motionlm(scenario):
     tracks = scenario.get(SD.TRACKS, {})
     if isinstance(tracks, dict):
@@ -72,12 +108,16 @@ def _coerce_scenario_arrays_for_motionlm(scenario):
         for traffic_light in dynamic_map_states.values():
             if not isinstance(traffic_light, dict):
                 continue
+            traffic_light["type"] = traffic_light.get("type") or MetaDriveType.TRAFFIC_LIGHT
             if "stop_point" in traffic_light:
                 traffic_light["stop_point"] = np.asarray(traffic_light["stop_point"], dtype=np.float32)
             state = traffic_light.get("state", {})
             if isinstance(state, dict):
                 for key, value in list(state.items()):
-                    state[key] = np.asarray(value)
+                    if key == "object_state":
+                        state[key] = _normalize_traffic_light_state_array(value)
+                    else:
+                        state[key] = np.asarray(value)
     return scenario
 
 
