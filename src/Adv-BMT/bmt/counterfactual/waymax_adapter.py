@@ -146,6 +146,15 @@ def _object_type_name(type_id: Any) -> str:
         return "UNKNOWN"
 
 
+def _default_extent_by_object_type(type_name: str) -> tuple[float, float, float]:
+    object_type = str(type_name).upper()
+    if object_type == "PEDESTRIAN":
+        return (0.8, 0.8, 1.7)
+    if object_type == "CYCLIST":
+        return (1.8, 0.6, 1.5)
+    return (4.5, 1.8, 1.5)
+
+
 def _extract_scenario_id(source: Any, *, fallback: str) -> str:
     for key in ("scenario_id", "id", "scenario/name", "scenario/id"):
         value = _get_any(source, (key,), default=None)
@@ -183,6 +192,18 @@ def _extract_track_dict(state: Any, *, fallback_scenario_id: str) -> tuple[Dict[
     yaw = _align_object_time(_to_numpy(_get_any(trajectory, ("yaw", "heading"), default=np.zeros_like(x)), dtype=np.float32), num_objects=x.shape[0])
     vel_x = _align_object_time(_to_numpy(_get_any(trajectory, ("vel_x", "velocity_x"), default=np.zeros_like(x)), dtype=np.float32), num_objects=x.shape[0])
     vel_y = _align_object_time(_to_numpy(_get_any(trajectory, ("vel_y", "velocity_y"), default=np.zeros_like(x)), dtype=np.float32), num_objects=x.shape[0])
+    length = _align_object_time(
+        _to_numpy(_get_any(trajectory, ("length", "lengths"), default=np.zeros_like(x)), dtype=np.float32),
+        num_objects=x.shape[0],
+    )
+    width = _align_object_time(
+        _to_numpy(_get_any(trajectory, ("width", "widths"), default=np.zeros_like(x)), dtype=np.float32),
+        num_objects=x.shape[0],
+    )
+    height = _align_object_time(
+        _to_numpy(_get_any(trajectory, ("height", "heights"), default=np.zeros_like(x)), dtype=np.float32),
+        num_objects=x.shape[0],
+    )
     valid = _align_object_time(_to_numpy(_get_any(trajectory, ("valid",), default=np.ones_like(x, dtype=bool)), dtype=bool), num_objects=x.shape[0])
 
     ids = _to_numpy(_get_any(metadata, ("ids", "id"), default=np.arange(x.shape[0])), dtype=np.int64).reshape(-1)
@@ -197,13 +218,27 @@ def _extract_track_dict(state: Any, *, fallback_scenario_id: str) -> tuple[Dict[
 
     for index in range(int(ids.shape[0])):
         track_id = str(ids[index])
+        type_name = _object_type_name(object_types[index] if index < object_types.shape[0] else 0)
+        default_length, default_width, default_height = _default_extent_by_object_type(type_name)
+        track_length = np.asarray(length[index], dtype=np.float32).reshape(-1)
+        track_width = np.asarray(width[index], dtype=np.float32).reshape(-1)
+        track_height = np.asarray(height[index], dtype=np.float32).reshape(-1)
+        if track_length.size == 0 or not np.any(np.isfinite(track_length)) or float(np.nanmax(np.abs(track_length))) <= 1e-6:
+            track_length = np.full((x.shape[1],), float(default_length), dtype=np.float32)
+        if track_width.size == 0 or not np.any(np.isfinite(track_width)) or float(np.nanmax(np.abs(track_width))) <= 1e-6:
+            track_width = np.full((x.shape[1],), float(default_width), dtype=np.float32)
+        if track_height.size == 0 or not np.any(np.isfinite(track_height)) or float(np.nanmax(np.abs(track_height))) <= 1e-6:
+            track_height = np.full((x.shape[1],), float(default_height), dtype=np.float32)
         tracks[track_id] = {
-            "type": _object_type_name(object_types[index] if index < object_types.shape[0] else 0),
+            "type": type_name,
             "state": {
                 "position": np.stack([x[index], y[index], z[index]], axis=-1).astype(np.float32).tolist(),
                 "heading": yaw[index].astype(np.float32).tolist(),
                 "velocity": np.stack([vel_x[index], vel_y[index]], axis=-1).astype(np.float32).tolist(),
                 "valid": valid[index].astype(bool).tolist(),
+                "length": track_length.astype(np.float32).tolist(),
+                "width": track_width.astype(np.float32).tolist(),
+                "height": track_height.astype(np.float32).tolist(),
             },
             "metadata": {
                 "raw_object_type_id": int(object_types[index]) if index < object_types.shape[0] else 0,

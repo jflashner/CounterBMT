@@ -18,6 +18,69 @@ logger = logging.getLogger(__file__)
 extract_data_by_agent_indices = utils.extract_data_by_agent_indices
 
 
+def _default_agent_extent(track_type):
+    if MetaDriveType.is_pedestrian(track_type):
+        return (0.8, 0.8, 1.7)
+    if MetaDriveType.is_cyclist(track_type):
+        return (1.8, 0.6, 1.5)
+    return (4.5, 1.8, 1.5)
+
+
+def _coerce_scenario_arrays_for_motionlm(scenario):
+    tracks = scenario.get(SD.TRACKS, {})
+    if isinstance(tracks, dict):
+        for track in tracks.values():
+            if not isinstance(track, dict):
+                continue
+            state = track.get(SD.STATE, {})
+            if not isinstance(state, dict):
+                continue
+            position = np.asarray(state.get("position", []), dtype=np.float32)
+            heading = np.asarray(state.get("heading", []), dtype=np.float32).reshape(-1)
+            velocity = np.asarray(state.get("velocity", []), dtype=np.float32)
+            valid = np.asarray(state.get("valid", []), dtype=bool).reshape(-1)
+            num_steps = int(position.shape[0]) if position.ndim >= 1 else int(heading.shape[0])
+            default_length, default_width, default_height = _default_agent_extent(track.get("type"))
+            length = np.asarray(state.get("length", np.full((num_steps,), default_length, dtype=np.float32)), dtype=np.float32).reshape(-1)
+            width = np.asarray(state.get("width", np.full((num_steps,), default_width, dtype=np.float32)), dtype=np.float32).reshape(-1)
+            height = np.asarray(state.get("height", np.full((num_steps,), default_height, dtype=np.float32)), dtype=np.float32).reshape(-1)
+            if length.size == 0:
+                length = np.full((num_steps,), default_length, dtype=np.float32)
+            if width.size == 0:
+                width = np.full((num_steps,), default_width, dtype=np.float32)
+            if height.size == 0:
+                height = np.full((num_steps,), default_height, dtype=np.float32)
+            state["position"] = position.astype(np.float32)
+            state["heading"] = heading.astype(np.float32)
+            state["velocity"] = velocity.astype(np.float32)
+            state["valid"] = valid.astype(bool)
+            state["length"] = length.astype(np.float32)
+            state["width"] = width.astype(np.float32)
+            state["height"] = height.astype(np.float32)
+
+    map_feature = scenario.get(SD.MAP_FEATURES, {})
+    if isinstance(map_feature, dict):
+        for feat in map_feature.values():
+            if not isinstance(feat, dict):
+                continue
+            for key in ("polyline", "position", "polygon", "location"):
+                if key in feat:
+                    feat[key] = np.asarray(feat[key], dtype=np.float32)
+
+    dynamic_map_states = scenario.get(SD.DYNAMIC_MAP_STATES, {})
+    if isinstance(dynamic_map_states, dict):
+        for traffic_light in dynamic_map_states.values():
+            if not isinstance(traffic_light, dict):
+                continue
+            if "stop_point" in traffic_light:
+                traffic_light["stop_point"] = np.asarray(traffic_light["stop_point"], dtype=np.float32)
+            state = traffic_light.get("state", {})
+            if isinstance(state, dict):
+                for key, value in list(state.items()):
+                    state[key] = np.asarray(value)
+    return scenario
+
+
 def centralize_to_map_center(position_array, map_center, map_heading):
     """
     Centralize the position array to the map center and rotate the position array to the map heading.
@@ -59,6 +122,11 @@ def extract_map_center_heading_locations(map_feature):
             locations = map_feat["polygon"]
         else:
             raise ValueError("Unknown map feature: {}, {}".format(map_feat_id, map_feat.keys()))
+        locations = np.asarray(locations, dtype=np.float32)
+        if locations.size == 0:
+            continue
+        if locations.ndim == 1:
+            locations = locations.reshape(1, -1)
         locations = locations.reshape(-1, locations.shape[-1])
         map_feat["location"] = locations
         max_boundary = locations.max(axis=0)
@@ -919,6 +987,7 @@ def preprocess_scenario_description_for_motionlm(
     scenario, config, in_evaluation, keep_all_data=False, backward_prediction=None, tokenizer=None
 ):
     original_SD = copy.deepcopy(scenario)
+    scenario = _coerce_scenario_arrays_for_motionlm(scenario)
 
     backward_prediction = config.eval_backward_model or backward_prediction  # for eval backward model
     metadata = scenario[SD.METADATA]

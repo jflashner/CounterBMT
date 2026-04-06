@@ -184,8 +184,83 @@ def _build_dataset_summary_entry(raw_scenario: Mapping[str, Any], *, scenario_pk
     }
 
 
-def _augment_raw_scenario_for_training(raw_scenario: Mapping[str, Any]) -> Dict[str, Any]:
+def _default_extent_by_track_type(track_type: str) -> tuple[float, float, float]:
+    track_type_name = str(track_type).upper()
+    if track_type_name == "PEDESTRIAN":
+        return (0.8, 0.8, 1.7)
+    if track_type_name == "CYCLIST":
+        return (1.8, 0.6, 1.5)
+    return (4.5, 1.8, 1.5)
+
+
+def _coerce_training_scenario_arrays(raw_scenario: Mapping[str, Any]) -> Dict[str, Any]:
     raw = dict(raw_scenario)
+
+    tracks_out: Dict[str, Any] = {}
+    for track_id, track in dict(raw.get("tracks", {}) or {}).items():
+        track_dict = dict(track)
+        state = dict(track_dict.get("state", {}) or {})
+        position = np.asarray(state.get("position", []), dtype=np.float32)
+        heading = np.asarray(state.get("heading", []), dtype=np.float32).reshape(-1)
+        velocity = np.asarray(state.get("velocity", []), dtype=np.float32)
+        valid = np.asarray(state.get("valid", []), dtype=bool).reshape(-1)
+        num_steps = int(position.shape[0]) if position.ndim >= 1 else int(heading.shape[0])
+        default_length, default_width, default_height = _default_extent_by_track_type(str(track_dict.get("type") or "VEHICLE"))
+        length = np.asarray(state.get("length", np.full((num_steps,), default_length, dtype=np.float32)), dtype=np.float32).reshape(-1)
+        width = np.asarray(state.get("width", np.full((num_steps,), default_width, dtype=np.float32)), dtype=np.float32).reshape(-1)
+        height = np.asarray(state.get("height", np.full((num_steps,), default_height, dtype=np.float32)), dtype=np.float32).reshape(-1)
+        if length.size == 0:
+            length = np.full((num_steps,), default_length, dtype=np.float32)
+        if width.size == 0:
+            width = np.full((num_steps,), default_width, dtype=np.float32)
+        if height.size == 0:
+            height = np.full((num_steps,), default_height, dtype=np.float32)
+        state["position"] = position.astype(np.float32)
+        state["heading"] = heading.astype(np.float32)
+        state["velocity"] = velocity.astype(np.float32)
+        state["valid"] = valid.astype(bool)
+        state["length"] = length.astype(np.float32)
+        state["width"] = width.astype(np.float32)
+        state["height"] = height.astype(np.float32)
+        track_dict["state"] = state
+        tracks_out[str(track_id)] = track_dict
+    raw["tracks"] = tracks_out
+
+    map_features_out: Dict[str, Any] = {}
+    for feature_id, feature in dict(raw.get("map_features", {}) or {}).items():
+        feature_dict = dict(feature)
+        for key in ("polyline", "position", "polygon", "location"):
+            if key in feature_dict:
+                feature_dict[key] = np.asarray(feature_dict[key], dtype=np.float32)
+        map_features_out[str(feature_id)] = feature_dict
+    raw["map_features"] = map_features_out
+
+    dynamic_map_states_out: Dict[str, Any] = {}
+    for light_id, light in dict(raw.get("dynamic_map_states", {}) or {}).items():
+        light_dict = dict(light)
+        if "stop_point" in light_dict:
+            light_dict["stop_point"] = np.asarray(light_dict["stop_point"], dtype=np.float32)
+        state = dict(light_dict.get("state", {}) or {})
+        if "object_state" in state:
+            state["object_state"] = np.asarray(state["object_state"])
+        light_dict["state"] = state
+        dynamic_map_states_out[str(light_id)] = light_dict
+    raw["dynamic_map_states"] = dynamic_map_states_out
+
+    sdc_paths_out: Dict[str, Any] = {}
+    for path_id, path in dict(raw.get("sdc_paths", {}) or {}).items():
+        path_dict = dict(path)
+        if "polyline_xyz" in path_dict:
+            path_dict["polyline_xyz"] = np.asarray(path_dict["polyline_xyz"], dtype=np.float32)
+        if "valid" in path_dict:
+            path_dict["valid"] = np.asarray(path_dict["valid"], dtype=bool)
+        sdc_paths_out[str(path_id)] = path_dict
+    raw["sdc_paths"] = sdc_paths_out
+    return raw
+
+
+def _augment_raw_scenario_for_training(raw_scenario: Mapping[str, Any]) -> Dict[str, Any]:
+    raw = _coerce_training_scenario_arrays(raw_scenario)
     metadata = dict(raw.get("metadata", {}) or {})
     tracks = dict(raw.get("tracks", {}) or {})
     track_ids = [str(track_id) for track_id in tracks.keys()]
