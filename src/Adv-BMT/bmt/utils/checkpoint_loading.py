@@ -15,12 +15,18 @@ EXPECTED_NEW_PATH_CONTROL_PREFIXES = (
     "compliance_head.",
     "timing_head.",
     "anchor_head.",
+    "sdc_semantic_head.",
     "model.motion_decoder.cf_path_proj.",
     "model.motion_decoder.cf_compliance_proj.",
     "model.motion_decoder.cf_timing_proj.",
     "model.motion_decoder.cf_anchor_proj.",
     "model.motion_decoder.cf_local_bias.",
     "model.motion_decoder.cf_local_residual_gate",
+    "model.motion_decoder.cf_sdc_semantic_embed.",
+    "model.motion_decoder.cf_sdc_waypoint_proj.",
+    "model.motion_decoder.cf_sdc_waypoint_summary.",
+    "model.motion_decoder.cf_sdc_local_bias.",
+    "model.motion_decoder.cf_sdc_local_residual_gate",
 )
 
 
@@ -85,6 +91,10 @@ def _is_expected_new_path_control_key(key: str) -> bool:
     return False
 
 
+def _is_policy_teacher_key(key: str) -> bool:
+    return str(key).startswith("policy_teacher.")
+
+
 def _parameter_owner_from_key(key: str) -> str:
     if "." not in key:
         return key
@@ -97,6 +107,8 @@ def _module_bucket_for_summary(key: str) -> str:
         return "path_head"
     if text.startswith("anchor_head."):
         return "anchor_head"
+    if text.startswith("sdc_semantic_head."):
+        return "sdc_semantic_head"
     if text.startswith("compliance_head."):
         return "compliance_head"
     if text.startswith("timing_head."):
@@ -177,7 +189,12 @@ def load_model_from_checkpoint_forgiving(
 
     missing_keys = [str(key) for key in model_state.keys() if key not in loaded_state]
     expected_new_path_control_keys_missing = sorted(key for key in missing_keys if _is_expected_new_path_control_key(key))
-    unexpected_missing_keys = sorted(key for key in missing_keys if key not in expected_new_path_control_keys_missing)
+    expected_policy_teacher_keys_missing = sorted(key for key in missing_keys if _is_policy_teacher_key(key))
+    unexpected_missing_keys = sorted(
+        key
+        for key in missing_keys
+        if key not in expected_new_path_control_keys_missing and key not in expected_policy_teacher_keys_missing
+    )
 
     if strict_state_dict or load_mode == "strict_state_dict":
         if missing_keys or unexpected_keys or shape_mismatch_keys:
@@ -194,6 +211,7 @@ def load_model_from_checkpoint_forgiving(
                 "first_50_unexpected_keys": sorted(unexpected_keys)[:50],
                 "first_50_shape_mismatch_keys": sorted(shape_mismatch_keys)[:50],
                 "expected_new_path_control_keys_missing": expected_new_path_control_keys_missing,
+                "expected_policy_teacher_keys_missing": expected_policy_teacher_keys_missing,
                 "unexpected_missing_keys": unexpected_missing_keys,
                 "strict_state_dict_used": True,
                 "loaded_module_prefix_counts": _bucket_module_counts(loaded_state.keys()),
@@ -201,6 +219,7 @@ def load_model_from_checkpoint_forgiving(
                 "unexpected_module_prefix_counts": _bucket_module_counts(unexpected_keys),
                 "shape_mismatch_module_prefix_counts": _bucket_module_counts(shape_mismatch_keys),
                 "expected_new_path_control_prefix_counts": _bucket_module_counts(expected_new_path_control_keys_missing),
+                "expected_policy_teacher_prefix_counts": _bucket_module_counts(expected_policy_teacher_keys_missing),
             }
             raise RuntimeError(
                 "Strict checkpoint load failed: "
@@ -211,6 +230,10 @@ def load_model_from_checkpoint_forgiving(
         model.load_state_dict(loaded_state, strict=True)
     else:
         model.load_state_dict(loaded_state, strict=False)
+
+    policy_teacher_sync_report = None
+    if hasattr(model, "sync_policy_teacher_from_student"):
+        policy_teacher_sync_report = model.sync_policy_teacher_from_student()
 
     load_report = {
         "ckpt_path": str(resolved_ckpt),
@@ -225,6 +248,7 @@ def load_model_from_checkpoint_forgiving(
         "first_50_unexpected_keys": sorted(unexpected_keys)[:50],
         "first_50_shape_mismatch_keys": sorted(shape_mismatch_keys)[:50],
         "expected_new_path_control_keys_missing": expected_new_path_control_keys_missing,
+        "expected_policy_teacher_keys_missing": expected_policy_teacher_keys_missing,
         "unexpected_missing_keys": unexpected_missing_keys,
         "strict_state_dict_used": bool(strict_state_dict or load_mode == "strict_state_dict"),
         "loaded_module_prefix_counts": _bucket_module_counts(loaded_state.keys()),
@@ -232,6 +256,8 @@ def load_model_from_checkpoint_forgiving(
         "unexpected_module_prefix_counts": _bucket_module_counts(unexpected_keys),
         "shape_mismatch_module_prefix_counts": _bucket_module_counts(shape_mismatch_keys),
         "expected_new_path_control_prefix_counts": _bucket_module_counts(expected_new_path_control_keys_missing),
+        "expected_policy_teacher_prefix_counts": _bucket_module_counts(expected_policy_teacher_keys_missing),
+        "policy_teacher_sync_report": policy_teacher_sync_report,
     }
     return model, load_report
 

@@ -8,6 +8,7 @@ from bmt.counterfactual.compile_control_code import (
     TERMINAL_ANCHOR_DIM,
     TIMING_TOKEN_DIM,
 )
+from bmt.counterfactual.sdc_path_control import SDC_PATH_SEMANTIC_LABEL_ORDER
 from bmt.dataset import constants
 from bmt.dataset.preprocess_action_label import SafetyAction
 from bmt.models import relation
@@ -199,6 +200,23 @@ class MotionDecoderGPT(nn.Module):
                 nn.Linear(d_model, d_model),
             )
             self.cf_local_residual_gate = nn.Parameter(torch.full((d_model,), float(maneuver_gate_init_bias)))
+            self.cf_sdc_semantic_embed = nn.Embedding(len(SDC_PATH_SEMANTIC_LABEL_ORDER), d_model)
+            self.cf_sdc_waypoint_proj = nn.Sequential(
+                nn.Linear(5, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+            self.cf_sdc_waypoint_summary = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+            self.cf_sdc_local_bias = nn.Sequential(
+                nn.Linear(2 * d_model + 2, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+            self.cf_sdc_local_residual_gate = nn.Parameter(torch.full((d_model,), float(maneuver_gate_init_bias)))
             self.cf_null_dropout_prob = float(self.config.MODEL.get("LOCAL_CONTROL_NULL_DROPOUT_PROB", 0.2))
 
         tokenizer = get_tokenizer(self.config)
@@ -257,6 +275,41 @@ class MotionDecoderGPT(nn.Module):
     def _maybe_build_local_control(self, input_dict, *, device, dtype, batch_size, horizon, num_agents):
         if not self.local_control_forward_enabled:
             return None
+        sdc_semantic_required = (
+            "cf/sdc_semantic_label_id",
+            "cf/sdc_semantic_confidence",
+            "cf/sdc_family_path_polylines_world",
+            "cf/sdc_family_path_mask",
+            "cf/time_window_mask",
+            "cf/decision_agent_mask",
+        )
+        if all(key in input_dict for key in sdc_semantic_required):
+            return self._build_sdc_semantic_only_local_control(
+                input_dict,
+                device=device,
+                dtype=dtype,
+                batch_size=batch_size,
+                horizon=horizon,
+                num_agents=num_agents,
+            )
+        sdc_required = (
+            "cf/sdc_semantic_label_id",
+            "cf/sdc_semantic_confidence",
+            "cf/sdc_path_waypoints",
+            "cf/sdc_path_waypoint_mask",
+            "cf/sdc_path_separability",
+            "cf/time_window_mask",
+            "cf/decision_agent_mask",
+        )
+        if all(key in input_dict for key in sdc_required):
+            return self._build_sdc_path_local_control(
+                input_dict,
+                device=device,
+                dtype=dtype,
+                batch_size=batch_size,
+                horizon=horizon,
+                num_agents=num_agents,
+            )
         required = (
             "cf/path_token",
             "cf/compliance_token",
@@ -354,6 +407,174 @@ class MotionDecoderGPT(nn.Module):
             "supervision_pos_mask": supervision_pos_mask,
             "local_bias": local_bias,
             "available_mask": available_mask,
+            "use_decoder_maneuver": self.local_control_forward_mode == "interactive",
+            "control_kind": "legacy_path",
+        }
+
+    def _build_sdc_semantic_only_local_control(self, input_dict, *, device, dtype, batch_size, horizon, num_agents):
+        def _to_tensor(name, *, as_long=False):
+            value = input_dict[name]
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value, device=device)
+            value = value.to(device=device)
+            if as_long:
+                return value.long()
+            return value.to(dtype=dtype)
+
+        semantic_label_id = _to_tensor("cf/sdc_semantic_label_id", as_long=True).reshape(batch_size, -1)[:, 0]
+        semantic_confidence = _to_tensor("cf/sdc_semantic_confidence").reshape(batch_size, -1)[:, 0]
+        time_window_mask = _to_tensor("cf/time_window_mask")
+        decision_agent_mask = _to_tensor("cf/decision_agent_mask")
+        conditioning_eligible = (
+            _to_tensor("cf/conditioning_eligible").reshape(batch_size, -1)[:, 0] > 0
+            if "cf/conditioning_eligible" in input_dict
+            else (_to_tensor("cf/sdc_control_available").reshape(batch_size, -1)[:, 0] > 0)
+        )
+        is_factual = (
+            _to_tensor("cf/sdc_is_factual").reshape(batch_size, -1)[:, 0]
+            if "cf/sdc_is_factual" in input_dict
+            else torch.ones((batch_size,), device=device, dtype=dtype)
+        )
+
+        if time_window_mask.shape[-1] != horizon:
+            time_window_mask = time_window_mask[:, :horizon]
+            if time_window_mask.shape[-1] < horizon:
+                pad = torch.zeros((batch_size, horizon - int(time_window_mask.shape[-1])), device=device, dtype=dtype)
+                time_window_mask = torch.cat([time_window_mask, pad], dim=-1)
+        if decision_agent_mask.shape[-1] != num_agents:
+            decision_agent_mask = decision_agent_mask[:, :num_agents]
+            if decision_agent_mask.shape[-1] < num_agents:
+                pad = torch.zeros((batch_size, num_agents - int(decision_agent_mask.shape[-1])), device=device, dtype=dtype)
+                decision_agent_mask = torch.cat([decision_agent_mask, pad], dim=-1)
+
+        supervision_pos_mask = time_window_mask[:, :, None] * decision_agent_mask[:, None, :]
+        supervision_available_mask = supervision_pos_mask.reshape(batch_size, -1).sum(dim=-1) > 0
+        available_mask = supervision_available_mask & conditioning_eligible
+        if self.training and self.cf_null_dropout_prob > 0.0:
+            keep_mask = (torch.rand((batch_size,), device=device) >= float(self.cf_null_dropout_prob)) | (~available_mask)
+        else:
+            keep_mask = torch.ones((batch_size,), device=device, dtype=torch.bool)
+        available_mask = available_mask & keep_mask
+
+        semantic_token = self.cf_sdc_semantic_embed(semantic_label_id)
+        zero_summary = torch.zeros_like(semantic_token)
+        control_memory = semantic_token[:, None, :]
+        control_memory_mask = available_mask[:, None]
+        control_memory = control_memory * control_memory_mask[:, :, None].to(dtype=dtype)
+        control_pos_mask = supervision_pos_mask * available_mask[:, None, None].to(dtype=dtype)
+        control_features = torch.cat(
+            [
+                semantic_token,
+                zero_summary,
+                semantic_confidence[:, None],
+                is_factual[:, None],
+            ],
+            dim=-1,
+        )
+        local_bias = self.cf_sdc_local_bias(control_features)
+        local_bias = local_bias * torch.sigmoid(self.cf_sdc_local_residual_gate).reshape(1, -1).to(dtype=dtype)
+        local_bias = local_bias * available_mask[:, None].to(dtype=dtype)
+        return {
+            "control_memory": control_memory,
+            "control_memory_mask": control_memory_mask,
+            "control_pos_mask": control_pos_mask,
+            "supervision_pos_mask": supervision_pos_mask,
+            "local_bias": local_bias,
+            "available_mask": available_mask,
+            "use_decoder_maneuver": True,
+            "control_kind": "sdc_semantic_only",
+        }
+
+    def _build_sdc_path_local_control(self, input_dict, *, device, dtype, batch_size, horizon, num_agents):
+        def _to_tensor(name, *, as_long=False):
+            value = input_dict[name]
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value, device=device)
+            value = value.to(device=device)
+            if as_long:
+                return value.long()
+            return value.to(dtype=dtype)
+
+        semantic_label_id = _to_tensor("cf/sdc_semantic_label_id", as_long=True).reshape(batch_size, -1)[:, 0]
+        semantic_confidence = _to_tensor("cf/sdc_semantic_confidence").reshape(batch_size, -1)[:, 0]
+        path_waypoints = _to_tensor("cf/sdc_path_waypoints")
+        path_waypoint_mask = _to_tensor("cf/sdc_path_waypoint_mask")
+        time_window_mask = _to_tensor("cf/time_window_mask")
+        decision_agent_mask = _to_tensor("cf/decision_agent_mask")
+        conditioning_eligible = (
+            _to_tensor("cf/conditioning_eligible").reshape(batch_size, -1)[:, 0] > 0
+            if "cf/conditioning_eligible" in input_dict
+            else (_to_tensor("cf/sdc_control_available").reshape(batch_size, -1)[:, 0] > 0)
+        )
+        is_factual = (
+            _to_tensor("cf/sdc_is_factual").reshape(batch_size, -1)[:, 0]
+            if "cf/sdc_is_factual" in input_dict
+            else torch.ones((batch_size,), device=device, dtype=dtype)
+        )
+
+        if path_waypoints.ndim != 3:
+            raise ValueError(f"cf/sdc_path_waypoints must be [B,M,5], got {tuple(path_waypoints.shape)}")
+        if path_waypoint_mask.ndim != 2:
+            raise ValueError(f"cf/sdc_path_waypoint_mask must be [B,M], got {tuple(path_waypoint_mask.shape)}")
+
+        if time_window_mask.shape[-1] != horizon:
+            time_window_mask = time_window_mask[:, :horizon]
+            if time_window_mask.shape[-1] < horizon:
+                pad = torch.zeros((batch_size, horizon - int(time_window_mask.shape[-1])), device=device, dtype=dtype)
+                time_window_mask = torch.cat([time_window_mask, pad], dim=-1)
+        if decision_agent_mask.shape[-1] != num_agents:
+            decision_agent_mask = decision_agent_mask[:, :num_agents]
+            if decision_agent_mask.shape[-1] < num_agents:
+                pad = torch.zeros((batch_size, num_agents - int(decision_agent_mask.shape[-1])), device=device, dtype=dtype)
+                decision_agent_mask = torch.cat([decision_agent_mask, pad], dim=-1)
+
+        supervision_pos_mask = time_window_mask[:, :, None] * decision_agent_mask[:, None, :]
+        supervision_available_mask = supervision_pos_mask.reshape(batch_size, -1).sum(dim=-1) > 0
+        available_mask = supervision_available_mask & conditioning_eligible
+        if self.training and self.cf_null_dropout_prob > 0.0:
+            keep_mask = (torch.rand((batch_size,), device=device) >= float(self.cf_null_dropout_prob)) | (~available_mask)
+        else:
+            keep_mask = torch.ones((batch_size,), device=device, dtype=torch.bool)
+        available_mask = available_mask & keep_mask
+
+        waypoint_hidden = self.cf_sdc_waypoint_proj(path_waypoints)
+        waypoint_mask = path_waypoint_mask > 0
+        waypoint_hidden = waypoint_hidden * waypoint_mask[:, :, None].to(dtype=dtype)
+        denom = waypoint_mask.to(dtype=dtype).sum(dim=1, keepdim=True).clamp_min(1.0)
+        waypoint_summary = waypoint_hidden.sum(dim=1) / denom
+        waypoint_summary = self.cf_sdc_waypoint_summary(waypoint_summary)
+        semantic_token = self.cf_sdc_semantic_embed(semantic_label_id)
+
+        summary_token = torch.stack([semantic_token, waypoint_summary], dim=1)
+        control_memory = torch.cat([summary_token, waypoint_hidden], dim=1)
+        prefix_mask = torch.ones((batch_size, 2), device=device, dtype=torch.bool)
+        control_memory_mask = torch.cat([prefix_mask, waypoint_mask], dim=1)
+        control_memory_mask = control_memory_mask & available_mask[:, None]
+        control_memory = control_memory * control_memory_mask[:, :, None].to(dtype=dtype)
+
+        control_pos_mask = supervision_pos_mask * available_mask[:, None, None].to(dtype=dtype)
+        control_features = torch.cat(
+            [
+                semantic_token,
+                waypoint_summary,
+                semantic_confidence[:, None],
+                is_factual[:, None],
+            ],
+            dim=-1,
+        )
+        local_bias = self.cf_sdc_local_bias(control_features)
+        local_bias = local_bias * torch.sigmoid(self.cf_sdc_local_residual_gate).reshape(1, -1).to(dtype=dtype)
+        local_bias = local_bias * available_mask[:, None].to(dtype=dtype)
+
+        return {
+            "control_memory": control_memory,
+            "control_memory_mask": control_memory_mask,
+            "control_pos_mask": control_pos_mask,
+            "supervision_pos_mask": supervision_pos_mask,
+            "local_bias": local_bias,
+            "available_mask": available_mask,
+            "use_decoder_maneuver": True,
+            "control_kind": "sdc_path",
         }
 
     def randomize_modeled_agent_id(self, data_dict, clip_agent_id=False):
@@ -510,6 +731,7 @@ class MotionDecoderGPT(nn.Module):
             input_dict["cf/control_pos_mask"] = local_control["control_pos_mask"]
             input_dict["cf/supervision_pos_mask"] = local_control["supervision_pos_mask"]
             input_dict["cf/control_available_mask"] = local_control["available_mask"]
+            input_dict["cf/control_kind"] = str(local_control.get("control_kind", "legacy_path"))
             if self.local_control_forward_mode == "interactive":
                 local_bias = local_control["local_bias"][:, None, None, :]
                 action_token = action_token + local_bias * local_control["control_pos_mask"][:, :, :, None]
@@ -756,7 +978,7 @@ class MotionDecoderGPT(nn.Module):
         decoder_maneuver_mask = None
         decoder_maneuver_position_mask = None
         if local_control is not None:
-            if self.local_control_forward_mode == "interactive":
+            if self.local_control_forward_mode == "interactive" or bool(local_control.get("use_decoder_maneuver", False)):
                 decoder_maneuver_token = local_control["control_memory"]
                 decoder_maneuver_mask = local_control["control_memory_mask"]
                 decoder_maneuver_position_mask = local_control["control_pos_mask"]

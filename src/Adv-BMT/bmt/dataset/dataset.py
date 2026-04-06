@@ -145,6 +145,8 @@ class InfgenDataset(Dataset):
         self.padding_to_max = config.PREPROCESSING.PADDING_TO_MAX
         self.backward_prediction = backward_prediction
         self.counterfactual_mode = str(self.config.DATA.get("COUNTERFACTUAL_MODE", "default")).strip() or "default"
+        self.counterfactual_use_vlm_semantics = bool(self.config.DATA.get("COUNTERFACTUAL_USE_VLM_SEMANTICS", False))
+        self.counterfactual_vlm_conf_threshold = float(self.config.DATA.get("COUNTERFACTUAL_VLM_CONFIDENCE_THRESHOLD", 0.75))
 
         # We are expecting the data_dir to be either an absolute path or a relative path w.r.t. the repo root.
         if mode == "training":
@@ -367,6 +369,7 @@ class InfgenDataset(Dataset):
             "decoder/track_name",
             "eval/track_name",
             "cf/debug_meta",
+            "cf/sdc_debug_meta",
             # "scenario_id",
             # "in_evaluation"
         ]  # Keys exempt from padding and tensor conversion.
@@ -374,7 +377,7 @@ class InfgenDataset(Dataset):
         for k in set(data_dict_sample.keys()):
             if k not in object_keys:
                 if not isinstance(data_dict_sample[k], np.ndarray):
-                    assert isinstance(data_dict_sample[k], (int, float, bool, str))
+                    assert isinstance(data_dict_sample[k], (int, float, bool, str, np.generic))
                     if isinstance(data_dict_sample[k], str):
                         data_dict[k] = np.array([b[k] for b in batch_list])
                     else:
@@ -454,6 +457,11 @@ class InfgenDataset(Dataset):
             elif k in [
                     "cf/time_window_mask",
                     "cf/decision_agent_mask",
+                    "cf/sdc_path_waypoint_mask",
+                    "cf/sdc_path_separability",
+                    "cf/sdc_path_arc_lengths",
+                    "cf/sdc_family_divergence_onsets",
+                    "cf/sdc_family_confidences",
                     # "encoder/modeled_agent_id",
                     # "action_label/labeled_agent_id",
                     "metadata/map_center",  # "decoder/input_step",
@@ -477,6 +485,11 @@ class InfgenDataset(Dataset):
                 data_dict[k] = utils.padding_1st_dim(val_list)
 
             elif k in [
+                    "cf/sdc_path_waypoints",
+                    "cf/sdc_family_path_polylines_world",
+                    "cf/sdc_family_path_tangents_world",
+                    "cf/sdc_family_arc_lengths",
+                    "cf/sdc_family_path_mask",
                     "decoder/input_action_valid_mask",
                     "encoder/current_agent_position",
                     "decoder/current_agent_position",
@@ -512,6 +525,10 @@ class InfgenDataset(Dataset):
                     "cf/compliance_token",
                     "cf/timing_token",
                     "cf/terminal_anchor",
+                    "cf/sdc_semantic_label_id",
+                    "cf/sdc_semantic_confidence",
+                    "cf/sdc_is_factual",
+                    "cf/sdc_control_available",
                     "encoder/agent_type",
                     "decoder/agent_type",
                     "encoder/modeled_agent_type",
@@ -639,12 +656,64 @@ class InfgenDataset(Dataset):
     def _index_entry_has_inline_control_payload(self, row):
         if not isinstance(row, dict):
             return False
+        if str(row.get("schema_version") or "").strip() == "sdc_semantic_control_v1":
+            return True
+        if str(row.get("schema_version") or "").strip() == "sdc_path_control_v1":
+            return True
+        if all(
+            key in row
+            for key in (
+                "requested_semantic_label",
+                "candidate_family_path_ids",
+                "candidate_family_resampled_paths_world",
+                "candidate_family_arc_lengths_m",
+                "candidate_family_divergence_onsets_m",
+            )
+        ):
+            return True
+        if all(
+            key in row
+            for key in (
+                "selected_path_waypoints_local_xy",
+                "selected_path_waypoints_local_heading",
+                "selected_path_arc_lengths_m",
+                "selected_path_separability",
+                "semantic_label",
+            )
+        ):
+            return True
         return "path_token" in row and "terminal_anchor" in row and "sparse_time_mask" in row
+
+    def _should_use_vlm_semantics(self, row):
+        if not self.counterfactual_use_vlm_semantics or not isinstance(row, dict):
+            return False
+        contract_confidence = float(row.get("vlm_contract_confidence") or 0.0)
+        semantic_label = str(row.get("vlm_semantic_label") or "").strip()
+        if contract_confidence < float(self.counterfactual_vlm_conf_threshold):
+            return False
+        return semantic_label in {"left", "straight", "right", "u_turn"}
+
+    def _apply_vlm_semantics_to_control_code(self, row):
+        if not self._should_use_vlm_semantics(row):
+            return dict(row) if isinstance(row, dict) else row
+        output = dict(row)
+        vlm_semantic_label = str(output.get("vlm_semantic_label")).strip()
+        output["branch_label"] = vlm_semantic_label
+        path_token = dict(output.get("path_token") or {})
+        if path_token:
+            path_token["branch_label"] = vlm_semantic_label
+            output["path_token"] = path_token
+        return output
 
     def _maybe_attach_counterfactual_control_fields(self, sample, *, scenario_id, sample_index=None):
         if not self.counterfactual_control_code_dir:
             return sample
         from bmt.counterfactual.compile_control_code import build_counterfactual_dataset_fields, load_control_code
+        from bmt.counterfactual.sdc_path_control import build_sdc_path_dataset_fields, is_sdc_path_control_row
+        from bmt.counterfactual.sdc_semantic_control import (
+            build_sdc_semantic_dataset_fields,
+            is_sdc_semantic_control_row,
+        )
 
         scenario_id = str(scenario_id)
         decoder_track_names = sample.get("decoder/track_name", [])
@@ -667,10 +736,36 @@ class InfgenDataset(Dataset):
         if self.sample_control_index_entries is not None and sample_index is not None and 0 <= int(sample_index) < len(self.sample_control_index_entries):
             inline_row = dict(self.sample_control_index_entries[int(sample_index)])
             if self._index_entry_has_inline_control_payload(inline_row):
-                inline_control_code = inline_row
+                inline_control_code = self._apply_vlm_semantics_to_control_code(inline_row)
         if self.sample_control_code_paths is not None and sample_index is not None and 0 <= int(sample_index) < len(self.sample_control_code_paths):
             control_code_path = str(self.sample_control_code_paths[int(sample_index)])
         if inline_control_code is not None:
+            if is_sdc_semantic_control_row(inline_control_code):
+                output = dict(sample)
+                output.update(
+                    build_sdc_semantic_dataset_fields(
+                        scenario_id=scenario_id,
+                        decoder_track_names=decoder_track_names,
+                        horizon=horizon,
+                        row=inline_control_code,
+                        require_trainable=self.mode == "training",
+                        include_stop=bool(self.config.DATA.get("COUNTERFACTUAL_SDC_INCLUDE_STOP", True)),
+                    )
+                )
+                return self._apply_counterfactual_mode(output)
+            if is_sdc_path_control_row(inline_control_code):
+                output = dict(sample)
+                output.update(
+                    build_sdc_path_dataset_fields(
+                        scenario_id=scenario_id,
+                        decoder_track_names=decoder_track_names,
+                        horizon=horizon,
+                        row=inline_control_code,
+                        require_trainable=self.mode == "training",
+                        include_stop=bool(self.config.DATA.get("COUNTERFACTUAL_SDC_INCLUDE_STOP", True)),
+                    )
+                )
+                return self._apply_counterfactual_mode(output)
             control_code = inline_control_code
         elif not control_code_path:
             control_code_path = self.counterfactual_control_code_index.get(scenario_id, "")
@@ -691,26 +786,45 @@ class InfgenDataset(Dataset):
         return self._apply_counterfactual_mode(output)
 
     def _apply_counterfactual_mode(self, sample):
-        if self.counterfactual_mode != "path_only":
+        if self.counterfactual_mode not in {"path_only", "sdc_path", "sdc_semantic_only"}:
             return sample
         output = dict(sample)
-        if "cf/compliance_token" in output:
-            output["cf/compliance_token"] = np.zeros_like(output["cf/compliance_token"], dtype=np.float32)
-        if "cf/timing_token" in output:
-            output["cf/timing_token"] = np.zeros_like(output["cf/timing_token"], dtype=np.float32)
+        if self.counterfactual_mode == "path_only":
+            if "cf/compliance_token" in output:
+                output["cf/compliance_token"] = np.zeros_like(output["cf/compliance_token"], dtype=np.float32)
+            if "cf/timing_token" in output:
+                output["cf/timing_token"] = np.zeros_like(output["cf/timing_token"], dtype=np.float32)
+            output["cf/compliance_supervision_mask"] = 0
+            output["cf/timing_supervision_mask"] = 0
+            path_supervision_mask = int(output.get("cf/path_supervision_mask", 0))
+            if path_supervision_mask == 0:
+                output["cf/conditioning_eligible"] = 0
+                output["cf/control_available"] = 0
+                debug_meta = dict(output.get("cf/debug_meta", {}))
+                debug_meta["available"] = False
+                debug_meta["drop_reason"] = "path_only_requires_path_supervision"
+                output["cf/debug_meta"] = debug_meta
+            else:
+                debug_meta = dict(output.get("cf/debug_meta", {}))
+                debug_meta["counterfactual_mode"] = "path_only"
+                output["cf/debug_meta"] = debug_meta
+            return output
+
         output["cf/compliance_supervision_mask"] = 0
         output["cf/timing_supervision_mask"] = 0
-        path_supervision_mask = int(output.get("cf/path_supervision_mask", 0))
-        if path_supervision_mask == 0:
+        sdc_available = int(output.get("cf/sdc_control_available", output.get("cf/control_available", 0)))
+        mode_label = str(self.counterfactual_mode)
+        if sdc_available == 0:
             output["cf/conditioning_eligible"] = 0
             output["cf/control_available"] = 0
             debug_meta = dict(output.get("cf/debug_meta", {}))
             debug_meta["available"] = False
-            debug_meta["drop_reason"] = "path_only_requires_path_supervision"
+            debug_meta.setdefault("drop_reason", f"{mode_label}_requires_available_sdc_control")
+            debug_meta["counterfactual_mode"] = mode_label
             output["cf/debug_meta"] = debug_meta
         else:
             debug_meta = dict(output.get("cf/debug_meta", {}))
-            debug_meta["counterfactual_mode"] = "path_only"
+            debug_meta["counterfactual_mode"] = mode_label
             output["cf/debug_meta"] = debug_meta
         return output
 
@@ -719,14 +833,25 @@ class InfgenDataset(Dataset):
             return None
         labels = []
         for entry in self.sample_control_index_entries:
+            if str(entry.get("schema_version") or "").strip() == "sdc_semantic_control_v1":
+                labels.append(str(entry.get("requested_semantic_label") or "none"))
+                continue
+            if str(entry.get("schema_version") or "").strip() == "sdc_path_control_v1":
+                labels.append(str(entry.get("semantic_label") or "none"))
+                continue
+            effective_entry = self._apply_vlm_semantics_to_control_code(entry)
             branch_label = str(
-                entry.get("branch_label")
-                or entry.get("supervised_branch_label")
-                or entry.get("path_branch_label")
+                effective_entry.get("branch_label")
+                or effective_entry.get("supervised_branch_label")
+                or effective_entry.get("path_branch_label")
                 or "none"
             )
             labels.append(branch_label)
-        counts = Counter(label for label in labels if label in {"left", "straight", "right"})
+        counts = Counter(
+            label
+            for label in labels
+            if label in {"left", "straight", "right", "left_lane_change", "right_lane_change", "stop", "u_turn"}
+        )
         if len(counts) == 0:
             return None
         weights = []

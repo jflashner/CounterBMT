@@ -9,6 +9,7 @@ import numpy as np
 from .types import (
     CanonicalMapFeature,
     CanonicalScenario,
+    CanonicalSDCPath,
     CanonicalTrack,
     CanonicalTrafficLight,
     JsonValue,
@@ -56,6 +57,8 @@ def normalize_scenario(raw_scenario: Mapping[str, Any]) -> CanonicalScenario:
         key = _normalize_id(feature_id)
         map_features[key] = _normalize_map_feature(map_features_raw[feature_id])
 
+    sdc_paths = _normalize_sdc_paths(raw.get("sdc_paths"))
+
     return CanonicalScenario(
         scenario_id=scenario_id,
         length=length,
@@ -65,6 +68,7 @@ def normalize_scenario(raw_scenario: Mapping[str, Any]) -> CanonicalScenario:
         tracks=tracks,
         traffic_lights=traffic_lights,
         map_features=map_features,
+        sdc_paths=sdc_paths,
         metadata_summary=_summarize_metadata(metadata),
         objects_of_interest=_normalize_id_list(metadata.get("objects_of_interest")),
     )
@@ -253,6 +257,67 @@ def _normalize_map_feature(feature_value: Any) -> CanonicalMapFeature:
         polyline_xyz=polyline_xyz,
         polygon_xy=polygon_xy,
         polygon_xyz=(None if polygon_xyz.shape[0] == 0 else polygon_xyz),
+        metadata=metadata,
+    )
+
+
+def _normalize_sdc_paths(paths_value: Any) -> Dict[str, CanonicalSDCPath]:
+    if isinstance(paths_value, Mapping):
+        items = list(paths_value.items())
+    elif isinstance(paths_value, Sequence) and not isinstance(paths_value, (str, bytes)):
+        items = [(str(index), value) for index, value in enumerate(paths_value)]
+    else:
+        return {}
+
+    normalized: Dict[str, CanonicalSDCPath] = {}
+    for raw_key, raw_value in items:
+        path_key = _normalize_id(_first_not_none(_as_mapping(raw_value).get("path_id"), raw_key))
+        if not path_key:
+            continue
+        path = _normalize_sdc_path(raw_value, default_path_id=path_key)
+        if path is not None:
+            normalized[path_key] = path
+    return normalized
+
+
+def _normalize_sdc_path(path_value: Any, *, default_path_id: str) -> Optional[CanonicalSDCPath]:
+    path = _as_mapping(path_value)
+    path_id = _normalize_id(_first_not_none(path.get("path_id"), default_path_id), default=default_path_id)
+    polyline_xyz = _coerce_polyline(
+        _first_not_none(
+            path.get("polyline_xyz"),
+            path.get("polyline"),
+            path.get("points_xyz"),
+            path.get("points"),
+            path.get("xyz"),
+        )
+    )
+    if polyline_xyz.shape[0] < 2:
+        return None
+    valid_raw = path.get("valid")
+    if valid_raw is None:
+        valid = np.ones((polyline_xyz.shape[0],), dtype=bool)
+    else:
+        valid = np.asarray(valid_raw, dtype=bool).reshape(-1)
+        if valid.shape[0] != polyline_xyz.shape[0]:
+            adjusted = np.zeros((polyline_xyz.shape[0],), dtype=bool)
+            prefix = min(valid.shape[0], polyline_xyz.shape[0])
+            adjusted[:prefix] = valid[:prefix]
+            if prefix < polyline_xyz.shape[0]:
+                adjusted[prefix:] = True
+            valid = adjusted
+
+    metadata: Dict[str, JsonValue] = {"raw_keys": sorted(str(k) for k in path.keys())}
+    for key, value in path.items():
+        if key in {"path_id", "polyline_xyz", "polyline", "points_xyz", "points", "xyz", "valid"}:
+            continue
+        metadata[str(key)] = _summarize_value(value)
+
+    return CanonicalSDCPath(
+        path_id=path_id,
+        polyline_xy=polyline_xyz[:, :2].copy(),
+        polyline_xyz=polyline_xyz,
+        valid=valid,
         metadata=metadata,
     )
 

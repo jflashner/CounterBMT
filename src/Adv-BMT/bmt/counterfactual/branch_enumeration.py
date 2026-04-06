@@ -260,11 +260,40 @@ def choose_decision_window(
         heading = heading_from_track_window(track.position_xy, track.valid, end_idx=int(t), lookback_steps=lookback_steps)
         if heading is None:
             continue
-        branches = enumerate_branch_candidates(
-            select_lane_like_features(canonical, stop_point_xy=stop_point_xy, radius_m=30.0),
-            stop_point_xy=stop_point_xy,
-            approach_heading=heading,
-        )
+        branches: List[BranchCandidate] = []
+        if str(resolved_agent_id) == str(canonical.sdc_id) and getattr(canonical, "sdc_paths", {}):
+            try:
+                from .sdc_path_branches import enumerate_branch_candidates_from_sdc_paths
+
+                branches = enumerate_branch_candidates_from_sdc_paths(
+                    canonical,
+                    agent_id=str(resolved_agent_id),
+                    decision_time_idx=int(t),
+                    approach_heading=float(heading),
+                )
+            except Exception:
+                branches = []
+        try:
+            if not branches:
+                from .branch_routes_v2 import enumerate_branch_candidates_from_routes_v2
+
+                _, branches = enumerate_branch_candidates_from_routes_v2(
+                    canonical,
+                    agent_id=resolved_agent_id,
+                    current_time_idx=int(canonical.current_time_index),
+                    decision_time_idx=int(t),
+                    stop_point_xy=stop_point_xy,
+                    approach_heading=heading,
+                )
+        except Exception:
+            if not branches:
+                branches = []
+        if not branches:
+            branches = enumerate_branch_candidates(
+                select_lane_like_features(canonical, stop_point_xy=stop_point_xy, radius_m=30.0),
+                stop_point_xy=stop_point_xy,
+                approach_heading=heading,
+            )
         if len(branches) >= 2:
             decision_time_idx = int(t)
             approach_heading = float(heading)

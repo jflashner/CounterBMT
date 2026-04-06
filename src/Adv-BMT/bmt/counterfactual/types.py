@@ -60,6 +60,15 @@ class CanonicalMapFeature:
 
 
 @dataclass
+class CanonicalSDCPath:
+    path_id: str
+    polyline_xy: np.ndarray
+    polyline_xyz: np.ndarray
+    valid: np.ndarray
+    metadata: Dict[str, JsonValue] = field(default_factory=dict)
+
+
+@dataclass
 class CanonicalScenario:
     scenario_id: str
     length: int
@@ -69,6 +78,6 @@ class CanonicalScenario:
     tracks: Dict[str, CanonicalTrack]
     traffic_lights: Dict[str, CanonicalTrafficLight]
     map_features: Dict[str, CanonicalMapFeature]
+    sdc_paths: Dict[str, CanonicalSDCPath] = field(default_factory=dict)
     metadata_summary: Dict[str, JsonValue] = field(default_factory=dict)
     objects_of_interest: List[str] = field(default_factory=list)
-

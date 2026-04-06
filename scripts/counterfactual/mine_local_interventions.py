@@ -42,6 +42,7 @@ from bmt.counterfactual import (
     load_raw_scenario,
     local_intervention_to_bayesian_dag,
     recover_ground_truth_branch,
+    render_branch_routes_overlay_v2,
     select_signalized_candidates_for_scenario,
     summarize_forward_supervision_for_raw_scenario,
     write_signal_qc_artifacts_for_candidate,
@@ -216,13 +217,21 @@ def _mine_one_agent_candidate(
         signal_qc_artifacts = write_signal_qc_artifacts_for_candidate(candidate, outdir=example_dir)
 
     local_patch = extract_local_patch(canonical, stop_point_xy=candidate.stop_point_xy, radius_m=30.0, time_index=decision_window.decision_time_idx)
+    route_result, enumerated_branches = _enumerate_branches(
+        canonical=canonical,
+        agent_id=str(agent_id),
+        decision_window=decision_window,
+        stop_point_xy=candidate.stop_point_xy,
+        local_patch=local_patch,
+    )
     branch_candidates = _serialize_branches(
         recover_ground_truth_branch(
             canonical,
             decision_window=decision_window,
-            branch_candidates=_enumerate_branches(local_patch, candidate.stop_point_xy, decision_window.approach_heading),
+            branch_candidates=enumerated_branches,
             agent_id=agent_id,
-        )
+        ),
+        route_result=route_result,
     )
     gt_recovery = branch_candidates["gt_recovery"]
     branch_list = branch_candidates["branch_candidates"]
@@ -345,6 +354,8 @@ def _mine_one_agent_candidate(
     decision_window_json = example_dir / "decision_window.json"
     branch_candidates_json = example_dir / "branch_candidates.json"
     branch_candidates_png = example_dir / "branch_candidates.png"
+    branch_routes_v2_json = example_dir / "branch_routes_v2.json"
+    branch_routes_overlay_v2_png = example_dir / "branch_routes_overlay_v2.png"
     conflict_agents_json = example_dir / "conflict_agents.json"
     eta_table_csv = example_dir / "eta_table.csv"
     conflict_plot_png = example_dir / "conflict_plot.png"
@@ -418,6 +429,19 @@ def _mine_one_agent_candidate(
                 gt_branch_id=str(recovered_decision.branch_id or ""),
                 out_path=branch_candidates_png,
             )
+            if route_result is not None and route_result.route_families:
+                render_branch_routes_overlay_v2(
+                    output_path=branch_routes_overlay_v2_png,
+                    canonical=canonical,
+                    route_result=route_result,
+                    current_pose_xy=current_xy,
+                    decision_pose_xy=decision_xy,
+                    gt_future_xy=np.asarray(future_xy, dtype=np.float32),
+                    factual_rollout_xy=None,
+                    title=f"{candidate.scenario_id} agent={agent_id} light={candidate.light_id}",
+                )
+        if route_result is not None:
+            _write_json(branch_routes_v2_json, route_result.to_dict())
         _write_json(
             conflict_agents_json,
             {
@@ -456,6 +480,7 @@ def _mine_one_agent_candidate(
                     "signal_qc": {key: str(value) for key, value in signal_qc_artifacts.items()},
                     "local_patch": str(local_patch_json),
                     "branch_candidates": str(branch_candidates_json),
+                    "branch_routes_v2": (str(branch_routes_v2_json) if route_result is not None else None),
                     "local_intervention_train_view": str(train_view_json),
                     "factual_control_code": str(factual_control_json),
                 },
@@ -517,17 +542,56 @@ def materialize_candidate_debug_bundle(
     )
 
 
-def _enumerate_branches(local_patch: Any, stop_point_xy: tuple[float, float], approach_heading: float) -> List[Any]:
+def _enumerate_branches(
+    *,
+    canonical: Any,
+    agent_id: str,
+    decision_window: Any,
+    stop_point_xy: tuple[float, float],
+    local_patch: Any,
+) -> tuple[Any | None, List[Any]]:
+    from bmt.counterfactual import enumerate_branch_candidates, enumerate_branch_candidates_from_routes_v2, enumerate_branch_candidates_from_sdc_paths
+
+    if str(agent_id) == str(canonical.sdc_id) and getattr(canonical, "sdc_paths", {}):
+        sdc_path_branches = enumerate_branch_candidates_from_sdc_paths(
+            canonical,
+            agent_id=str(agent_id),
+            decision_time_idx=int(decision_window.decision_time_idx),
+            approach_heading=float(decision_window.approach_heading),
+        )
+        if sdc_path_branches:
+            return None, sdc_path_branches
+
+    route_result = None
+    try:
+        route_result, route_branches = enumerate_branch_candidates_from_routes_v2(
+            canonical,
+            agent_id=str(agent_id),
+            current_time_idx=int(decision_window.current_time_index_global),
+            decision_time_idx=int(decision_window.decision_time_idx),
+            stop_point_xy=stop_point_xy,
+            approach_heading=float(decision_window.approach_heading),
+        )
+        if route_branches:
+            return route_result, route_branches
+    except Exception:
+        route_result = None
+
     from bmt.counterfactual import enumerate_branch_candidates
 
-    return enumerate_branch_candidates(local_patch.lane_features, stop_point_xy=stop_point_xy, approach_heading=approach_heading)
+    return route_result, enumerate_branch_candidates(
+        local_patch.lane_features,
+        stop_point_xy=stop_point_xy,
+        approach_heading=float(decision_window.approach_heading),
+    )
 
 
-def _serialize_branches(recovery_output: tuple[Any, List[Any]]) -> Dict[str, Any]:
+def _serialize_branches(recovery_output: tuple[Any, List[Any]], *, route_result: Any | None = None) -> Dict[str, Any]:
     gt_recovery, branch_candidates = recovery_output
     return {
         "gt_recovery": gt_recovery.to_dict(),
         "branch_candidates": [branch.to_dict() for branch in branch_candidates],
+        "branch_routes_v2": (None if route_result is None else route_result.to_dict()),
     }
 
 

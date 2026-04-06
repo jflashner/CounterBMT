@@ -14,3 +14,4 @@ wheels/
 /data/
 src/exp_converted/
 src/exp_waymo/
+.env

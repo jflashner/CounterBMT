@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-heading-threshold-rad", type=float, default=0.35)
     parser.add_argument("--path-only-safe-mode", dest="path_only_safe_mode", action="store_true")
     parser.add_argument("--no-path-only-safe-mode", dest="path_only_safe_mode", action="store_false")
+    parser.add_argument("--target-agent-policy", type=str, default="all_trainable", choices=("all_trainable", "sdc_only"))
     parser.set_defaults(path_only_safe_mode=True)
     parser.set_defaults(progress=True)
     return parser.parse_args()
@@ -226,6 +227,7 @@ def main() -> int:
         {
             "max_agents_per_candidate": int(args.max_agents_per_candidate),
             "max_candidates_per_scenario": int(args.max_candidates_per_scenario),
+            "target_agent_policy": str(args.target_agent_policy),
             "light_canonicalization_summary_json": str(outdir / "light_canonicalization_summary.json"),
             "light_group_histogram_json": str(outdir / "light_group_histogram.json"),
             "path_index_raw_jsonl": str(path_index_raw_path),
@@ -250,6 +252,7 @@ def main() -> int:
         {
             "max_agents_per_candidate": int(args.max_agents_per_candidate),
             "max_candidates_per_scenario": int(args.max_candidates_per_scenario),
+            "target_agent_policy": str(args.target_agent_policy),
             "path_index_raw_jsonl": str(path_index_raw_path),
             "path_index_curated_jsonl": str(path_index_curated_path),
             "default_training_facing_index_jsonl": str(path_index_curated_path),
@@ -506,7 +509,10 @@ def _process_one_scenario(args: Dict[str, Any]) -> Dict[str, Any]:
         if str(candidate.light_id) not in canonical.traffic_lights:
             continue
         light = canonical.traffic_lights[str(candidate.light_id)]
-        considered_agents = list(getattr(forward_summary, "trainable_track_ids", []))
+        if str(args.get("target_agent_policy", "all_trainable")) == "sdc_only":
+            considered_agents = [str(canonical.sdc_id)]
+        else:
+            considered_agents = list(getattr(forward_summary, "trainable_track_ids", []))
         max_agents = int(args.get("max_agents_per_candidate", 0))
         if max_agents > 0:
             considered_agents = considered_agents[:max_agents]
@@ -670,7 +676,13 @@ def _prefilter_path_candidate(
         radius_m=30.0,
         time_index=decision_idx,
     )
-    branch_candidates = _enumerate_branches(local_patch, candidate.stop_point_xy, decision_window.approach_heading)
+    _route_result, branch_candidates = _enumerate_branches(
+        canonical=canonical,
+        agent_id=str(agent_id),
+        decision_window=decision_window,
+        stop_point_xy=candidate.stop_point_xy,
+        local_patch=local_patch,
+    )
     feasible_branches = [
         branch
         for branch in branch_candidates
