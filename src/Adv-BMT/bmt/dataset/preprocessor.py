@@ -441,6 +441,8 @@ def process_traffic_light(
             stop_point = centralize_to_map_center(
                 position_array=traffic_light["stop_point"], map_center=map_center, map_heading=map_heading
             )
+            if not np.isfinite(stop_point[..., :2]).all():
+                continue
             traffic_light_position[tl_count] = stop_point[..., :3]
             traffic_light_feature[tl_count, :3] = stop_point
             traffic_light_feature[tl_count, 3] = MetaDriveType.is_traffic_light_in_green(tl_state)
@@ -461,6 +463,8 @@ def process_traffic_light(
             stop_point = centralize_to_map_center(
                 position_array=traffic_light["stop_point"], map_center=map_center, map_heading=map_heading
             )
+            if not np.isfinite(stop_point[..., :2]).all():
+                continue
 
             traffic_light_position[tl_count] = stop_point[..., :3]
             for step in range(track_length):

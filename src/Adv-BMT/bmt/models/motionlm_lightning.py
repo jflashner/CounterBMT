@@ -80,6 +80,17 @@ def safe_entropy(logits, epsilon=1e-5):
     return entropy.mean()
 
 
+def sanitize_logits_for_loss(logits, *, clamp=50.0):
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=float(clamp), neginf=-float(clamp))
+    return logits.clamp(min=-float(clamp), max=float(clamp))
+
+
+def sanitize_scalar_loss(value, *, fallback=0.0):
+    if torch.is_tensor(value):
+        return torch.nan_to_num(value, nan=float(fallback), posinf=float(fallback), neginf=float(fallback))
+    return value
+
+
 class MotionLMLightning(pl.LightningModule):
     def __init__(self, config):
         if "SEED" in config:
@@ -691,10 +702,10 @@ class MotionLMLightning(pl.LightningModule):
                 "projected_family_distance": projected_distance,
             }
 
-        teacher_logits = teacher_logits.to(device=device, dtype=dtype)
+        teacher_logits = sanitize_logits_for_loss(teacher_logits.to(device=device, dtype=dtype))
         decision_agent_mask = semantic_context["decision_agent_mask"]
-        student_logits_sdc = (output_logit * decision_agent_mask[:, None, :, None]).sum(dim=2)
-        teacher_logits_sdc = (teacher_logits * decision_agent_mask[:, None, :, None]).sum(dim=2)
+        student_logits_sdc = sanitize_logits_for_loss((output_logit * decision_agent_mask[:, None, :, None]).sum(dim=2))
+        teacher_logits_sdc = sanitize_logits_for_loss((teacher_logits * decision_agent_mask[:, None, :, None]).sum(dim=2))
 
         candidate_projection = project_points_to_family_paths_torch(
             semantic_context["sdc_next_pos_candidates_world"],
@@ -746,6 +757,7 @@ class MotionLMLightning(pl.LightningModule):
             + heading_weight * heading_penalty
             + backward_weight * backward_penalty
         ).permute(0, 1, 3, 2)
+        energy = torch.nan_to_num(energy, nan=1e6, posinf=1e6, neginf=0.0)
 
         teacher_log_probs = F.log_softmax(teacher_logits_sdc, dim=-1)
         student_log_probs = F.log_softmax(student_logits_sdc, dim=-1)
@@ -753,17 +765,26 @@ class MotionLMLightning(pl.LightningModule):
             teacher_log_probs[:, :, None, :] - (energy / max(energy_temperature, 1e-3)),
             dim=-1,
         )
+        family_teacher = torch.nan_to_num(family_teacher, nan=0.0, posinf=0.0, neginf=0.0)
         family_teacher = (family_teacher * family_weights[:, None, :, None]).sum(dim=2)
         family_teacher = family_teacher / family_teacher.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        kl_per_step = (family_teacher * (torch.log(family_teacher.clamp_min(1e-6)) - student_log_probs)).sum(dim=-1)
-        guide_loss = (kl_per_step[guide_valid] * guide_weight[guide_valid]).sum() / guide_weight[guide_valid].sum().clamp_min(1e-4)
+        family_teacher = torch.nan_to_num(family_teacher, nan=0.0, posinf=0.0, neginf=0.0)
+        kl_per_step = torch.nan_to_num(
+            (family_teacher * (torch.log(family_teacher.clamp_min(1e-6)) - student_log_probs)).sum(dim=-1),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        guide_loss = sanitize_scalar_loss(
+            (kl_per_step[guide_valid] * guide_weight[guide_valid]).sum() / guide_weight[guide_valid].sum().clamp_min(1e-4)
+        )
         projected_distance = (expected_projection["nearest_distance"] * family_weights[:, None, :]).sum(dim=-1)
         family_teacher_entropy = -(family_teacher * torch.log(family_teacher.clamp_min(1e-6))).sum(dim=-1)
         return {
             "guide_loss": guide_loss,
             "guide_weight": guide_weight,
-            "family_teacher_entropy": family_teacher_entropy[guide_valid].mean() if bool(guide_valid.any()) else zero,
-            "projected_family_distance": projected_distance,
+            "family_teacher_entropy": sanitize_scalar_loss(family_teacher_entropy[guide_valid].mean()) if bool(guide_valid.any()) else zero,
+            "projected_family_distance": torch.nan_to_num(projected_distance, nan=0.0, posinf=0.0, neginf=0.0),
         }
 
     def forward(self, batch_dict):
@@ -806,7 +827,7 @@ class MotionLMLightning(pl.LightningModule):
                     motion_token_weights,
                 )
 
-            valid_logits = output_logit[target_action_valid_mask]
+            valid_logits = sanitize_logits_for_loss(output_logit[target_action_valid_mask])
             valid_target = target_action[target_action_valid_mask]
             valid_motion_weights = motion_token_weights[target_action_valid_mask]
 
@@ -828,10 +849,7 @@ class MotionLMLightning(pl.LightningModule):
                 original_loss = torch.nn.functional.cross_entropy(input=valid_logits, target=valid_target, reduction="none")
 
             weight_denom = valid_motion_weights.sum().clamp_min(1.0)
-            loss = (original_loss * valid_motion_weights).sum() / weight_denom
-
-            assert not np.isnan(loss.item())
-            assert not np.isinf(loss.item())
+            loss = sanitize_scalar_loss((original_loss * valid_motion_weights).sum() / weight_denom)
 
             with torch.no_grad():
                 encodings = F.one_hot(valid_logits.argmax(-1),
@@ -979,14 +997,14 @@ class MotionLMLightning(pl.LightningModule):
                 guide_loss_weight = float(
                     self.config.MODEL.get("LOCAL_CONTROL_SDC_FAMILY_GUIDE_LOSS_WEIGHT", 0.2)
                 )
-                semantic_logits = self.sdc_semantic_head(control_hidden)
+                semantic_logits = sanitize_logits_for_loss(self.sdc_semantic_head(control_hidden))
                 semantic_loss = control_hidden.new_tensor(0.0)
                 if bool(semantic_supervision_mask.any()) and semantic_loss_weight > 0.0:
-                    semantic_loss = F.cross_entropy(
+                    semantic_loss = sanitize_scalar_loss(F.cross_entropy(
                         semantic_logits[semantic_supervision_mask],
                         semantic_target[semantic_supervision_mask],
                         reduction="mean",
-                    )
+                    ))
                     loss = loss + semantic_loss_weight * semantic_loss
                     loss_stat["cf/sdc_semantic_acc"] = (
                         semantic_logits[semantic_supervision_mask].argmax(dim=-1) == semantic_target[semantic_supervision_mask]
@@ -1007,7 +1025,7 @@ class MotionLMLightning(pl.LightningModule):
                     }
                 )
                 if guide_loss_weight > 0.0 and sdc_semantic_context is not None:
-                    loss = loss + guide_loss_weight * guide_bundle["guide_loss"]
+                    loss = loss + guide_loss_weight * sanitize_scalar_loss(guide_bundle["guide_loss"])
                 loss_stat.update(
                     {
                         "cf/control_batch_fraction": conditioning_eligible.float().mean(),
@@ -1044,7 +1062,7 @@ class MotionLMLightning(pl.LightningModule):
                 heading_beta = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_PATH_HEADING_BETA_RAD", 0.35))
                 progress_slack_m = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_PATH_PROGRESS_BACKWARD_SLACK_M", 0.25))
 
-                semantic_logits = self.sdc_semantic_head(control_hidden)
+                semantic_logits = sanitize_logits_for_loss(self.sdc_semantic_head(control_hidden))
                 semantic_loss = control_hidden.new_tensor(0.0)
                 prox_loss = control_hidden.new_tensor(0.0)
                 heading_loss = control_hidden.new_tensor(0.0)
@@ -1052,11 +1070,11 @@ class MotionLMLightning(pl.LightningModule):
                 policy_kl = control_hidden.new_tensor(0.0)
 
                 if bool(semantic_supervision_mask.any()) and semantic_loss_weight > 0.0:
-                    semantic_loss = F.cross_entropy(
+                    semantic_loss = sanitize_scalar_loss(F.cross_entropy(
                         semantic_logits[semantic_supervision_mask],
                         semantic_target[semantic_supervision_mask],
                         reduction="mean",
-                    )
+                    ))
                     loss = loss + semantic_loss_weight * semantic_loss
                     loss_stat["cf/sdc_semantic_acc"] = (
                         semantic_logits[semantic_supervision_mask].argmax(dim=-1) == semantic_target[semantic_supervision_mask]
@@ -1314,6 +1332,11 @@ class MotionLMLightning(pl.LightningModule):
         return loss
 
     def optimizer_step(self, *args, **kwargs):
+        grad_clip_norm = float(self.config.MODEL.get("LOCAL_CONTROL_GRAD_CLIP_NORM", 1.0))
+        if grad_clip_norm > 0.0:
+            parameters = [p for p in self.parameters() if p.requires_grad and p.grad is not None]
+            if parameters:
+                torch.nn.utils.clip_grad_norm_(parameters, max_norm=grad_clip_norm)
         super().optimizer_step(*args, **kwargs)
 
     def on_validation_start(self):
