@@ -80,7 +80,9 @@ def safe_entropy(logits, epsilon=1e-5):
     return entropy.mean()
 
 
-def sanitize_logits_for_loss(logits, *, clamp=50.0):
+def sanitize_logits_for_loss(logits, *, clamp=None):
+    if clamp is None:
+        return torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
     logits = torch.nan_to_num(logits, nan=0.0, posinf=float(clamp), neginf=-float(clamp))
     return logits.clamp(min=-float(clamp), max=float(clamp))
 
@@ -791,6 +793,14 @@ class MotionLMLightning(pl.LightningModule):
         guide_loss = sanitize_scalar_loss(
             (kl_per_step[guide_valid] * guide_weight[guide_valid]).sum() / guide_weight[guide_valid].sum().clamp_min(1e-4)
         )
+        guide_valid_f = guide_valid.to(dtype=dtype)
+        guide_weighted_num = (kl_per_step * guide_weight * guide_valid_f).sum(dim=-1)
+        guide_weighted_den = (guide_weight * guide_valid_f).sum(dim=-1)
+        guide_loss_per_example = torch.where(
+            guide_weighted_den > 1e-5,
+            guide_weighted_num / guide_weighted_den.clamp_min(1e-4),
+            torch.zeros_like(guide_weighted_num),
+        )
         projected_distance = (expected_projection["nearest_distance"] * family_weights[:, None, :]).sum(dim=-1)
         family_teacher_entropy = -(family_teacher * torch.log(family_teacher.clamp_min(1e-6))).sum(dim=-1)
         student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
@@ -806,6 +816,8 @@ class MotionLMLightning(pl.LightningModule):
             "guide_loss": guide_loss,
             "guide_weight": guide_weight,
             "guide_valid_fraction": guide_valid.float().mean(),
+            "guide_loss_per_example": torch.nan_to_num(guide_loss_per_example, nan=0.0, posinf=0.0, neginf=0.0),
+            "guide_example_valid": guide_weighted_den > 1e-5,
             "student_entropy": sanitize_scalar_loss(student_entropy[guide_valid].mean()) if bool(guide_valid.any()) else zero,
             "expected_energy": sanitize_scalar_loss(expected_energy[guide_valid].mean()) if bool(guide_valid.any()) else zero,
             "expected_position_penalty": sanitize_scalar_loss(expected_position_penalty[guide_valid].mean()) if bool(guide_valid.any()) else zero,
@@ -1060,21 +1072,17 @@ class MotionLMLightning(pl.LightningModule):
                 )
                 if guide_loss_weight > 0.0 and sdc_semantic_context is not None:
                     loss = loss + guide_loss_weight * sanitize_scalar_loss(guide_bundle["guide_loss"])
+                total_control_objective = (
+                    guide_loss_weight * sanitize_scalar_loss(guide_bundle["guide_loss"])
+                    + semantic_loss_weight * sanitize_scalar_loss(semantic_loss)
+                )
                 loss_stat.update(
                     {
                         "cf/control_batch_fraction": conditioning_eligible.float().mean(),
                         "cf/conditioning_batch_fraction": conditioning_eligible.float().mean(),
-                        "cf/path_supervision_fraction": semantic_supervision_mask.float().mean(),
-                        "cf/compliance_supervision_fraction": control_hidden.new_tensor(0.0),
-                        "cf/timing_supervision_fraction": control_hidden.new_tensor(0.0),
-                        "cf/path_loss": semantic_loss,
-                        "cf/compliance_loss": control_hidden.new_tensor(0.0),
-                        "cf/timing_loss": control_hidden.new_tensor(0.0),
-                        "cf/anchor_loss": control_hidden.new_tensor(0.0),
-                        "cf/path_loss_weight": semantic_loss_weight,
-                        "cf/compliance_loss_weight": 0.0,
-                        "cf/timing_loss_weight": 0.0,
-                        "cf/anchor_loss_weight": 0.0,
+                        "cf/sdc_semantic_supervision_fraction": semantic_supervision_mask.float().mean(),
+                        "cf/sdc_semantic_aux_loss": semantic_loss,
+                        "cf/sdc_semantic_aux_loss_weight": semantic_loss_weight,
                         "cf/sdc_family_guide_loss": guide_bundle["guide_loss"],
                         "cf/sdc_family_guide_loss_weight": guide_loss_weight,
                         "cf/sdc_family_guide_valid_fraction": guide_bundle["guide_valid_fraction"],
@@ -1085,11 +1093,20 @@ class MotionLMLightning(pl.LightningModule):
                         "cf/sdc_family_expected_heading_penalty": guide_bundle["expected_heading_penalty"],
                         "cf/sdc_family_expected_backward_penalty": guide_bundle["expected_backward_penalty"],
                         "cf/sdc_family_gate_mean": guide_bundle["guide_weight"].mean(),
+                        "cf/sdc_control_objective": total_control_objective,
                         "cf/sdc_family_distance_mean": guide_bundle["projected_family_distance"][
                             sdc_semantic_context["sdc_valid_by_t"]
                         ].mean() if sdc_semantic_context is not None and bool(sdc_semantic_context["sdc_valid_by_t"].any()) else control_hidden.new_tensor(0.0),
                     }
                 )
+                if "guide_loss_per_example" in guide_bundle and semantic_target.numel() == guide_bundle["guide_loss_per_example"].shape[0]:
+                    guide_example_valid = guide_bundle.get("guide_example_valid", torch.zeros_like(semantic_target, dtype=torch.bool))
+                    for label_id, label_name in enumerate(SDC_PATH_SEMANTIC_LABEL_ORDER):
+                        label_mask = (semantic_target == int(label_id)) & guide_example_valid
+                        if bool(label_mask.any()):
+                            loss_stat[f"cf/sdc_family_guide_loss_by_label/{label_name}"] = sanitize_scalar_loss(
+                                guide_bundle["guide_loss_per_example"][label_mask].mean()
+                            )
             elif self.counterfactual_mode == "sdc_path" and self.sdc_semantic_head is not None and "cf/sdc_semantic_label_id" in data_dict:
                 semantic_target = _to_tensor("cf/sdc_semantic_label_id", dtype=torch.long).reshape(control_hidden.shape[0], -1)[:, 0]
                 semantic_supervision_mask = control_valid_mask & conditioning_eligible
