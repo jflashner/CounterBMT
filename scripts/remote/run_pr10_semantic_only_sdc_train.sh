@@ -83,7 +83,18 @@ if [[ -n "$WANDB_RUN_NAME" ]]; then
   export WANDB_RUN_NAME
 fi
 
-python src/Adv-BMT/bmt/train_motion.py \
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+  if [[ -x "$REPO_ROOT/.venv-legacy-adv-bmt/bin/python" ]]; then
+    PYTHON_BIN="$REPO_ROOT/.venv-legacy-adv-bmt/bin/python"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  else
+    PYTHON_BIN="$(command -v python)"
+  fi
+fi
+
+"$PYTHON_BIN" src/Adv-BMT/bmt/train_motion.py \
   --config-name motion_forward_sdc_semantic_only_strict_local.yaml \
   DATA.TRAINING_DATA_DIR="$DATA_ROOT" \
   DATA.TEST_DATA_DIR="$DATA_ROOT" \
