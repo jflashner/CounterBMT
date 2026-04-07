@@ -698,6 +698,12 @@ class MotionLMLightning(pl.LightningModule):
             return {
                 "guide_loss": zero,
                 "guide_weight": guide_weight,
+                "guide_valid_fraction": zero,
+                "student_entropy": zero,
+                "expected_energy": zero,
+                "expected_position_penalty": zero,
+                "expected_heading_penalty": zero,
+                "expected_backward_penalty": zero,
                 "family_teacher_entropy": zero,
                 "projected_family_distance": projected_distance,
             }
@@ -761,6 +767,7 @@ class MotionLMLightning(pl.LightningModule):
 
         teacher_log_probs = F.log_softmax(teacher_logits_sdc, dim=-1)
         student_log_probs = F.log_softmax(student_logits_sdc, dim=-1)
+        student_probs = torch.softmax(student_logits_sdc, dim=-1)
         family_teacher = torch.softmax(
             teacher_log_probs[:, :, None, :] - (energy / max(energy_temperature, 1e-3)),
             dim=-1,
@@ -780,9 +787,24 @@ class MotionLMLightning(pl.LightningModule):
         )
         projected_distance = (expected_projection["nearest_distance"] * family_weights[:, None, :]).sum(dim=-1)
         family_teacher_entropy = -(family_teacher * torch.log(family_teacher.clamp_min(1e-6))).sum(dim=-1)
+        student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
+        weighted_position_penalty = (position_penalty.permute(0, 1, 3, 2) * family_weights[:, None, :, None]).sum(dim=2)
+        weighted_heading_penalty = (heading_penalty.permute(0, 1, 3, 2) * family_weights[:, None, :, None]).sum(dim=2)
+        weighted_backward_penalty = (backward_penalty.permute(0, 1, 3, 2) * family_weights[:, None, :, None]).sum(dim=2)
+        weighted_energy = (energy * family_weights[:, None, :, None]).sum(dim=2)
+        expected_position_penalty = (weighted_position_penalty * student_probs).sum(dim=-1)
+        expected_heading_penalty = (weighted_heading_penalty * student_probs).sum(dim=-1)
+        expected_backward_penalty = (weighted_backward_penalty * student_probs).sum(dim=-1)
+        expected_energy = (weighted_energy * student_probs).sum(dim=-1)
         return {
             "guide_loss": guide_loss,
             "guide_weight": guide_weight,
+            "guide_valid_fraction": guide_valid.float().mean(),
+            "student_entropy": sanitize_scalar_loss(student_entropy[guide_valid].mean()) if bool(guide_valid.any()) else zero,
+            "expected_energy": sanitize_scalar_loss(expected_energy[guide_valid].mean()) if bool(guide_valid.any()) else zero,
+            "expected_position_penalty": sanitize_scalar_loss(expected_position_penalty[guide_valid].mean()) if bool(guide_valid.any()) else zero,
+            "expected_heading_penalty": sanitize_scalar_loss(expected_heading_penalty[guide_valid].mean()) if bool(guide_valid.any()) else zero,
+            "expected_backward_penalty": sanitize_scalar_loss(expected_backward_penalty[guide_valid].mean()) if bool(guide_valid.any()) else zero,
             "family_teacher_entropy": sanitize_scalar_loss(family_teacher_entropy[guide_valid].mean()) if bool(guide_valid.any()) else zero,
             "projected_family_distance": torch.nan_to_num(projected_distance, nan=0.0, posinf=0.0, neginf=0.0),
         }
@@ -1020,6 +1042,12 @@ class MotionLMLightning(pl.LightningModule):
                     else {
                         "guide_loss": control_hidden.new_tensor(0.0),
                         "guide_weight": control_hidden.new_zeros((control_hidden.shape[0], 1)),
+                        "guide_valid_fraction": control_hidden.new_tensor(0.0),
+                        "student_entropy": control_hidden.new_tensor(0.0),
+                        "expected_energy": control_hidden.new_tensor(0.0),
+                        "expected_position_penalty": control_hidden.new_tensor(0.0),
+                        "expected_heading_penalty": control_hidden.new_tensor(0.0),
+                        "expected_backward_penalty": control_hidden.new_tensor(0.0),
                         "family_teacher_entropy": control_hidden.new_tensor(0.0),
                         "projected_family_distance": control_hidden.new_zeros((control_hidden.shape[0], 1)),
                     }
@@ -1043,7 +1071,13 @@ class MotionLMLightning(pl.LightningModule):
                         "cf/anchor_loss_weight": 0.0,
                         "cf/sdc_family_guide_loss": guide_bundle["guide_loss"],
                         "cf/sdc_family_guide_loss_weight": guide_loss_weight,
+                        "cf/sdc_family_guide_valid_fraction": guide_bundle["guide_valid_fraction"],
+                        "cf/sdc_family_student_entropy": guide_bundle["student_entropy"],
                         "cf/sdc_family_teacher_entropy": guide_bundle["family_teacher_entropy"],
+                        "cf/sdc_family_expected_energy": guide_bundle["expected_energy"],
+                        "cf/sdc_family_expected_pos_penalty": guide_bundle["expected_position_penalty"],
+                        "cf/sdc_family_expected_heading_penalty": guide_bundle["expected_heading_penalty"],
+                        "cf/sdc_family_expected_backward_penalty": guide_bundle["expected_backward_penalty"],
                         "cf/sdc_family_gate_mean": guide_bundle["guide_weight"].mean(),
                         "cf/sdc_family_distance_mean": guide_bundle["projected_family_distance"][
                             sdc_semantic_context["sdc_valid_by_t"]
