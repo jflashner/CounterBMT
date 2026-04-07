@@ -266,8 +266,10 @@ def main(config):
         val_prefetch_factor=config.prefetch_factor,
     )
     if torch.cuda.device_count() > 1:
-        trainer_kwargs["strategy"] = 'ddp'
-        # trainer_kwargs["strategy"] = 'ddp_find_unused_parameters_true'
+        if bool(config.MODEL.get("LOCAL_CONTROL_FORWARD_ENABLED", False)):
+            trainer_kwargs["strategy"] = 'ddp_find_unused_parameters_true'
+        else:
+            trainer_kwargs["strategy"] = 'ddp'
     if log_dir:
         trainer_kwargs["default_root_dir"] = log_dir
 

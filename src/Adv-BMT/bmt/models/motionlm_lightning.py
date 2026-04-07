@@ -132,53 +132,59 @@ class MotionLMLightning(pl.LightningModule):
         if not bool(self.config.MODEL.get("LOCAL_CONTROL_FREEZE_BACKBONE", False)):
             return
 
+        use_legacy_control = self.counterfactual_mode not in {"sdc_semantic_only", "sdc_path"}
+        use_sdc_semantic_only = self.counterfactual_mode == "sdc_semantic_only"
+        use_sdc_path = self.counterfactual_mode == "sdc_path"
+
         for parameter in self.model.parameters():
             parameter.requires_grad = False
-        for parameter in self.path_head.parameters():
-            parameter.requires_grad = True
-        for parameter in self.anchor_head.parameters():
-            parameter.requires_grad = True
+        if use_legacy_control:
+            for parameter in self.path_head.parameters():
+                parameter.requires_grad = True
+        if use_legacy_control and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_ANCHOR", True)):
+            for parameter in self.anchor_head.parameters():
+                parameter.requires_grad = True
 
-        if bool(self.config.MODEL.get("LOCAL_CONTROL_USE_COMPLIANCE", True)):
+        if use_legacy_control and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_COMPLIANCE", True)):
             for parameter in self.compliance_head.parameters():
                 parameter.requires_grad = True
-        if bool(self.config.MODEL.get("LOCAL_CONTROL_USE_TIMING", True)):
+        if use_legacy_control and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_TIMING", True)):
             for parameter in self.timing_head.parameters():
                 parameter.requires_grad = True
 
         motion_decoder = self.model.motion_decoder
-        if hasattr(motion_decoder, "cf_path_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_PATH", True)):
+        if use_legacy_control and hasattr(motion_decoder, "cf_path_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_PATH", True)):
             for parameter in motion_decoder.cf_path_proj.parameters():
                 parameter.requires_grad = True
-        if hasattr(motion_decoder, "cf_anchor_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_ANCHOR", True)):
+        if use_legacy_control and hasattr(motion_decoder, "cf_anchor_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_ANCHOR", True)):
             for parameter in motion_decoder.cf_anchor_proj.parameters():
                 parameter.requires_grad = True
-        if hasattr(motion_decoder, "cf_compliance_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_COMPLIANCE", True)):
+        if use_legacy_control and hasattr(motion_decoder, "cf_compliance_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_COMPLIANCE", True)):
             for parameter in motion_decoder.cf_compliance_proj.parameters():
                 parameter.requires_grad = True
-        if hasattr(motion_decoder, "cf_timing_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_TIMING", True)):
+        if use_legacy_control and hasattr(motion_decoder, "cf_timing_proj") and bool(self.config.MODEL.get("LOCAL_CONTROL_USE_TIMING", True)):
             for parameter in motion_decoder.cf_timing_proj.parameters():
                 parameter.requires_grad = True
-        if hasattr(motion_decoder, "cf_local_bias"):
+        if use_legacy_control and hasattr(motion_decoder, "cf_local_bias"):
             for parameter in motion_decoder.cf_local_bias.parameters():
                 parameter.requires_grad = True
-        if hasattr(motion_decoder, "cf_local_residual_gate"):
+        if use_legacy_control and hasattr(motion_decoder, "cf_local_residual_gate"):
             motion_decoder.cf_local_residual_gate.requires_grad = True
-        if hasattr(motion_decoder, "cf_sdc_semantic_embed"):
+        if (use_sdc_semantic_only or use_sdc_path) and hasattr(motion_decoder, "cf_sdc_semantic_embed"):
             for parameter in motion_decoder.cf_sdc_semantic_embed.parameters():
                 parameter.requires_grad = True
-        if hasattr(motion_decoder, "cf_sdc_waypoint_proj"):
+        if use_sdc_path and hasattr(motion_decoder, "cf_sdc_waypoint_proj"):
             for parameter in motion_decoder.cf_sdc_waypoint_proj.parameters():
                 parameter.requires_grad = True
-        if hasattr(motion_decoder, "cf_sdc_waypoint_summary"):
+        if use_sdc_path and hasattr(motion_decoder, "cf_sdc_waypoint_summary"):
             for parameter in motion_decoder.cf_sdc_waypoint_summary.parameters():
                 parameter.requires_grad = True
-        if hasattr(motion_decoder, "cf_sdc_local_bias"):
+        if (use_sdc_semantic_only or use_sdc_path) and hasattr(motion_decoder, "cf_sdc_local_bias"):
             for parameter in motion_decoder.cf_sdc_local_bias.parameters():
                 parameter.requires_grad = True
-        if hasattr(motion_decoder, "cf_sdc_local_residual_gate"):
+        if (use_sdc_semantic_only or use_sdc_path) and hasattr(motion_decoder, "cf_sdc_local_residual_gate"):
             motion_decoder.cf_sdc_local_residual_gate.requires_grad = True
-        if self.sdc_semantic_head is not None:
+        if (use_sdc_semantic_only or use_sdc_path) and self.sdc_semantic_head is not None:
             for parameter in self.sdc_semantic_head.parameters():
                 parameter.requires_grad = True
 
@@ -1422,14 +1428,16 @@ class MotionLMLightning(pl.LightningModule):
             {f"val/{k}": float(v) for k, v in loss_stat.items()},
             batch_size=data_dict["encoder/map_feature"].shape[0],
             prog_bar=False,
+            sync_dist=True,
         )
         if motion_stat:
             self.log_dict(
                 {f"val/{k}": float(v) for k, v in motion_stat.items()},
                 batch_size=data_dict["encoder/map_feature"].shape[0],
                 prog_bar=False,
+                sync_dist=True,
             )
-        self.log("val/monitoring_step", float(self.global_step))
+        self.log("val/monitoring_step", float(self.global_step), sync_dist=True)
         return loss
 
     def on_validation_epoch_end(self):
