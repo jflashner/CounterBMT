@@ -93,6 +93,18 @@ def sanitize_scalar_loss(value, *, fallback=0.0):
     return value
 
 
+def clone_nested_value(value):
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, dict):
+        return {k: clone_nested_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [clone_nested_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(clone_nested_value(v) for v in value)
+    return copy.deepcopy(value)
+
+
 class MotionLMLightning(pl.LightningModule):
     def __init__(self, config):
         if "SEED" in config:
@@ -419,6 +431,280 @@ class MotionLMLightning(pl.LightningModule):
             "expected_heading_world": expected_heading,
         }
 
+    def _adapt_rollout_output_for_semantic_guidance(self, *, base_batch, rollout_output):
+        adapted = clone_nested_value(rollout_output)
+        rollout_logits = rollout_output["decoder/output_logit"]
+        device = rollout_logits.device
+        dtype = rollout_logits.dtype
+        horizon = int(rollout_logits.shape[1])
+
+        initial_pos = self._as_tensor(
+            base_batch["decoder/modeled_agent_position"][:, :1],
+            device=device,
+            dtype=dtype,
+        )
+        initial_heading = self._as_tensor(
+            base_batch["decoder/modeled_agent_heading"][:, :1],
+            device=device,
+            dtype=dtype,
+        )
+        initial_velocity = self._as_tensor(
+            base_batch["decoder/modeled_agent_velocity"][:, :1],
+            device=device,
+            dtype=dtype,
+        )
+        rollout_next_pos = self._as_tensor(
+            rollout_output["decoder/debug_ar_pos"][:, :horizon],
+            device=device,
+            dtype=dtype,
+        )
+        rollout_next_heading = self._as_tensor(
+            rollout_output["decoder/debug_ar_head"][:, :horizon],
+            device=device,
+            dtype=dtype,
+        )
+        rollout_next_velocity = self._as_tensor(
+            rollout_output["decoder/debug_ar_vel"][:, :horizon],
+            device=device,
+            dtype=dtype,
+        )
+
+        if horizon > 1:
+            current_pos = torch.cat([initial_pos, rollout_next_pos[:, :-1]], dim=1)
+            current_heading = torch.cat([initial_heading, rollout_next_heading[:, :-1]], dim=1)
+            current_velocity = torch.cat([initial_velocity, rollout_next_velocity[:, :-1]], dim=1)
+        else:
+            current_pos = initial_pos.clone()
+            current_heading = initial_heading.clone()
+            current_velocity = initial_velocity.clone()
+
+        adapted["decoder/modeled_agent_position"] = current_pos
+        adapted["decoder/modeled_agent_heading"] = current_heading
+        adapted["decoder/modeled_agent_velocity"] = current_velocity
+        adapted["decoder/modeled_agent_valid_mask"] = rollout_output["decoder/input_action_valid_mask"][:, :horizon]
+        adapted["decoder/modeled_agent_delta"] = rollout_next_pos[..., :2] - current_pos[..., :2]
+        adapted["decoder/input_action"] = rollout_output["decoder/output_action"][:, :horizon]
+        adapted["decoder/input_action_valid_mask"] = rollout_output["decoder/input_action_valid_mask"][:, :horizon]
+        adapted["decoder/target_action_valid_mask"] = rollout_output["decoder/input_action_valid_mask"][:, :horizon]
+        adapted["decoder/input_step"] = torch.arange(horizon, device=device, dtype=torch.long)
+        adapted["decoder/rollout_next_position"] = rollout_next_pos
+        adapted["decoder/rollout_next_heading"] = rollout_next_heading
+        adapted["decoder/rollout_next_velocity"] = rollout_next_velocity
+        return adapted
+
+    def _prepare_batch_for_training_autoregressive_rollout(self, data_dict):
+        required = (
+            "decoder/agent_position",
+            "decoder/agent_velocity",
+            "decoder/agent_heading",
+            "decoder/agent_valid_mask",
+        )
+        if all(key in data_dict for key in required):
+            return data_dict
+
+        rollout_batch = dict(data_dict)
+        if "decoder/current_agent_position" in data_dict:
+            agent_position = self._as_tensor(
+                data_dict["decoder/current_agent_position"],
+                device=data_dict["decoder/modeled_agent_position"].device,
+                dtype=data_dict["decoder/modeled_agent_position"].dtype,
+            )
+        else:
+            agent_position = self._as_tensor(
+                data_dict["decoder/modeled_agent_position"][:, 0],
+                device=data_dict["decoder/modeled_agent_position"].device,
+                dtype=data_dict["decoder/modeled_agent_position"].dtype,
+            )
+        if "decoder/current_agent_velocity" in data_dict:
+            agent_velocity = self._as_tensor(
+                data_dict["decoder/current_agent_velocity"],
+                device=data_dict["decoder/modeled_agent_velocity"].device,
+                dtype=data_dict["decoder/modeled_agent_velocity"].dtype,
+            )
+        else:
+            agent_velocity = self._as_tensor(
+                data_dict["decoder/modeled_agent_velocity"][:, 0],
+                device=data_dict["decoder/modeled_agent_velocity"].device,
+                dtype=data_dict["decoder/modeled_agent_velocity"].dtype,
+            )
+        if "decoder/current_agent_heading" in data_dict:
+            agent_heading = self._as_tensor(
+                data_dict["decoder/current_agent_heading"],
+                device=data_dict["decoder/modeled_agent_heading"].device,
+                dtype=data_dict["decoder/modeled_agent_heading"].dtype,
+            )
+        else:
+            agent_heading = self._as_tensor(
+                data_dict["decoder/modeled_agent_heading"][:, 0],
+                device=data_dict["decoder/modeled_agent_heading"].device,
+                dtype=data_dict["decoder/modeled_agent_heading"].dtype,
+            )
+        if "decoder/current_agent_valid_mask" in data_dict:
+            agent_valid_mask = self._as_tensor(
+                data_dict["decoder/current_agent_valid_mask"],
+                device=data_dict["decoder/modeled_agent_position"].device,
+                dtype=torch.bool,
+            )
+        else:
+            agent_valid_mask = self._as_tensor(
+                data_dict["decoder/input_action_valid_mask"][:, 0],
+                device=data_dict["decoder/modeled_agent_position"].device,
+                dtype=torch.bool,
+            )
+
+        rollout_batch["decoder/agent_position"] = agent_position[:, None]
+        rollout_batch["decoder/agent_velocity"] = agent_velocity[:, None]
+        rollout_batch["decoder/agent_heading"] = agent_heading[:, None]
+        rollout_batch["decoder/agent_valid_mask"] = agent_valid_mask[:, None]
+        return rollout_batch
+
+    def _compute_sdc_rollout_progress_loss(self, *, data_dict, semantic_context):
+        output_logit = data_dict["decoder/output_logit"]
+        device = output_logit.device
+        dtype = output_logit.dtype
+        zero = output_logit.new_tensor(0.0)
+        required = ("decoder/rollout_next_position", "cf/sdc_semantic_label_id")
+        if semantic_context is None or any(key not in data_dict for key in required):
+            return {
+                "progress_loss": zero,
+                "progress_valid_fraction": zero,
+                "realized_progress_mean": zero,
+                "stall_fraction": zero,
+                "rollout_family_distance": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1])),
+            }
+
+        rollout_next_position = self._as_tensor(
+            data_dict["decoder/rollout_next_position"][:, : output_logit.shape[1], :, :2],
+            device=device,
+            dtype=dtype,
+        )
+        decision_agent_mask = semantic_context["decision_agent_mask"]
+        sdc_next_pos_world = (
+            rollout_next_position * decision_agent_mask[:, None, :, None].to(dtype=dtype)
+        ).sum(dim=2)
+        realized_projection = project_points_to_family_paths_torch(
+            sdc_next_pos_world,
+            family_path_polylines_world=semantic_context["family_paths_world"],
+            family_path_mask=semantic_context["family_path_mask"],
+            family_path_tangents_world=semantic_context["family_tangents_world"],
+            family_path_arc_lengths=semantic_context["family_arc_lengths"],
+        )
+
+        family_weights = semantic_context["family_weights"]
+        current_arc = semantic_context["current_projection"]["nearest_arc"]
+        realized_arc = realized_projection["nearest_arc"]
+        realized_delta_arc = realized_arc - current_arc
+        weighted_progress = (realized_delta_arc * family_weights[:, None, :]).sum(dim=-1)
+        weighted_distance = (realized_projection["nearest_distance"] * family_weights[:, None, :]).sum(dim=-1)
+        guide_weight = (semantic_context["current_gate"] * family_weights[:, None, :]).sum(dim=-1)
+        valid_mask = semantic_context["sdc_valid_by_t"] & semantic_context["control_available"][:, None] & (guide_weight > 1e-5)
+
+        semantic_target = self._as_tensor(
+            data_dict["cf/sdc_semantic_label_id"],
+            device=device,
+            dtype=torch.long,
+        ).reshape(output_logit.shape[0], -1)[:, 0]
+        stop_label_id = int(SDC_PATH_SEMANTIC_LABEL_ORDER.index("stop"))
+        valid_mask = valid_mask & (semantic_target != stop_label_id)[:, None]
+
+        progress_margin_m = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_PROGRESS_MARGIN_M", 0.25))
+        stall_threshold_m = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_STALL_THRESHOLD_M", 0.05))
+        progress_penalty = torch.relu(progress_margin_m - weighted_progress)
+
+        if not bool(valid_mask.any()):
+            return {
+                "progress_loss": zero,
+                "progress_valid_fraction": zero,
+                "realized_progress_mean": zero,
+                "stall_fraction": zero,
+                "rollout_family_distance": torch.nan_to_num(weighted_distance, nan=0.0, posinf=0.0, neginf=0.0),
+            }
+
+        progress_loss = sanitize_scalar_loss(
+            (progress_penalty[valid_mask] * guide_weight[valid_mask]).sum()
+            / guide_weight[valid_mask].sum().clamp_min(1e-4)
+        )
+        return {
+            "progress_loss": progress_loss,
+            "progress_valid_fraction": valid_mask.float().mean(),
+            "realized_progress_mean": sanitize_scalar_loss(weighted_progress[valid_mask].mean()),
+            "stall_fraction": sanitize_scalar_loss((weighted_progress[valid_mask] < stall_threshold_m).float().mean()),
+            "rollout_family_distance": torch.nan_to_num(weighted_distance, nan=0.0, posinf=0.0, neginf=0.0),
+        }
+
+    def _build_sdc_semantic_rollout_guidance(self, *, data_dict):
+        output_logit = data_dict["decoder/output_logit"]
+        zero = output_logit.new_tensor(0.0)
+        rollout_sampling_method = str(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_SAMPLING_METHOD", "argmax")
+        ).strip() or "argmax"
+        rollout_temperature = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TEMPERATURE", 1.0))
+        rollout_topp = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TOPP", 0.9))
+
+        motion_decoder = getattr(self.model, "motion_decoder", None)
+        previous_null_dropout_prob = getattr(motion_decoder, "cf_null_dropout_prob", None)
+        if motion_decoder is not None and previous_null_dropout_prob is not None:
+            motion_decoder.cf_null_dropout_prob = 0.0
+        try:
+            rollout_input = self._prepare_batch_for_training_autoregressive_rollout(data_dict)
+            rollout_output = self.model.autoregressive_rollout(
+                rollout_input,
+                num_decode_steps=None,
+                sampling_method=rollout_sampling_method,
+                temperature=(None if rollout_temperature <= 0.0 else rollout_temperature),
+                topp=(None if rollout_topp <= 0.0 else rollout_topp),
+                autoregressive_start_step=0,
+                allow_training=True,
+            )
+        finally:
+            if motion_decoder is not None and previous_null_dropout_prob is not None:
+                motion_decoder.cf_null_dropout_prob = previous_null_dropout_prob
+
+        rollout_eval_dict = self._adapt_rollout_output_for_semantic_guidance(
+            base_batch=data_dict,
+            rollout_output=rollout_output,
+        )
+        rollout_semantic_context = self._extract_sdc_semantic_context(rollout_eval_dict)
+        if rollout_semantic_context is None:
+            return {
+                "guide_bundle": {
+                    "guide_loss": zero,
+                    "guide_weight": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1])),
+                    "guide_valid_fraction": zero,
+                    "student_entropy": zero,
+                    "expected_energy": zero,
+                    "expected_position_penalty": zero,
+                    "expected_heading_penalty": zero,
+                    "expected_backward_penalty": zero,
+                    "family_teacher_entropy": zero,
+                    "projected_family_distance": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1])),
+                },
+                "progress_bundle": {
+                    "progress_loss": zero,
+                    "progress_valid_fraction": zero,
+                    "realized_progress_mean": zero,
+                    "stall_fraction": zero,
+                    "rollout_family_distance": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1])),
+                },
+                "semantic_context": None,
+            }
+
+        rollout_teacher_logits = self._run_policy_teacher(rollout_eval_dict)
+        guide_bundle = self._compute_sdc_semantic_family_guidance(
+            data_dict=rollout_eval_dict,
+            semantic_context=rollout_semantic_context,
+            teacher_logits=rollout_teacher_logits,
+        )
+        progress_bundle = self._compute_sdc_rollout_progress_loss(
+            data_dict=rollout_eval_dict,
+            semantic_context=rollout_semantic_context,
+        )
+        return {
+            "guide_bundle": guide_bundle,
+            "progress_bundle": progress_bundle,
+            "semantic_context": rollout_semantic_context,
+        }
+
     def _extract_sdc_path_context(self, data_dict):
         required = (
             "cf/sdc_path_waypoints",
@@ -681,9 +967,11 @@ class MotionLMLightning(pl.LightningModule):
                 continue
             if str(key).startswith("decoder/debug_"):
                 continue
+            if str(key).startswith("decoder/rollout_"):
+                continue
             if key in {"decoder/output_logit", "decoder/decoded_tokens"}:
                 continue
-            teacher_input[key] = copy.deepcopy(value)
+            teacher_input[key] = clone_nested_value(value)
         with torch.no_grad():
             teacher_output = self.policy_teacher(teacher_input)
         return teacher_output.get("decoder/output_logit")
@@ -1037,6 +1325,12 @@ class MotionLMLightning(pl.LightningModule):
                 guide_loss_weight = float(
                     self.config.MODEL.get("LOCAL_CONTROL_SDC_FAMILY_GUIDE_LOSS_WEIGHT", 0.2)
                 )
+                rollout_guide_loss_weight = float(
+                    self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_GUIDE_LOSS_WEIGHT", 0.0)
+                )
+                rollout_progress_loss_weight = float(
+                    self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_PROGRESS_LOSS_WEIGHT", 0.0)
+                )
                 semantic_logits = sanitize_logits_for_loss(self.sdc_semantic_head(control_hidden))
                 semantic_loss = control_hidden.new_tensor(0.0)
                 if bool(semantic_supervision_mask.any()) and semantic_loss_weight > 0.0:
@@ -1070,10 +1364,45 @@ class MotionLMLightning(pl.LightningModule):
                         "projected_family_distance": control_hidden.new_zeros((control_hidden.shape[0], 1)),
                     }
                 )
+                rollout_guide_bundle = {
+                    "guide_loss": control_hidden.new_tensor(0.0),
+                    "guide_weight": control_hidden.new_zeros((control_hidden.shape[0], 1)),
+                    "guide_valid_fraction": control_hidden.new_tensor(0.0),
+                    "student_entropy": control_hidden.new_tensor(0.0),
+                    "expected_energy": control_hidden.new_tensor(0.0),
+                    "expected_position_penalty": control_hidden.new_tensor(0.0),
+                    "expected_heading_penalty": control_hidden.new_tensor(0.0),
+                    "expected_backward_penalty": control_hidden.new_tensor(0.0),
+                    "family_teacher_entropy": control_hidden.new_tensor(0.0),
+                    "projected_family_distance": control_hidden.new_zeros((control_hidden.shape[0], 1)),
+                }
+                rollout_progress_bundle = {
+                    "progress_loss": control_hidden.new_tensor(0.0),
+                    "progress_valid_fraction": control_hidden.new_tensor(0.0),
+                    "realized_progress_mean": control_hidden.new_tensor(0.0),
+                    "stall_fraction": control_hidden.new_tensor(0.0),
+                    "rollout_family_distance": control_hidden.new_zeros((control_hidden.shape[0], 1)),
+                }
+                rollout_semantic_context = None
+                if (
+                    sdc_semantic_context is not None
+                    and bool(sdc_semantic_context["alternative_batch_mask"].any())
+                    and (rollout_guide_loss_weight > 0.0 or rollout_progress_loss_weight > 0.0)
+                ):
+                    rollout_bundle = self._build_sdc_semantic_rollout_guidance(data_dict=data_dict)
+                    rollout_guide_bundle = rollout_bundle["guide_bundle"]
+                    rollout_progress_bundle = rollout_bundle["progress_bundle"]
+                    rollout_semantic_context = rollout_bundle["semantic_context"]
                 if guide_loss_weight > 0.0 and sdc_semantic_context is not None:
                     loss = loss + guide_loss_weight * sanitize_scalar_loss(guide_bundle["guide_loss"])
+                if rollout_guide_loss_weight > 0.0 and rollout_semantic_context is not None:
+                    loss = loss + rollout_guide_loss_weight * sanitize_scalar_loss(rollout_guide_bundle["guide_loss"])
+                if rollout_progress_loss_weight > 0.0 and rollout_semantic_context is not None:
+                    loss = loss + rollout_progress_loss_weight * sanitize_scalar_loss(rollout_progress_bundle["progress_loss"])
                 total_control_objective = (
                     guide_loss_weight * sanitize_scalar_loss(guide_bundle["guide_loss"])
+                    + rollout_guide_loss_weight * sanitize_scalar_loss(rollout_guide_bundle["guide_loss"])
+                    + rollout_progress_loss_weight * sanitize_scalar_loss(rollout_progress_bundle["progress_loss"])
                     + semantic_loss_weight * sanitize_scalar_loss(semantic_loss)
                 )
                 loss_stat.update(
@@ -1093,10 +1422,28 @@ class MotionLMLightning(pl.LightningModule):
                         "cf/sdc_family_expected_heading_penalty": guide_bundle["expected_heading_penalty"],
                         "cf/sdc_family_expected_backward_penalty": guide_bundle["expected_backward_penalty"],
                         "cf/sdc_family_gate_mean": guide_bundle["guide_weight"].mean(),
+                        "cf/sdc_rollout_family_guide_loss": rollout_guide_bundle["guide_loss"],
+                        "cf/sdc_rollout_family_guide_loss_weight": rollout_guide_loss_weight,
+                        "cf/sdc_rollout_family_guide_valid_fraction": rollout_guide_bundle["guide_valid_fraction"],
+                        "cf/sdc_rollout_family_student_entropy": rollout_guide_bundle["student_entropy"],
+                        "cf/sdc_rollout_family_teacher_entropy": rollout_guide_bundle["family_teacher_entropy"],
+                        "cf/sdc_rollout_family_expected_energy": rollout_guide_bundle["expected_energy"],
+                        "cf/sdc_rollout_family_expected_pos_penalty": rollout_guide_bundle["expected_position_penalty"],
+                        "cf/sdc_rollout_family_expected_heading_penalty": rollout_guide_bundle["expected_heading_penalty"],
+                        "cf/sdc_rollout_family_expected_backward_penalty": rollout_guide_bundle["expected_backward_penalty"],
+                        "cf/sdc_rollout_family_gate_mean": rollout_guide_bundle["guide_weight"].mean(),
+                        "cf/sdc_rollout_progress_loss": rollout_progress_bundle["progress_loss"],
+                        "cf/sdc_rollout_progress_loss_weight": rollout_progress_loss_weight,
+                        "cf/sdc_rollout_progress_valid_fraction": rollout_progress_bundle["progress_valid_fraction"],
+                        "cf/sdc_rollout_progress_mean": rollout_progress_bundle["realized_progress_mean"],
+                        "cf/sdc_rollout_stall_fraction": rollout_progress_bundle["stall_fraction"],
                         "cf/sdc_control_objective": total_control_objective,
                         "cf/sdc_family_distance_mean": guide_bundle["projected_family_distance"][
                             sdc_semantic_context["sdc_valid_by_t"]
                         ].mean() if sdc_semantic_context is not None and bool(sdc_semantic_context["sdc_valid_by_t"].any()) else control_hidden.new_tensor(0.0),
+                        "cf/sdc_rollout_family_distance_mean": rollout_progress_bundle["rollout_family_distance"][
+                            rollout_semantic_context["sdc_valid_by_t"]
+                        ].mean() if rollout_semantic_context is not None and bool(rollout_semantic_context["sdc_valid_by_t"].any()) else control_hidden.new_tensor(0.0),
                     }
                 )
                 if "guide_loss_per_example" in guide_bundle and semantic_target.numel() == guide_bundle["guide_loss_per_example"].shape[0]:
@@ -1106,6 +1453,17 @@ class MotionLMLightning(pl.LightningModule):
                         if bool(label_mask.any()):
                             loss_stat[f"cf/sdc_family_guide_loss_by_label/{label_name}"] = sanitize_scalar_loss(
                                 guide_bundle["guide_loss_per_example"][label_mask].mean()
+                            )
+                if "guide_loss_per_example" in rollout_guide_bundle and semantic_target.numel() == rollout_guide_bundle["guide_loss_per_example"].shape[0]:
+                    rollout_guide_example_valid = rollout_guide_bundle.get(
+                        "guide_example_valid",
+                        torch.zeros_like(semantic_target, dtype=torch.bool),
+                    )
+                    for label_id, label_name in enumerate(SDC_PATH_SEMANTIC_LABEL_ORDER):
+                        label_mask = (semantic_target == int(label_id)) & rollout_guide_example_valid
+                        if bool(label_mask.any()):
+                            loss_stat[f"cf/sdc_rollout_family_guide_loss_by_label/{label_name}"] = sanitize_scalar_loss(
+                                rollout_guide_bundle["guide_loss_per_example"][label_mask].mean()
                             )
             elif self.counterfactual_mode == "sdc_path" and self.sdc_semantic_head is not None and "cf/sdc_semantic_label_id" in data_dict:
                 semantic_target = _to_tensor("cf/sdc_semantic_label_id", dtype=torch.long).reshape(control_hidden.shape[0], -1)[:, 0]

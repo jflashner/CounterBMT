@@ -44,6 +44,18 @@ def get_relative_velocity(vel, heading):
     return utils.rotate(vel[..., 0], vel[..., 1], angle=-heading)
 
 
+def _clone_rollout_value(value):
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, dict):
+        return {k: _clone_rollout_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_rollout_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_rollout_value(v) for v in value)
+    return copy.deepcopy(value)
+
+
 def _reconstruct_delta_pos_from_abs_vel(vel, heading, dt):
     vel = utils.rotate(vel[..., 0], vel[..., 1], angle=-heading)
     pos = vel * dt
@@ -206,10 +218,11 @@ class MotionLM(nn.Module):
         topp=None,
         num_modes_for_eval=None,
         autoregressive_start_step = 2,
+        allow_training=False,
         **kwargs
     ):
 
-        assert self.training is False, "This function is only for evaluation!"
+        assert (self.training is False) or bool(allow_training), "This function is only for evaluation unless allow_training=True."
 
         if "backward_prediction" in kwargs and kwargs["backward_prediction"]:
             return self.autoregressive_rollout_backward_prediction(
@@ -224,8 +237,8 @@ class MotionLM(nn.Module):
             )
 
         raw_data = data_dict
-        # To avoid those overwriting operation.
-        data_dict = copy.deepcopy(data_dict)
+        # To avoid overwriting the caller's batch while still supporting non-leaf tensors during training.
+        data_dict = _clone_rollout_value(data_dict)
 
         tokenizer = self.tokenizer
 
