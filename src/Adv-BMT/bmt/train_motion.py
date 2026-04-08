@@ -2,11 +2,14 @@ import datetime
 import json
 import os
 import pathlib
+import subprocess
+import sys
 import traceback
 
 import hydra
 import lightning.pytorch as pl
 import torch
+from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.callbacks import LearningRateMonitor
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
@@ -130,6 +133,201 @@ def _write_training_artifacts(
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
 
 
+class SemanticRolloutGifCallback(Callback):
+    def __init__(self, *, config, artifact_root: pathlib.Path):
+        self.config = config
+        self.artifact_root = pathlib.Path(artifact_root)
+        self.enabled = bool(config.get("ROLLOUT_GIF_EVAL_ENABLED", False))
+        self.every_n_validations = max(1, int(config.get("ROLLOUT_GIF_EVAL_EVERY_N_VALIDATIONS", 1)))
+        self.max_scenes = max(1, int(config.get("ROLLOUT_GIF_EVAL_MAX_SCENES", 1)))
+        self.num_samples = max(1, int(config.get("ROLLOUT_GIF_EVAL_NUM_SAMPLES", 6)))
+        self.rollout_gif_fps = float(config.get("ROLLOUT_GIF_EVAL_FPS", 6.0))
+        self.rollout_device = str(config.get("ROLLOUT_GIF_EVAL_DEVICE", "cpu")).strip() or "cpu"
+        self.all_scene_slots = bool(config.get("ROLLOUT_GIF_EVAL_ALL_SCENE_SLOTS", True))
+        self.scenario_ids = self._normalize_text_list(config.get("ROLLOUT_GIF_EVAL_SCENARIO_IDS", []))
+        self.control_index_override = str(config.get("ROLLOUT_GIF_EVAL_CONTROL_INDEX", "")).strip()
+        self.data_dir_override = str(config.get("ROLLOUT_GIF_EVAL_DATA_DIR", "")).strip()
+        self.rollout_sampling_method = str(
+            config.get("ROLLOUT_GIF_EVAL_ROLLOUT_SAMPLING_METHOD", "argmax")
+        ).strip() or "argmax"
+        self.rollout_temperature = float(config.get("ROLLOUT_GIF_EVAL_ROLLOUT_TEMPERATURE", -1.0))
+        self.rollout_topp = float(config.get("ROLLOUT_GIF_EVAL_ROLLOUT_TOPP", -1.0))
+        self._validation_events = 0
+        self.legacy_root = pathlib.Path(REPO_ROOT).resolve()
+        self.repo_root = self.legacy_root.parent.parent
+        self.eval_script = self.repo_root / "scripts" / "counterfactual" / "eval_sdc_semantic_action_projections.py"
+
+    @staticmethod
+    def _normalize_text_list(value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            parts = [item.strip() for item in value.split(",")]
+            return [item for item in parts if item]
+        if isinstance(value, (list, tuple)):
+            items = []
+            for item in value:
+                text = str(item).strip()
+                if text:
+                    items.append(text)
+            return items
+        text = str(value).strip()
+        return [text] if text else []
+
+    def _resolve_control_index(self):
+        if self.control_index_override:
+            return pathlib.Path(self.control_index_override).expanduser().resolve()
+        for key in (
+            "DATA.COUNTERFACTUAL_CONTROL_INDEX_VAL",
+            "DATA.COUNTERFACTUAL_CONTROL_INDEX_TRAIN",
+            "DATA.COUNTERFACTUAL_CONTROL_INDEX",
+        ):
+            value = str(OmegaConf.select(self.config, key, default="") or "").strip()
+            if value:
+                return pathlib.Path(value).expanduser().resolve()
+        raise FileNotFoundError("No control index configured for rollout GIF eval.")
+
+    def _resolve_data_dir(self):
+        if self.data_dir_override:
+            return pathlib.Path(self.data_dir_override).expanduser().resolve()
+        for key in ("DATA.TEST_DATA_DIR", "DATA.TRAINING_DATA_DIR"):
+            value = str(OmegaConf.select(self.config, key, default="") or "").strip()
+            if value:
+                return pathlib.Path(value).expanduser().resolve()
+        raise FileNotFoundError("No data dir configured for rollout GIF eval.")
+
+    def _select_scenario_ids(self, control_index: pathlib.Path):
+        if self.scenario_ids:
+            return self.scenario_ids[: self.max_scenes]
+        selected = []
+        seen = set()
+        with control_index.open("rt", encoding="utf-8") as fp:
+            for line in fp:
+                text = line.strip()
+                if not text:
+                    continue
+                scenario_id = str(json.loads(text).get("scenario_id") or "").strip()
+                if not scenario_id or scenario_id in seen:
+                    continue
+                selected.append(scenario_id)
+                seen.add(scenario_id)
+                if len(selected) >= self.max_scenes:
+                    break
+        if not selected:
+            raise RuntimeError(f"No scenario ids found in control index: {control_index}")
+        return selected
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if not self.enabled or not trainer.is_global_zero or trainer.sanity_checking:
+            return
+
+        self._validation_events += 1
+        if (self._validation_events % self.every_n_validations) != 0:
+            return
+
+        try:
+            control_index = self._resolve_control_index()
+            data_dir = self._resolve_data_dir()
+            scenario_ids = self._select_scenario_ids(control_index)
+            eval_root = self.artifact_root / "rollout_gif_eval" / f"step_{int(trainer.global_step):06d}"
+            eval_root.mkdir(parents=True, exist_ok=True)
+
+            cfg_path = eval_root / "resolved_train_config.yaml"
+            OmegaConf.save(config=self.config, f=str(cfg_path))
+
+            ckpt_path = eval_root / "_snapshot.ckpt"
+            trainer.save_checkpoint(str(ckpt_path))
+
+            summary = {
+                "global_step": int(trainer.global_step),
+                "current_epoch": int(trainer.current_epoch),
+                "scenario_ids": list(scenario_ids),
+                "control_index": str(control_index),
+                "data_dir": str(data_dir),
+                "device": self.rollout_device,
+                "results": [],
+            }
+            env = dict(os.environ)
+            py_path = env.get("PYTHONPATH", "")
+            repo_root_text = str(self.repo_root)
+            env["PYTHONPATH"] = (
+                f"{repo_root_text}:{py_path}" if py_path and repo_root_text not in py_path.split(":") else (py_path or repo_root_text)
+            )
+
+            for scenario_id in scenario_ids:
+                scenario_outdir = eval_root / scenario_id
+                scenario_outdir.mkdir(parents=True, exist_ok=True)
+                cmd = [
+                    sys.executable,
+                    str(self.eval_script),
+                    "--config",
+                    str(cfg_path),
+                    "--control-index",
+                    str(control_index),
+                    "--data-dir",
+                    str(data_dir),
+                    "--ckpt",
+                    str(ckpt_path),
+                    "--outdir",
+                    str(scenario_outdir),
+                    "--scenario-id",
+                    str(scenario_id),
+                    "--num-samples",
+                    str(self.num_samples),
+                    "--device",
+                    str(self.rollout_device),
+                    "--autoregressive-rollout",
+                    "--rollout-sampling-method",
+                    str(self.rollout_sampling_method),
+                    "--rollout-temperature",
+                    str(self.rollout_temperature),
+                    "--rollout-topp",
+                    str(self.rollout_topp),
+                    "--save-rollout-gif",
+                    "--rollout-gif-fps",
+                    str(self.rollout_gif_fps),
+                ]
+                if self.all_scene_slots:
+                    cmd.append("--all-scene-slots")
+                result = subprocess.run(
+                    cmd,
+                    cwd=str(self.repo_root),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+                log_path = scenario_outdir / "_callback_eval.log"
+                log_path.write_text(result.stdout, encoding="utf-8")
+                scenario_summary = {
+                    "scenario_id": str(scenario_id),
+                    "returncode": int(result.returncode),
+                    "output_dir": str(scenario_outdir),
+                    "log_path": str(log_path),
+                }
+                summary["results"].append(scenario_summary)
+                if result.returncode != 0:
+                    print(
+                        f"[rollout-gif-eval] scenario={scenario_id} failed with return code {result.returncode}. "
+                        f"See {log_path}"
+                    )
+                else:
+                    print(
+                        f"[rollout-gif-eval] saved autoregressive rollout GIFs for {scenario_id} to {scenario_outdir}"
+                    )
+
+            summary_path = eval_root / "callback_summary.json"
+            summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+            try:
+                ckpt_path.unlink()
+            except FileNotFoundError:
+                pass
+        except Exception as exc:
+            print(f"[rollout-gif-eval] callback failed: {exc}")
+            traceback.print_exc()
+
+
 @hydra.main(version_base=None, config_path=str(REPO_ROOT / "cfgs"), config_name="motion_default.yaml")
 def main(config):
     # Unfreeze the config to allow modification
@@ -211,6 +409,12 @@ def main(config):
         ),
         LearningRateMonitor(logging_interval='step')
     ]
+    rollout_gif_callback = SemanticRolloutGifCallback(
+        config=config,
+        artifact_root=ckpt_save_dir,
+    )
+    if rollout_gif_callback.enabled:
+        callbacks.append(rollout_gif_callback)
     device = "auto" if torch.cuda.is_available() else "cpu"
     trainer_kwargs = dict(
         num_sanity_val_steps=config.num_sanity_val_steps,
