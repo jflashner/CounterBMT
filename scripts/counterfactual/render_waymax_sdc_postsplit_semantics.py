@@ -6,6 +6,7 @@ import itertools
 import json
 import random
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -75,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt-relative-threshold-m", type=float, default=10.0)
     parser.add_argument("--alt-diversity-weight", type=float, default=1.0)
     parser.add_argument("--include-off-route-paths", action="store_true")
+    parser.add_argument("--diversity-top-k", type=int, default=0)
     parser.add_argument("--gradient-display-reference", type=float, default=0.30)
     parser.add_argument("--gradient-display-gamma", type=float, default=0.80)
     parser.add_argument("--save-scene-grid", action="store_true")
@@ -86,6 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default="gpt-5.4")
     parser.add_argument("--image-detail", type=str, default="original", choices=("low", "high", "original", "auto"))
     parser.add_argument("--save-pkls", action="store_true")
+    parser.add_argument("--render-workers", type=int, default=1)
     return parser.parse_args()
 
 
@@ -217,6 +220,7 @@ def _select_top_separable_alternates(
     gt_relative_threshold_m: float,
     alt_diversity_weight: float,
     include_off_route_paths: bool,
+    diversity_top_k: int,
 ) -> Optional[Dict[str, Any]]:
     track_state = dict(dict(raw_scenario["tracks"]).get(str(sdc_id), {}).get("state", {}))
     current_position = np.asarray(track_state.get("position", []), dtype=np.float32)
@@ -303,6 +307,9 @@ def _select_top_separable_alternates(
     if len(scored_rows) < 3:
         return None
     scored_rows = sorted(scored_rows, key=lambda row: (-float(row["score"]), str(row["path_id"])))
+    shortlist_top_k = max(0, int(diversity_top_k))
+    if shortlist_top_k > 0:
+        scored_rows = scored_rows[: max(3, shortlist_top_k)]
     pairwise_diversity: Dict[Tuple[int, int], float] = {}
     for left_idx, right_idx in itertools.combinations(range(len(scored_rows)), 2):
         pairwise_diversity[(left_idx, right_idx)] = _symmetric_pairwise_diversity_score(
@@ -544,6 +551,106 @@ def _slot_request_row(
     }
 
 
+def _render_selected_entry(
+    *,
+    row: Mapping[str, Any],
+    rank_idx: int,
+    outdir: Path,
+    save_scene_grid: bool,
+    scene_grid_padding_m: float,
+    scene_grid_columns: int,
+    save_pkls: bool,
+    model_name: str,
+    image_detail: str,
+    gradient_display_reference: float,
+    gradient_display_gamma: float,
+) -> Dict[str, Any]:
+    scenario_id = str(row["scenario_id"])
+    sdc_id = str(row["sdc_id"])
+    current_time_index = int(row["current_time_index"])
+    example_id = f"{scenario_id}__sdc_{sdc_id}__t_{current_time_index:03d}"
+    example_dir = outdir / "examples" / example_id
+    image_dir = example_dir / "images"
+    payload = _build_payload_with_postsplit_gradients(
+        raw_scenario=row["raw_scenario"],
+        example_id=example_id,
+        scenario_id=scenario_id,
+        sdc_id=sdc_id,
+        current_time_index=current_time_index,
+        gt_future_xy=np.asarray(row["gt_future_xy"], dtype=np.float32),
+        gt_past_xy=np.asarray(row["gt_past_xy"], dtype=np.float32),
+        selected_bundle=row["selected_bundle"],
+        image_dir=image_dir,
+        gradient_display_reference=float(gradient_display_reference),
+        gradient_display_gamma=float(gradient_display_gamma),
+    )
+    payload["scene_index"] = int(row["scene_index"])
+    payload["selection_rank"] = int(rank_idx)
+    payload["selection_score"] = float(row["scene_score"])
+    if bool(save_scene_grid):
+        scene_grid_path = example_dir / "all_sdc_paths_grid.png"
+        scene_grid_summary = _plot_scene_grid(
+            row["raw_scenario"],
+            out_path=scene_grid_path,
+            padding_m=float(scene_grid_padding_m),
+            columns=int(scene_grid_columns),
+        )
+        payload["all_sdc_paths_grid_png"] = str(scene_grid_path.resolve())
+        payload["all_sdc_paths_grid_summary"] = scene_grid_summary
+    write_json(example_dir / "render_metadata.json", payload)
+    if bool(save_pkls):
+        write_json(example_dir / "raw_scenario.json", row["raw_scenario"])
+
+    prompt_manifest_rows: List[Dict[str, Any]] = []
+    for slot_row in list(payload.get("slot_metadata") or []):
+        slot_id = str(slot_row.get("slot_id") or "")
+        if slot_id not in SLOT_IDS:
+            continue
+        prompt_manifest_rows.append(
+            _slot_request_row(
+                payload=payload,
+                slot_row=slot_row,
+                example_dir=example_dir,
+                model_name=str(model_name),
+                image_detail=str(image_detail),
+            )
+        )
+
+    aggregate_row = {
+        "example_id": example_id,
+        "scenario_id": scenario_id,
+        "sdc_id": sdc_id,
+        "scene_index": int(row["scene_index"]),
+        "current_time_index": int(current_time_index),
+        "selection_rank": int(rank_idx),
+        "selection_score": float(row["scene_score"]),
+        "selection_score_kind": str(row["selected_bundle"].get("scene_score_kind") or "unknown"),
+        "selection_gt_component": float(row["selected_bundle"].get("scene_gt_component") or 0.0),
+        "selection_alt_diversity_component": float(row["selected_bundle"].get("scene_alt_diversity_component") or 0.0),
+        "gt_length_m": float(row["gt_length_m"]),
+        "selected_alt_path_ids": list(row["selected_alt_path_ids"]),
+        "slot_metadata": payload["slot_metadata"],
+        "images": payload["images"],
+        "all_sdc_paths_grid_png": payload.get("all_sdc_paths_grid_png"),
+        "all_sdc_paths_grid_summary": payload.get("all_sdc_paths_grid_summary"),
+        "prompt_paths": {
+            str(slot_row.get("slot_id") or ""): str((example_dir / f"prompt_{slot_row.get('slot_id')}.txt").resolve())
+            for slot_row in list(payload.get("slot_metadata") or [])
+            if str(slot_row.get("slot_id") or "") in SLOT_IDS
+        },
+        "request_jsons": {
+            str(slot_row.get("slot_id") or ""): str((example_dir / f"request_{slot_row.get('slot_id')}.json").resolve())
+            for slot_row in list(payload.get("slot_metadata") or [])
+            if str(slot_row.get("slot_id") or "") in SLOT_IDS
+        },
+    }
+    return {
+        "render_payload": payload,
+        "prompt_manifest_rows": prompt_manifest_rows,
+        "aggregate_row": aggregate_row,
+    }
+
+
 def main() -> int:
     args = parse_args()
     if not waymax_available():
@@ -602,6 +709,7 @@ def main() -> int:
             gt_relative_threshold_m=float(args.gt_relative_threshold_m),
             alt_diversity_weight=float(args.alt_diversity_weight),
             include_off_route_paths=bool(args.include_off_route_paths),
+            diversity_top_k=int(args.diversity_top_k),
         )
         if selected_bundle is None:
             continue
@@ -634,89 +742,55 @@ def main() -> int:
     prompt_manifest_rows: List[Dict[str, Any]] = []
     aggregate_rows: List[Dict[str, Any]] = []
 
-    for rank_idx, row in enumerate(selected_rows):
-        scenario_id = str(row["scenario_id"])
-        sdc_id = str(row["sdc_id"])
-        current_time_index = int(row["current_time_index"])
-        example_id = f"{scenario_id}__sdc_{sdc_id}__t_{current_time_index:03d}"
-        example_dir = outdir / "examples" / example_id
-        image_dir = example_dir / "images"
-        payload = _build_payload_with_postsplit_gradients(
-            raw_scenario=row["raw_scenario"],
-            example_id=example_id,
-            scenario_id=scenario_id,
-            sdc_id=sdc_id,
-            current_time_index=current_time_index,
-            gt_future_xy=np.asarray(row["gt_future_xy"], dtype=np.float32),
-            gt_past_xy=np.asarray(row["gt_past_xy"], dtype=np.float32),
-            selected_bundle=row["selected_bundle"],
-            image_dir=image_dir,
-            gradient_display_reference=float(args.gradient_display_reference),
-            gradient_display_gamma=float(args.gradient_display_gamma),
-        )
-        payload["scene_index"] = int(row["scene_index"])
-        payload["selection_rank"] = int(rank_idx)
-        payload["selection_score"] = float(row["scene_score"])
-        if bool(args.save_scene_grid):
-            scene_grid_path = example_dir / "all_sdc_paths_grid.png"
-            scene_grid_summary = _plot_scene_grid(
-                row["raw_scenario"],
-                out_path=scene_grid_path,
-                padding_m=float(args.scene_grid_padding_m),
-                columns=int(args.scene_grid_columns),
-            )
-            payload["all_sdc_paths_grid_png"] = str(scene_grid_path.resolve())
-            payload["all_sdc_paths_grid_summary"] = scene_grid_summary
-        write_json(example_dir / "render_metadata.json", payload)
-        if bool(args.save_pkls):
-            # Raw state is not retained once converted; save staged raw scenario instead.
-            write_json(example_dir / "raw_scenario.json", row["raw_scenario"])
-
-        for slot_row in list(payload.get("slot_metadata") or []):
-            slot_id = str(slot_row.get("slot_id") or "")
-            if slot_id not in SLOT_IDS:
-                continue
-            prompt_manifest_rows.append(
-                _slot_request_row(
-                    payload=payload,
-                    slot_row=slot_row,
-                    example_dir=example_dir,
+    render_jobs = [(int(rank_idx), dict(row)) for rank_idx, row in enumerate(selected_rows)]
+    render_results: List[Dict[str, Any]] = []
+    if int(args.render_workers) > 1 and len(render_jobs) > 1:
+        with ProcessPoolExecutor(max_workers=int(args.render_workers)) as executor:
+            future_map = {
+                executor.submit(
+                    _render_selected_entry,
+                    row=row,
+                    rank_idx=rank_idx,
+                    outdir=outdir,
+                    save_scene_grid=bool(args.save_scene_grid),
+                    scene_grid_padding_m=float(args.scene_grid_padding_m),
+                    scene_grid_columns=int(args.scene_grid_columns),
+                    save_pkls=bool(args.save_pkls),
                     model_name=str(args.model),
                     image_detail=str(args.image_detail),
+                    gradient_display_reference=float(args.gradient_display_reference),
+                    gradient_display_gamma=float(args.gradient_display_gamma),
+                ): rank_idx
+                for rank_idx, row in render_jobs
+            }
+            for future in as_completed(future_map):
+                render_results.append(dict(future.result()))
+    else:
+        for rank_idx, row in render_jobs:
+            render_results.append(
+                _render_selected_entry(
+                    row=row,
+                    rank_idx=rank_idx,
+                    outdir=outdir,
+                    save_scene_grid=bool(args.save_scene_grid),
+                    scene_grid_padding_m=float(args.scene_grid_padding_m),
+                    scene_grid_columns=int(args.scene_grid_columns),
+                    save_pkls=bool(args.save_pkls),
+                    model_name=str(args.model),
+                    image_detail=str(args.image_detail),
+                    gradient_display_reference=float(args.gradient_display_reference),
+                    gradient_display_gamma=float(args.gradient_display_gamma),
                 )
             )
 
-        aggregate_rows.append(
-            {
-                "example_id": example_id,
-                "scenario_id": scenario_id,
-                "sdc_id": sdc_id,
-                "scene_index": int(row["scene_index"]),
-                "current_time_index": int(current_time_index),
-                "selection_rank": int(rank_idx),
-                "selection_score": float(row["scene_score"]),
-                "selection_score_kind": str(row["selected_bundle"].get("scene_score_kind") or "unknown"),
-                "selection_gt_component": float(row["selected_bundle"].get("scene_gt_component") or 0.0),
-                "selection_alt_diversity_component": float(row["selected_bundle"].get("scene_alt_diversity_component") or 0.0),
-                "gt_length_m": float(row["gt_length_m"]),
-                "selected_alt_path_ids": list(row["selected_alt_path_ids"]),
-                "slot_metadata": payload["slot_metadata"],
-                "images": payload["images"],
-                "all_sdc_paths_grid_png": payload.get("all_sdc_paths_grid_png"),
-                "all_sdc_paths_grid_summary": payload.get("all_sdc_paths_grid_summary"),
-                "prompt_paths": {
-                    str(slot_row.get("slot_id") or ""): str((example_dir / f"prompt_{slot_row.get('slot_id')}.txt").resolve())
-                    for slot_row in list(payload.get("slot_metadata") or [])
-                    if str(slot_row.get("slot_id") or "") in SLOT_IDS
-                },
-                "request_jsons": {
-                    str(slot_row.get("slot_id") or ""): str((example_dir / f"request_{slot_row.get('slot_id')}.json").resolve())
-                    for slot_row in list(payload.get("slot_metadata") or [])
-                    if str(slot_row.get("slot_id") or "") in SLOT_IDS
-                },
-            }
-        )
-        render_rows.append(payload)
+    render_results = sorted(
+        render_results,
+        key=lambda row: int(dict(row.get("render_payload") or {}).get("selection_rank") or 0),
+    )
+    for result in render_results:
+        render_rows.append(dict(result["render_payload"]))
+        prompt_manifest_rows.extend([dict(row) for row in list(result.get("prompt_manifest_rows") or [])])
+        aggregate_rows.append(dict(result["aggregate_row"]))
 
     ranking_rows = []
     for row in ranked_rows:
@@ -764,6 +838,7 @@ def main() -> int:
             "min_gt_length_m": float(args.min_gt_length_m),
             "gt_relative_threshold_m": float(args.gt_relative_threshold_m),
             "alt_diversity_weight": float(args.alt_diversity_weight),
+            "diversity_top_k": int(args.diversity_top_k),
             "include_off_route_paths": bool(args.include_off_route_paths),
             "gradient_display_reference": float(args.gradient_display_reference),
             "gradient_display_gamma": float(args.gradient_display_gamma),
@@ -783,9 +858,11 @@ def main() -> int:
         "min_gt_length_m": float(args.min_gt_length_m),
         "gt_relative_threshold_m": float(args.gt_relative_threshold_m),
         "alt_diversity_weight": float(args.alt_diversity_weight),
+        "diversity_top_k": int(args.diversity_top_k),
         "include_off_route_paths": bool(args.include_off_route_paths),
         "gradient_display_reference": float(args.gradient_display_reference),
         "gradient_display_gamma": float(args.gradient_display_gamma),
+        "render_workers": int(args.render_workers),
         "render_manifest_json": str(render_manifest_path.resolve()),
         "request_manifest_jsonl": str(request_manifest_path.resolve()),
         "selection_summary_json": str(selection_summary_path.resolve()),
