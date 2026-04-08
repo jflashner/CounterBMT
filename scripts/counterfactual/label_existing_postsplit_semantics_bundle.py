@@ -322,6 +322,16 @@ def _filter_batch_jobs(
     ]
 
 
+def _custom_ids_for_jobs(jobs: Sequence[Mapping[str, Any]]) -> set[str]:
+    out: set[str] = set()
+    for job in jobs:
+        for custom_id in list(job.get("custom_ids") or []):
+            token = str(custom_id).strip()
+            if token:
+                out.add(token)
+    return out
+
+
 def _merge_batch_jobs(
     *,
     base_jobs: Sequence[Mapping[str, Any]],
@@ -757,6 +767,17 @@ def main() -> int:
                 batch_jobs,
                 shard_indices=requested_batch_shard_indices,
             )
+            missing_batch_ids = [
+                int(job.get("shard_index") or -1)
+                for job in jobs_to_wait
+                if not str(job.get("batch_id") or "").strip()
+            ]
+            if missing_batch_ids:
+                raise SystemExit(
+                    "Requested --wait-for-batch for shard(s) without submitted batch_id: "
+                    + ",".join(str(idx) for idx in sorted(missing_batch_ids))
+                    + ". Run with --submit-batch first."
+                )
             waited_jobs = _wait_and_download_batch_jobs(
                 client=client,
                 jobs=jobs_to_wait,
@@ -784,7 +805,17 @@ def main() -> int:
         parsed_batch_custom_ids = sorted(parsed_batch_rows.keys())
         failed_slots.extend(batch_failures)
 
-        unresolved_specs = [spec for spec in slot_specs if str(spec["custom_id"]) not in raw_contracts_written]
+        fallback_target_custom_ids = (
+            _custom_ids_for_jobs(_filter_batch_jobs(batch_jobs, shard_indices=requested_batch_shard_indices))
+            if bool(args.wait_for_batch)
+            else set(str(spec["custom_id"]) for spec in slot_specs)
+        )
+        unresolved_specs = [
+            spec
+            for spec in slot_specs
+            if str(spec["custom_id"]) in fallback_target_custom_ids
+            and str(spec["custom_id"]) not in raw_contracts_written
+        ]
         if bool(args.wait_for_batch) and unresolved_specs:
             sync_rows, sync_failures = _run_sync_labeling(
                 specs=unresolved_specs,

@@ -36,6 +36,7 @@ from scripts.counterfactual.label_waymax_sdc_path_semantics import (
 from scripts.counterfactual.plot_waymax_sdc_path_grids import _plot_scene_grid  # type: ignore[attr-defined]
 from bmt.counterfactual.sdc_path_control import (
     ResampledLocalPath,
+    _sanitize_polyline,
     compute_path_separability_profile,
     polyline_arc_lengths,
     polyline_headings,
@@ -77,8 +78,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alt-diversity-weight", type=float, default=1.0)
     parser.add_argument("--include-off-route-paths", action="store_true")
     parser.add_argument("--diversity-top-k", type=int, default=0)
-    parser.add_argument("--gradient-display-reference", type=float, default=0.30)
-    parser.add_argument("--gradient-display-gamma", type=float, default=0.80)
+    # Match the existing top50 gold-standard postsplit bundle by default.
+    parser.add_argument("--gradient-display-reference", type=float, default=0.75)
+    parser.add_argument("--gradient-display-gamma", type=float, default=1.10)
+    parser.add_argument("--show-traffic-lights", action="store_true")
     parser.add_argument("--save-scene-grid", action="store_true")
     parser.add_argument("--scene-grid-columns", type=int, default=4)
     parser.add_argument("--scene-grid-padding-m", type=float, default=18.0)
@@ -108,12 +111,17 @@ def _resampled_local_path_from_world_segments(
         segment_world_xy = _finite_xy_rows(np.asarray(segment_world, dtype=np.float32))
         if segment_world_xy.shape[0] < 2:
             continue
-        segment_world_resampled = resample_polyline_xy(segment_world_xy, spacing_m=float(spacing_m))
+        segment_world_resampled = _sanitize_polyline(
+            resample_polyline_xy(segment_world_xy, spacing_m=float(spacing_m))
+        ).astype(np.float32)
+        if segment_world_resampled.shape[0] < 2:
+            continue
         segment_local = world_to_sdc_up_frame(
             segment_world_resampled,
             origin_xy_world=np.asarray(center_xy_world, dtype=np.float32),
             origin_heading_world=float(origin_heading_world),
         )
+        segment_local = _sanitize_polyline(segment_local).astype(np.float32)
         if segment_local.shape[0] < 2:
             continue
         world_resampled_segments.append(np.asarray(segment_world_resampled, dtype=np.float32))
@@ -173,6 +181,47 @@ def _display_gradient_values(values: np.ndarray, *, reference: float, gamma: flo
     return np.power(scaled, gam, dtype=np.float32)
 
 
+def _pairwise_distance_matrix(path_a_xy: np.ndarray, path_b_xy: np.ndarray) -> np.ndarray:
+    diff = np.asarray(path_a_xy, dtype=np.float32)[:, None, :] - np.asarray(path_b_xy, dtype=np.float32)[None, :, :]
+    return np.linalg.norm(diff, axis=-1).astype(np.float32)
+
+
+def _single_competitor_separability_profile_from_distances(
+    selected_path: ResampledLocalPath,
+    competing_path_id: str,
+    competing_path: ResampledLocalPath,
+    distance_matrix: np.ndarray,
+    *,
+    scale_m: float,
+    heading_weight_m: float,
+) -> Dict[str, Any]:
+    selected_xy = np.asarray(selected_path.waypoints_xy, dtype=np.float32)
+    selected_heading = np.asarray(selected_path.headings, dtype=np.float32).reshape(-1)
+    competitor_heading = np.asarray(competing_path.headings, dtype=np.float32).reshape(-1)
+    if selected_xy.shape[0] == 0:
+        return {
+            "separability": np.zeros((0,), dtype=np.float32),
+            "min_distance_m": np.zeros((0,), dtype=np.float32),
+            "heading_delta_rad": np.zeros((0,), dtype=np.float32),
+            "nearest_competing_path_id": [],
+        }
+    d = np.asarray(distance_matrix, dtype=np.float32)
+    nearest_idx = np.argmin(d, axis=-1)
+    nearest_d = d[np.arange(selected_xy.shape[0], dtype=np.int64), nearest_idx]
+    nearest_heading = competitor_heading[np.asarray(nearest_idx, dtype=np.int64)]
+    heading_delta = np.abs(
+        np.arctan2(np.sin(selected_heading - nearest_heading), np.cos(selected_heading - nearest_heading))
+    ).astype(np.float32)
+    combined = nearest_d + (float(heading_weight_m) * heading_delta)
+    normalized = np.clip(combined / max(float(scale_m), 1e-3), 0.0, 1.0).astype(np.float32)
+    return {
+        "separability": normalized,
+        "min_distance_m": nearest_d.astype(np.float32),
+        "heading_delta_rad": heading_delta.astype(np.float32),
+        "nearest_competing_path_id": [str(competing_path_id)] * int(selected_xy.shape[0]),
+    }
+
+
 def _symmetric_pairwise_diversity_score(
     path_a: ResampledLocalPath,
     path_b: ResampledLocalPath,
@@ -182,9 +231,12 @@ def _symmetric_pairwise_diversity_score(
 ) -> float:
     if path_a.waypoints_xy.shape[0] < 2 or path_b.waypoints_xy.shape[0] < 2:
         return 0.0
-    sep_a = compute_path_separability_profile(
+    d_ab = _pairwise_distance_matrix(path_a.waypoints_xy, path_b.waypoints_xy)
+    sep_a = _single_competitor_separability_profile_from_distances(
         path_a,
-        {"other": path_b},
+        "other",
+        path_b,
+        d_ab,
         scale_m=float(scale_m),
         heading_weight_m=float(heading_weight_m),
     )
@@ -193,9 +245,11 @@ def _symmetric_pairwise_diversity_score(
         np.asarray(path_a.arc_lengths_m, dtype=np.float32),
         gt_length_m=float(path_a.arc_lengths_m[-1]) if path_a.arc_lengths_m.size > 0 else 1.0,
     )
-    sep_b = compute_path_separability_profile(
+    sep_b = _single_competitor_separability_profile_from_distances(
         path_b,
-        {"other": path_a},
+        "other",
+        path_a,
+        d_ab.T,
         scale_m=float(scale_m),
         heading_weight_m=float(heading_weight_m),
     )
@@ -260,9 +314,12 @@ def _select_top_separable_alternates(
         )
         if alt_local_path.waypoints_xy.shape[0] < 2:
             continue
-        alt_sep = compute_path_separability_profile(
+        alt_gt_distance = _pairwise_distance_matrix(alt_local_path.waypoints_xy, gt_local_path.waypoints_xy)
+        alt_sep = _single_competitor_separability_profile_from_distances(
             alt_local_path,
-            {"gt": gt_local_path},
+            "gt",
+            gt_local_path,
+            alt_gt_distance,
             scale_m=float(separability_scale_m),
             heading_weight_m=float(separability_heading_weight_m),
         )
@@ -271,9 +328,11 @@ def _select_top_separable_alternates(
             np.asarray(alt_local_path.arc_lengths_m, dtype=np.float32),
             gt_length_m=gt_length_m,
         )
-        gt_vs_alt_sep = compute_path_separability_profile(
+        gt_vs_alt_sep = _single_competitor_separability_profile_from_distances(
             gt_local_path,
-            {path_id: alt_local_path},
+            path_id,
+            alt_local_path,
+            alt_gt_distance.T,
             scale_m=float(separability_scale_m),
             heading_weight_m=float(separability_heading_weight_m),
         )
@@ -381,6 +440,7 @@ def _build_payload_with_postsplit_gradients(
     image_dir: Path,
     gradient_display_reference: float,
     gradient_display_gamma: float,
+    show_traffic_lights: bool,
 ) -> Dict[str, Any]:
     def _concat_segments(segments: Sequence[np.ndarray]) -> np.ndarray:
         kept = [np.asarray(segment, dtype=np.float64) for segment in segments if np.asarray(segment).shape[0] >= 2]
@@ -398,7 +458,11 @@ def _build_payload_with_postsplit_gradients(
     current_xy = _finite_xy_rows(current_position[idx])[0]
     current_heading = float(current_heading_seq[idx]) if idx < current_heading_seq.shape[0] and np.isfinite(current_heading_seq[idx]) else 0.0
     map_context = _select_map_context(raw_scenario, center_xy=current_xy, radius_m=CONTEXT_SELECTION_RADIUS_M)
-    traffic_lights = _select_traffic_lights(raw_scenario, center_xy=current_xy, radius_m=CONTEXT_SELECTION_RADIUS_M, time_index=idx)
+    traffic_lights = (
+        _select_traffic_lights(raw_scenario, center_xy=current_xy, radius_m=CONTEXT_SELECTION_RADIUS_M, time_index=idx)
+        if bool(show_traffic_lights)
+        else []
+    )
     nearby_agents = _select_nearby_agents(raw_scenario, sdc_id=sdc_id, center_xy=current_xy, current_idx=idx, radius_m=CONTEXT_SELECTION_RADIUS_M)
 
     slot_metadata = [
@@ -564,6 +628,7 @@ def _render_selected_entry(
     image_detail: str,
     gradient_display_reference: float,
     gradient_display_gamma: float,
+    show_traffic_lights: bool,
 ) -> Dict[str, Any]:
     scenario_id = str(row["scenario_id"])
     sdc_id = str(row["sdc_id"])
@@ -583,6 +648,7 @@ def _render_selected_entry(
         image_dir=image_dir,
         gradient_display_reference=float(gradient_display_reference),
         gradient_display_gamma=float(gradient_display_gamma),
+        show_traffic_lights=bool(show_traffic_lights),
     )
     payload["scene_index"] = int(row["scene_index"])
     payload["selection_rank"] = int(rank_idx)
@@ -760,6 +826,7 @@ def main() -> int:
                     image_detail=str(args.image_detail),
                     gradient_display_reference=float(args.gradient_display_reference),
                     gradient_display_gamma=float(args.gradient_display_gamma),
+                    show_traffic_lights=bool(args.show_traffic_lights),
                 ): rank_idx
                 for rank_idx, row in render_jobs
             }
@@ -780,6 +847,7 @@ def main() -> int:
                     image_detail=str(args.image_detail),
                     gradient_display_reference=float(args.gradient_display_reference),
                     gradient_display_gamma=float(args.gradient_display_gamma),
+                    show_traffic_lights=bool(args.show_traffic_lights),
                 )
             )
 
@@ -842,6 +910,7 @@ def main() -> int:
             "include_off_route_paths": bool(args.include_off_route_paths),
             "gradient_display_reference": float(args.gradient_display_reference),
             "gradient_display_gamma": float(args.gradient_display_gamma),
+            "show_traffic_lights": bool(args.show_traffic_lights),
             "rows": ranking_rows,
         },
     )
@@ -862,6 +931,7 @@ def main() -> int:
         "include_off_route_paths": bool(args.include_off_route_paths),
         "gradient_display_reference": float(args.gradient_display_reference),
         "gradient_display_gamma": float(args.gradient_display_gamma),
+        "show_traffic_lights": bool(args.show_traffic_lights),
         "render_workers": int(args.render_workers),
         "render_manifest_json": str(render_manifest_path.resolve()),
         "request_manifest_jsonl": str(request_manifest_path.resolve()),

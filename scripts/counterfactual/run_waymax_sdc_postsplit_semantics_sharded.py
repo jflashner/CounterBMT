@@ -47,8 +47,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alt-diversity-weight", type=float, default=1.0)
     parser.add_argument("--include-off-route-paths", action="store_true")
     parser.add_argument("--diversity-top-k", type=int, default=0)
-    parser.add_argument("--gradient-display-reference", type=float, default=0.30)
-    parser.add_argument("--gradient-display-gamma", type=float, default=0.80)
+    # Match the current postsplit gold-standard bundle defaults unless explicitly overridden.
+    parser.add_argument("--gradient-display-reference", type=float, default=0.75)
+    parser.add_argument("--gradient-display-gamma", type=float, default=1.10)
+    parser.add_argument("--show-traffic-lights", action="store_true")
     parser.add_argument("--save-scene-grid", action="store_true")
     parser.add_argument("--scene-grid-columns", type=int, default=4)
     parser.add_argument("--scene-grid-padding-m", type=float, default=18.0)
@@ -157,6 +159,8 @@ def _build_render_command(
     ]
     if bool(args.include_off_route_paths):
         cmd.append("--include-off-route-paths")
+    if bool(args.show_traffic_lights):
+        cmd.append("--show-traffic-lights")
     if bool(args.save_scene_grid):
         cmd.append("--save-scene-grid")
     if bool(args.save_pkls):

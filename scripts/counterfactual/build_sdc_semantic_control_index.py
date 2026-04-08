@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import pickle
 import shutil
@@ -42,6 +43,10 @@ from bmt.counterfactual.sdc_semantic_control import (
     world_direction_to_model_frame,
     world_xy_to_model_frame,
 )
+from bmt.counterfactual.waymax_adapter import raw_scenario_from_waymax_state, resolve_waymax_config
+from waymax.dataloader import womd_dataloader
+
+DEFAULT_WOD_131_TRAIN_PATH = "gs://waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example/training/training_tfexample.tfrecord-00000-of-01000"
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantics-index", type=str, required=True)
     parser.add_argument("--outdir", type=str, required=True)
     parser.add_argument("--output-name", type=str, default="sdc_semantic_control_index.jsonl")
+    parser.add_argument("--path", type=str, default=DEFAULT_WOD_131_TRAIN_PATH)
+    parser.add_argument("--config-name", type=str, default="WOD_1_3_1_TRAINING")
+    parser.add_argument("--num-paths", type=int, default=45)
+    parser.add_argument("--num-points-per-path", type=int, default=800)
     parser.add_argument("--resample-spacing-m", type=float, default=DEFAULT_RESAMPLE_SPACING_M)
     parser.add_argument("--separability-scale-m", type=float, default=DEFAULT_SEPARABILITY_SCALE_M)
     parser.add_argument("--separability-heading-weight-m", type=float, default=DEFAULT_SEPARABILITY_HEADING_WEIGHT_M)
@@ -107,6 +116,95 @@ def _find_scenario_pkl(example_dir: Path, *, scenario_id: str) -> Path:
     if matches:
         return matches[0]
     raise FileNotFoundError(f"No scenario .pkl found in {example_dir} or elsewhere under outputs/ for {scenario_id}")
+
+
+def _parse_scene_index_from_scenario_id(scenario_id: str) -> int:
+    text = str(scenario_id or "").strip()
+    if not text.startswith("waymax_scene_"):
+        raise ValueError(f"Unsupported scenario_id for Waymax reconstruction: {scenario_id!r}")
+    return int(text.rsplit("_", 1)[-1])
+
+
+def _materialize_missing_waymax_pkls(
+    *,
+    semantics_rows: Sequence[Mapping[str, Any]],
+    outdir: Path,
+    path: str,
+    config_name: str,
+    num_paths: int,
+    num_points_per_path: int,
+) -> Dict[str, Path]:
+    requested: Dict[int, Dict[str, Any]] = {}
+    for row in semantics_rows:
+        scenario_id = str(row.get("scenario_id") or dict(row.get("contract") or {}).get("scenario_id") or "").strip()
+        if not scenario_id:
+            continue
+        current_time_index = int(row.get("current_time_index") or dict(row.get("contract") or {}).get("current_time_index") or 0)
+        try:
+            scene_index = _parse_scene_index_from_scenario_id(scenario_id)
+        except Exception:
+            continue
+        requested.setdefault(
+            scene_index,
+            {
+                "scenario_id": scenario_id,
+                "current_time_index": current_time_index,
+            },
+        )
+    if not requested:
+        return {}
+
+    cache_root = outdir / "_reconstructed_waymax_pkls"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cached: Dict[str, Path] = {}
+    missing_scene_indices: List[int] = []
+    for scene_index, meta in sorted(requested.items()):
+        scenario_id = str(meta["scenario_id"])
+        pkl_path = cache_root / f"sd_waymo_v1.3.1_{scenario_id}.pkl"
+        if pkl_path.is_file():
+            cached[scenario_id] = pkl_path
+        else:
+            missing_scene_indices.append(int(scene_index))
+    if not missing_scene_indices:
+        return cached
+
+    config = resolve_waymax_config(
+        config_name=str(config_name),
+        path=str(path),
+        include_sdc_paths=True,
+        num_paths=int(num_paths),
+        num_points_per_path=int(num_points_per_path),
+    )
+    if dataclasses.is_dataclass(config) and hasattr(config, "num_shards"):
+        config = dataclasses.replace(config, num_shards=1, deterministic=True)
+
+    wanted = set(int(idx) for idx in missing_scene_indices)
+    max_scene_index = max(wanted)
+    scene_iter = womd_dataloader.simulator_state_generator(config=config)
+    for local_idx, state in enumerate(scene_iter):
+        if local_idx > max_scene_index:
+            break
+        if local_idx not in wanted:
+            continue
+        meta = requested[int(local_idx)]
+        scenario_id = str(meta["scenario_id"])
+        current_time_index = int(meta["current_time_index"])
+        raw_scenario = raw_scenario_from_waymax_state(
+            state,
+            scenario_id=scenario_id,
+            current_time_index=current_time_index,
+        )
+        pkl_path = cache_root / f"sd_waymo_v1.3.1_{scenario_id}.pkl"
+        with pkl_path.open("wb") as f:
+            pickle.dump(raw_scenario, f)
+        cached[scenario_id] = pkl_path
+        wanted.remove(int(local_idx))
+        if not wanted:
+            break
+    if wanted:
+        missing_ids = [str(requested[idx]["scenario_id"]) for idx in sorted(wanted)]
+        raise FileNotFoundError(f"Unable to reconstruct Waymax scenarios for: {missing_ids}")
+    return cached
 
 
 def _copy_file(src: Path, dst: Path) -> Path:
@@ -633,6 +731,14 @@ def main() -> int:
     debug_records: List[Dict[str, Any]] = []
     family_group_audit: List[Dict[str, Any]] = []
     staged_manifests: List[Dict[str, Any]] = []
+    reconstructed_pkls = _materialize_missing_waymax_pkls(
+        semantics_rows=semantics_rows,
+        outdir=outdir,
+        path=str(args.path),
+        config_name=str(args.config_name),
+        num_paths=int(args.num_paths),
+        num_points_per_path=int(args.num_points_per_path),
+    )
 
     for example_idx, example_row in enumerate(semantics_rows):
         example_dir = _find_example_dir(example_row)
@@ -641,7 +747,12 @@ def main() -> int:
             contract_path = example_dir / "contract_normalized.json"
             contract = dict(json.loads(contract_path.read_text(encoding="utf-8")))
         scenario_id = str(contract.get("scenario_id") or example_row.get("scenario_id") or "")
-        scenario_pkl = _find_scenario_pkl(example_dir, scenario_id=scenario_id)
+        try:
+            scenario_pkl = _find_scenario_pkl(example_dir, scenario_id=scenario_id)
+        except FileNotFoundError:
+            scenario_pkl = reconstructed_pkls.get(str(scenario_id), None)
+            if scenario_pkl is None:
+                raise
         raw_scenario = load_raw_scenario(scenario_pkl)
         sdc_id = str(contract.get("sdc_id") or example_row.get("sdc_id") or "")
         current_time_index = int(contract.get("current_time_index") or example_row.get("current_time_index") or 0)

@@ -37,6 +37,24 @@ class ResampledLocalPath:
     arc_lengths_m: np.ndarray
 
 
+def sanitize_resampled_local_path(path: ResampledLocalPath) -> ResampledLocalPath:
+    xy = _sanitize_polyline(path.waypoints_xy)
+    headings = np.asarray(path.headings, dtype=np.float32).reshape(-1)
+    arc = np.asarray(path.arc_lengths_m, dtype=np.float32).reshape(-1)
+    n = int(min(xy.shape[0], headings.shape[0], arc.shape[0]))
+    if n <= 0:
+        return ResampledLocalPath(
+            waypoints_xy=np.zeros((0, 2), dtype=np.float32),
+            headings=np.zeros((0,), dtype=np.float32),
+            arc_lengths_m=np.zeros((0,), dtype=np.float32),
+        )
+    return ResampledLocalPath(
+        waypoints_xy=np.asarray(xy[:n], dtype=np.float32),
+        headings=np.asarray(headings[:n], dtype=np.float32),
+        arc_lengths_m=np.asarray(arc[:n], dtype=np.float32),
+    )
+
+
 def normalize_semantic_label(value: Any, *, default: str = "straight") -> str:
     text = str(value or "").strip().lower()
     if text in SDC_PATH_SEMANTIC_LABEL_TO_ID:
@@ -163,7 +181,7 @@ def resample_polyline_xy(points_xy: Any, *, spacing_m: float = DEFAULT_RESAMPLE_
         sample_arc = np.concatenate([sample_arc, np.asarray([total], dtype=np.float32)], axis=0)
     x = np.interp(sample_arc, arc, xy[:, 0]).astype(np.float32)
     y = np.interp(sample_arc, arc, xy[:, 1]).astype(np.float32)
-    return np.stack([x, y], axis=-1).astype(np.float32)
+    return _sanitize_polyline(np.stack([x, y], axis=-1).astype(np.float32))
 
 
 def polyline_headings(points_xy: Any) -> np.ndarray:
@@ -346,8 +364,9 @@ def compute_path_separability_profile(
     scale_m: float = DEFAULT_SEPARABILITY_SCALE_M,
     heading_weight_m: float = DEFAULT_SEPARABILITY_HEADING_WEIGHT_M,
 ) -> Dict[str, Any]:
-    selected_xy = np.asarray(selected_path.waypoints_xy, dtype=np.float32)
-    selected_heading = np.asarray(selected_path.headings, dtype=np.float32).reshape(-1)
+    sanitized_selected = sanitize_resampled_local_path(selected_path)
+    selected_xy = np.asarray(sanitized_selected.waypoints_xy, dtype=np.float32)
+    selected_heading = np.asarray(sanitized_selected.headings, dtype=np.float32).reshape(-1)
     if selected_xy.shape[0] == 0:
         return {
             "separability": np.zeros((0,), dtype=np.float32),
@@ -367,8 +386,9 @@ def compute_path_separability_profile(
     min_heading_delta = np.zeros((selected_xy.shape[0],), dtype=np.float32)
     nearest_path_id: List[Optional[str]] = [None] * int(selected_xy.shape[0])
     for path_id, path in competing_paths.items():
-        competitor_xy = np.asarray(path.waypoints_xy, dtype=np.float32)
-        competitor_heading = np.asarray(path.headings, dtype=np.float32).reshape(-1)
+        sanitized_competitor = sanitize_resampled_local_path(path)
+        competitor_xy = np.asarray(sanitized_competitor.waypoints_xy, dtype=np.float32)
+        competitor_heading = np.asarray(sanitized_competitor.headings, dtype=np.float32).reshape(-1)
         if competitor_xy.shape[0] == 0:
             continue
         diff = selected_xy[:, None, :] - competitor_xy[None, :, :]
