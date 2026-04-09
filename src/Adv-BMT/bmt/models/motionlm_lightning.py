@@ -31,6 +31,7 @@ from bmt.counterfactual.sdc_semantic_control import (
     compute_family_gate_torch,
     family_confidence_weights_torch,
     project_points_to_family_paths_torch,
+    project_points_to_segment_tube_torch,
 )
 from bmt.models.motionlm import MotionLM
 from bmt.tokenization import get_tokenizer
@@ -139,6 +140,7 @@ class MotionLMLightning(pl.LightningModule):
         # self.validation_ground_truth = []
 
         self.exp_name = None
+        self._last_rollout_train_debug_step = -1
 
     def _configure_local_control_finetune(self):
         if not self.local_control_forward_enabled:
@@ -309,6 +311,190 @@ class MotionLMLightning(pl.LightningModule):
         if dtype is not None:
             value = value.to(dtype=dtype)
         return value
+
+    @staticmethod
+    def _normalize_text_list(value):
+        from bmt.counterfactual.sdc_rollout_training_debug import normalize_text_list
+
+        return normalize_text_list(value)
+
+    def _should_dump_rollout_tube_training_debug(self):
+        if not self.training:
+            return False
+        if not bool(self.config.get("ROLLOUT_TRAIN_DEBUG_ENABLED", False)):
+            return False
+        step_index = int(self.global_step) + 1
+        every_n_steps = max(1, int(self.config.get("ROLLOUT_TRAIN_DEBUG_EVERY_N_STEPS", 25)))
+        if step_index % every_n_steps != 0:
+            return False
+        if self._last_rollout_train_debug_step == step_index:
+            return False
+        return True
+
+    def _rollout_tube_training_debug_output_root(self):
+        logger_obj = getattr(self, "logger", None)
+        if logger_obj is not None:
+            log_dir = getattr(logger_obj, "log_dir", None)
+            if log_dir:
+                return Path(log_dir).expanduser().resolve()
+            save_dir = getattr(logger_obj, "save_dir", None)
+            name = getattr(logger_obj, "name", None)
+            version = getattr(logger_obj, "version", None)
+            if save_dir and name is not None and version is not None:
+                return Path(save_dir).expanduser().resolve() / str(name) / str(version)
+        trainer_obj = getattr(self, "trainer", None)
+        if trainer_obj is not None:
+            default_root = getattr(trainer_obj, "default_root_dir", None)
+            if default_root:
+                return Path(default_root).expanduser().resolve()
+        return (REPO_ROOT / "logs" / "rollout_train_debug_fallback").resolve()
+
+    def _extract_rollout_debug_meta_list(self, data_dict, *, batch_size):
+        meta_value = data_dict.get("cf/sdc_debug_meta")
+        if isinstance(meta_value, list):
+            meta_list = []
+            for item in meta_value[:batch_size]:
+                meta_list.append(dict(item) if isinstance(item, dict) else {"raw_meta": str(item)})
+            while len(meta_list) < batch_size:
+                meta_list.append({})
+            return meta_list
+        scenario_value = data_dict.get("metadata/scenario_id", data_dict.get("scenario_id"))
+        scenario_list = []
+        if isinstance(scenario_value, list):
+            scenario_list = [str(item) for item in scenario_value]
+        elif scenario_value is not None:
+            scenario_list = [str(scenario_value)] * batch_size
+        meta_list = []
+        for idx in range(batch_size):
+            meta_list.append({"scenario_id": scenario_list[idx] if idx < len(scenario_list) else ""})
+        return meta_list
+
+    def _maybe_dump_rollout_tube_training_debug(
+        self,
+        *,
+        data_dict,
+        reward_t,
+        valid_mask,
+        selected_log_probs,
+        tube_distance,
+        rtg,
+        advantage_t,
+        trajectories_world,
+        action_token_t,
+    ):
+        if not self._should_dump_rollout_tube_training_debug():
+            return
+
+        try:
+            from bmt.counterfactual.sdc_rollout_training_debug import write_rollout_tube_training_debug
+
+            batch_size = int(reward_t.shape[1])
+            meta_list = self._extract_rollout_debug_meta_list(data_dict, batch_size=batch_size)
+            scenario_filters = set(self._normalize_text_list(self.config.get("ROLLOUT_TRAIN_DEBUG_SCENARIO_IDS", [])))
+            slot_filters = set(self._normalize_text_list(self.config.get("ROLLOUT_TRAIN_DEBUG_SLOT_IDS", [])))
+            include_gt = bool(self.config.get("ROLLOUT_TRAIN_DEBUG_INCLUDE_GT", False))
+            max_matches = max(1, int(self.config.get("ROLLOUT_TRAIN_DEBUG_MAX_MATCHES", 4)))
+            grid_step_m = float(self.config.get("ROLLOUT_TRAIN_DEBUG_GRID_STEP_M", 0.35))
+            output_subdir = str(self.config.get("ROLLOUT_TRAIN_DEBUG_OUTPUT_SUBDIR", "train_rollout_debug")).strip() or "train_rollout_debug"
+
+            matches = []
+            for batch_idx, meta in enumerate(meta_list):
+                scenario_id = str(meta.get("scenario_id") or "").strip()
+                slot_id = str(meta.get("selected_slot_id") or "").strip()
+                if scenario_filters and scenario_id not in scenario_filters:
+                    continue
+                if slot_filters and slot_id not in slot_filters:
+                    continue
+                if not include_gt and slot_id == "gt":
+                    continue
+                matches.append((batch_idx, meta))
+            if not matches:
+                return
+
+            step_index = int(self.global_step) + 1
+            root = self._rollout_tube_training_debug_output_root() / output_subdir / f"step_{step_index:06d}"
+            raw_path_world = self._as_tensor(
+                data_dict["cf/sdc_selected_raw_path_world"],
+                device=reward_t.device,
+                dtype=reward_t.dtype,
+            ).detach().cpu().numpy()
+            raw_path_mask = self._as_tensor(
+                data_dict["cf/sdc_selected_raw_path_mask"],
+                device=reward_t.device,
+                dtype=reward_t.dtype,
+            ).detach().cpu().numpy()
+            raw_segment_mask = self._as_tensor(
+                data_dict["cf/sdc_selected_raw_path_segment_mask"],
+                device=reward_t.device,
+                dtype=reward_t.dtype,
+            ).detach().cpu().numpy()
+            decision_agent_mask = self._as_tensor(
+                data_dict["cf/decision_agent_mask"],
+                device=reward_t.device,
+                dtype=reward_t.dtype,
+            )
+            current_pos_world = self._as_tensor(
+                data_dict["decoder/modeled_agent_position"][:, 0, :, :2],
+                device=reward_t.device,
+                dtype=reward_t.dtype,
+            )
+            current_heading_world_t = self._as_tensor(
+                data_dict["decoder/modeled_agent_heading"][:, 0, :],
+                device=reward_t.device,
+                dtype=reward_t.dtype,
+            )
+            current_xy_world = (
+                current_pos_world * decision_agent_mask[:, :, None]
+            ).sum(dim=1).detach().cpu().numpy()
+            current_heading_world = (
+                current_heading_world_t * decision_agent_mask
+            ).sum(dim=1).detach().cpu().numpy()
+            total_return = reward_t.sum(dim=-1)
+            total_return_adv = self._group_normalize_advantages(
+                total_return,
+                valid_mask.any(dim=-1),
+            )
+
+            for batch_idx, meta in matches[:max_matches]:
+                scenario_id = str(meta.get("scenario_id") or f"batch_{batch_idx:03d}")
+                slot_id = str(meta.get("selected_slot_id") or f"slot_{batch_idx:03d}")
+                requested_semantic_label = str(meta.get("requested_semantic_label") or "")
+                outdir = root / scenario_id / slot_id
+                write_rollout_tube_training_debug(
+                    outdir=outdir,
+                    scenario_id=scenario_id,
+                    slot_id=slot_id,
+                    requested_semantic_label=requested_semantic_label,
+                    global_step=step_index,
+                    current_xy_world=current_xy_world[batch_idx],
+                    current_heading_world=float(current_heading_world[batch_idx]),
+                    path_world=raw_path_world[batch_idx],
+                    point_mask=raw_path_mask[batch_idx],
+                    segment_mask=raw_segment_mask[batch_idx],
+                    trajectories_world=trajectories_world[:, batch_idx].detach().cpu().numpy(),
+                    reward_t=reward_t[:, batch_idx].detach().cpu().numpy(),
+                    return_to_go_t=rtg[:, batch_idx].detach().cpu().numpy(),
+                    advantage_t=advantage_t[:, batch_idx].detach().cpu().numpy(),
+                    action_token_t=action_token_t[:, batch_idx].detach().cpu().numpy(),
+                    action_logprob_t=selected_log_probs[:, batch_idx].detach().cpu().numpy(),
+                    tube_distance_t=tube_distance[:, batch_idx].detach().cpu().numpy(),
+                    valid_mask_t=valid_mask[:, batch_idx].detach().cpu().numpy(),
+                    tube_radius_m=float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_RADIUS_M", 3.0)),
+                    inside_reward=float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_INSIDE_REWARD", 1.0)),
+                    outside_scale=float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_OUTSIDE_SCALE", 1.0)),
+                    discount=float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_DISCOUNT", 1.0)),
+                    grid_step_m=grid_step_m,
+                    extra_summary={
+                        "mean_total_return": float(total_return[:, batch_idx].mean().detach().cpu().item()),
+                        "mean_scalar_group_advantage": float(total_return_adv[:, batch_idx].mean().detach().cpu().item()),
+                        "requested_semantic_confidence": meta.get("requested_semantic_confidence"),
+                    },
+                )
+                print(f"[rollout_train_debug] wrote {outdir}")
+            self._last_rollout_train_debug_step = step_index
+        except Exception as exc:  # pragma: no cover - debug path should not crash training
+            print(f"[rollout_train_debug] failed: {exc}")
+            logger.warning("Failed to dump rollout tube training debug: %s", exc)
 
     def _next_state_candidates_from_action_space(self, output_logit, data_dict):
         probs = torch.softmax(output_logit.float(), dim=-1)
@@ -557,6 +743,291 @@ class MotionLMLightning(pl.LightningModule):
         rollout_batch["decoder/agent_heading"] = agent_heading[:, None]
         rollout_batch["decoder/agent_valid_mask"] = agent_valid_mask[:, None]
         return rollout_batch
+
+    def _compute_discounted_return_to_go(self, reward_t, valid_mask, *, discount):
+        reward_t = reward_t.to(dtype=torch.float32)
+        valid_mask = valid_mask.to(dtype=torch.bool)
+        running = torch.zeros_like(reward_t[:, :, 0])
+        rtg = torch.zeros_like(reward_t)
+        gamma = float(discount)
+        for step_idx in range(reward_t.shape[-1] - 1, -1, -1):
+            reward_step = torch.where(valid_mask[:, :, step_idx], reward_t[:, :, step_idx], torch.zeros_like(running))
+            running = reward_step + gamma * running
+            running = torch.where(valid_mask[:, :, step_idx], running, torch.zeros_like(running))
+            rtg[:, :, step_idx] = running
+        return rtg
+
+    def _group_normalize_advantages(self, values, valid_mask, *, eps=1e-6):
+        values = values.to(dtype=torch.float32)
+        valid_mask = valid_mask.to(dtype=torch.bool)
+        valid_f = valid_mask.to(dtype=values.dtype)
+        count = valid_f.sum(dim=0, keepdim=True)
+        mean = (values * valid_f).sum(dim=0, keepdim=True) / count.clamp_min(1.0)
+        centered = values - mean
+        var = (centered.square() * valid_f).sum(dim=0, keepdim=True) / count.clamp_min(1.0)
+        normalized = centered / torch.sqrt(var + float(eps))
+        return torch.where(valid_mask, normalized, torch.zeros_like(normalized))
+
+    def _extract_sdc_selected_rollout_log_probs(self, *, rollout_eval_dict, semantic_context):
+        output_logit = rollout_eval_dict["decoder/output_logit"]
+        decision_agent_mask = semantic_context["decision_agent_mask"][:, : output_logit.shape[2]]
+        selected_action = self._as_tensor(
+            rollout_eval_dict["decoder/input_action"][:, : output_logit.shape[1], : output_logit.shape[2]],
+            device=output_logit.device,
+            dtype=torch.long,
+        )
+        sdc_logits = sanitize_logits_for_loss(
+            (output_logit * decision_agent_mask[:, None, :, None].to(dtype=output_logit.dtype)).sum(dim=2)
+        )
+        sdc_action = (selected_action * decision_agent_mask[:, None, :].to(dtype=torch.long)).sum(dim=2)
+        return F.log_softmax(sdc_logits, dim=-1).gather(-1, sdc_action.unsqueeze(-1)).squeeze(-1)
+
+    def _compute_sdc_rollout_tube_rewards(self, *, data_dict, semantic_context):
+        output_logit = data_dict["decoder/output_logit"]
+        device = output_logit.device
+        dtype = output_logit.dtype
+        zero = output_logit.new_tensor(0.0)
+        required = (
+            "decoder/rollout_next_position",
+            "cf/sdc_semantic_label_id",
+            "cf/sdc_selected_raw_path_world",
+            "cf/sdc_selected_raw_path_mask",
+            "cf/sdc_selected_raw_path_segment_mask",
+        )
+        if semantic_context is None or any(key not in data_dict for key in required):
+            return {
+                "reward_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "valid_mask": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.bool),
+                "tube_distance": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "inside_fraction": zero,
+                "first_step_reward_mean": zero,
+            }
+
+        rollout_next_position = self._as_tensor(
+            data_dict["decoder/rollout_next_position"][:, : output_logit.shape[1], :, :2],
+            device=device,
+            dtype=dtype,
+        )
+        decision_agent_mask = semantic_context["decision_agent_mask"]
+        sdc_next_pos_world = (
+            rollout_next_position * decision_agent_mask[:, None, :, None].to(dtype=dtype)
+        ).sum(dim=2)
+
+        raw_path_world = self._as_tensor(
+            data_dict["cf/sdc_selected_raw_path_world"],
+            device=device,
+            dtype=dtype,
+        )
+        raw_path_mask = self._as_tensor(
+            data_dict["cf/sdc_selected_raw_path_mask"],
+            device=device,
+            dtype=dtype,
+        )
+        raw_path_segment_mask = self._as_tensor(
+            data_dict["cf/sdc_selected_raw_path_segment_mask"],
+            device=device,
+            dtype=dtype,
+        )
+        tube_projection = project_points_to_segment_tube_torch(
+            sdc_next_pos_world,
+            path_points_world=raw_path_world,
+            path_point_mask=raw_path_mask,
+            path_segment_mask=raw_path_segment_mask,
+        )
+        tube_distance = torch.nan_to_num(
+            tube_projection["nearest_distance"],
+            nan=1e6,
+            posinf=1e6,
+            neginf=0.0,
+        ).to(dtype=torch.float32)
+
+        tube_radius_m = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_RADIUS_M", 3.0))
+        inside_reward = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_INSIDE_REWARD", 1.0))
+        outside_scale = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_OUTSIDE_SCALE", 1.0))
+        reward_t = torch.where(
+            tube_distance <= tube_radius_m,
+            torch.full_like(tube_distance, float(inside_reward)),
+            -(tube_distance - float(tube_radius_m)) * float(outside_scale),
+        )
+
+        semantic_target = self._as_tensor(
+            data_dict["cf/sdc_semantic_label_id"],
+            device=device,
+            dtype=torch.long,
+        ).reshape(output_logit.shape[0], -1)[:, 0]
+        stop_label_id = int(SDC_PATH_SEMANTIC_LABEL_ORDER.index("stop"))
+        route_available = raw_path_mask.sum(dim=-1) > 0
+        valid_mask = (
+            semantic_context["sdc_valid_by_t"]
+            & semantic_context["control_available"][:, None]
+            & semantic_context["alternative_batch_mask"][:, None]
+            & (semantic_target != stop_label_id)[:, None]
+            & route_available[:, None]
+        )
+        reward_t = torch.where(valid_mask, reward_t, torch.zeros_like(reward_t))
+        inside_mask = valid_mask & (tube_distance <= tube_radius_m)
+        return {
+            "reward_t": reward_t,
+            "valid_mask": valid_mask,
+            "tube_distance": tube_distance,
+            "inside_fraction": sanitize_scalar_loss(inside_mask.float().mean()) if bool(valid_mask.any()) else zero,
+            "first_step_reward_mean": sanitize_scalar_loss(reward_t[:, 0].mean()) if reward_t.shape[1] > 0 else zero,
+        }
+
+    def _build_sdc_semantic_rollout_tube_policy_objective(self, *, data_dict):
+        output_logit = data_dict["decoder/output_logit"]
+        zero = output_logit.new_tensor(0.0)
+        group_size = int(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_GROUP_SIZE", 0))
+        if group_size <= 0:
+            return {
+                "policy_loss": zero,
+                "valid_fraction": zero,
+                "inside_fraction": zero,
+                "return_mean": zero,
+                "return_std": zero,
+                "advantage_abs_mean": zero,
+                "tube_distance_mean": zero,
+                "group_size": 0,
+            }
+
+        sampling_method = str(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_SAMPLING_METHOD", "softmax")
+        ).strip() or "softmax"
+        temperature = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_TEMPERATURE", 1.0))
+        topp = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_TOPP", 0.9))
+        discount = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_DISCOUNT", 1.0))
+
+        reward_list = []
+        valid_list = []
+        log_prob_list = []
+        distance_list = []
+        inside_fraction_list = []
+        trajectory_list = []
+        action_token_list = []
+
+        motion_decoder = getattr(self.model, "motion_decoder", None)
+        previous_null_dropout_prob = getattr(motion_decoder, "cf_null_dropout_prob", None)
+        if motion_decoder is not None and previous_null_dropout_prob is not None:
+            motion_decoder.cf_null_dropout_prob = 0.0
+        try:
+            for _ in range(group_size):
+                rollout_input = self._prepare_batch_for_training_autoregressive_rollout(data_dict)
+                rollout_output = self.model.autoregressive_rollout(
+                    rollout_input,
+                    num_decode_steps=None,
+                    sampling_method=sampling_method,
+                    temperature=(None if temperature <= 0.0 else temperature),
+                    topp=(None if topp <= 0.0 else topp),
+                    autoregressive_start_step=0,
+                    allow_training=True,
+                )
+                rollout_eval_dict = self._adapt_rollout_output_for_semantic_guidance(
+                    base_batch=data_dict,
+                    rollout_output=rollout_output,
+                )
+                rollout_semantic_context = self._extract_sdc_semantic_context(rollout_eval_dict)
+                if rollout_semantic_context is None:
+                    continue
+                reward_bundle = self._compute_sdc_rollout_tube_rewards(
+                    data_dict=rollout_eval_dict,
+                    semantic_context=rollout_semantic_context,
+                )
+                decision_agent_mask = rollout_semantic_context["decision_agent_mask"]
+                rollout_next_position = self._as_tensor(
+                    rollout_eval_dict["decoder/rollout_next_position"][:, : output_logit.shape[1], :, :2],
+                    device=output_logit.device,
+                    dtype=output_logit.dtype,
+                )
+                sdc_next_pos_world = (
+                    rollout_next_position * decision_agent_mask[:, None, :, None].to(dtype=output_logit.dtype)
+                ).sum(dim=2)
+                selected_action = self._as_tensor(
+                    rollout_eval_dict["decoder/input_action"][:, : output_logit.shape[1], : output_logit.shape[2]],
+                    device=output_logit.device,
+                    dtype=torch.long,
+                )
+                sdc_action_tokens = (
+                    selected_action * decision_agent_mask[:, None, :].to(dtype=torch.long)
+                ).sum(dim=2)
+                log_prob_list.append(
+                    self._extract_sdc_selected_rollout_log_probs(
+                        rollout_eval_dict=rollout_eval_dict,
+                        semantic_context=rollout_semantic_context,
+                    )
+                )
+                reward_list.append(reward_bundle["reward_t"])
+                valid_list.append(reward_bundle["valid_mask"])
+                distance_list.append(reward_bundle["tube_distance"])
+                inside_fraction_list.append(reward_bundle["inside_fraction"])
+                trajectory_list.append(
+                    torch.cat(
+                        [
+                            rollout_semantic_context["sdc_current_pos_world"][:, :1],
+                            sdc_next_pos_world,
+                        ],
+                        dim=1,
+                    )
+                )
+                action_token_list.append(sdc_action_tokens)
+        finally:
+            if motion_decoder is not None and previous_null_dropout_prob is not None:
+                motion_decoder.cf_null_dropout_prob = previous_null_dropout_prob
+
+        if not reward_list:
+            return {
+                "policy_loss": zero,
+                "valid_fraction": zero,
+                "inside_fraction": zero,
+                "return_mean": zero,
+                "return_std": zero,
+                "advantage_abs_mean": zero,
+                "tube_distance_mean": zero,
+                "group_size": 0,
+            }
+
+        reward_t = torch.stack(reward_list, dim=0)
+        valid_mask = torch.stack(valid_list, dim=0)
+        selected_log_probs = torch.stack(log_prob_list, dim=0)
+        tube_distance = torch.stack(distance_list, dim=0)
+        trajectories_world = torch.stack(trajectory_list, dim=0)
+        action_token_t = torch.stack(action_token_list, dim=0)
+        rtg = self._compute_discounted_return_to_go(reward_t, valid_mask, discount=discount)
+        advantage_t = self._group_normalize_advantages(rtg, valid_mask)
+        policy_loss = sanitize_scalar_loss(
+            -(
+                selected_log_probs[valid_mask].to(dtype=torch.float32)
+                * advantage_t[valid_mask].detach()
+            ).mean()
+        ) if bool(valid_mask.any()) else zero
+        total_return = reward_t.sum(dim=-1)
+        valid_return = valid_mask.any(dim=-1)
+        return_mean = sanitize_scalar_loss(total_return[valid_return].mean()) if bool(valid_return.any()) else zero
+        return_std = sanitize_scalar_loss(total_return[valid_return].std(unbiased=False)) if bool(valid_return.any()) else zero
+        distance_mean = sanitize_scalar_loss(tube_distance[valid_mask].mean()) if bool(valid_mask.any()) else zero
+        inside_fraction = sanitize_scalar_loss(
+            torch.stack(inside_fraction_list).mean()
+        ) if inside_fraction_list else zero
+        self._maybe_dump_rollout_tube_training_debug(
+            data_dict=data_dict,
+            reward_t=reward_t,
+            valid_mask=valid_mask,
+            selected_log_probs=selected_log_probs,
+            tube_distance=tube_distance,
+            rtg=rtg,
+            advantage_t=advantage_t,
+            trajectories_world=trajectories_world,
+            action_token_t=action_token_t,
+        )
+        return {
+            "policy_loss": policy_loss,
+            "valid_fraction": valid_mask.float().mean(),
+            "inside_fraction": inside_fraction,
+            "return_mean": return_mean,
+            "return_std": return_std,
+            "advantage_abs_mean": sanitize_scalar_loss(advantage_t[valid_mask].abs().mean()) if bool(valid_mask.any()) else zero,
+            "tube_distance_mean": distance_mean,
+            "group_size": int(len(reward_list)),
+        }
 
     def _compute_sdc_rollout_progress_loss(self, *, data_dict, semantic_context):
         output_logit = data_dict["decoder/output_logit"]
@@ -1331,6 +1802,9 @@ class MotionLMLightning(pl.LightningModule):
                 rollout_progress_loss_weight = float(
                     self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_PROGRESS_LOSS_WEIGHT", 0.0)
                 )
+                rollout_tube_policy_loss_weight = float(
+                    self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_POLICY_LOSS_WEIGHT", 0.0)
+                )
                 semantic_logits = sanitize_logits_for_loss(self.sdc_semantic_head(control_hidden))
                 semantic_loss = control_hidden.new_tensor(0.0)
                 if bool(semantic_supervision_mask.any()) and semantic_loss_weight > 0.0:
@@ -1383,26 +1857,51 @@ class MotionLMLightning(pl.LightningModule):
                     "stall_fraction": control_hidden.new_tensor(0.0),
                     "rollout_family_distance": control_hidden.new_zeros((control_hidden.shape[0], 1)),
                 }
+                rollout_tube_policy_bundle = {
+                    "policy_loss": control_hidden.new_tensor(0.0),
+                    "valid_fraction": control_hidden.new_tensor(0.0),
+                    "inside_fraction": control_hidden.new_tensor(0.0),
+                    "return_mean": control_hidden.new_tensor(0.0),
+                    "return_std": control_hidden.new_tensor(0.0),
+                    "advantage_abs_mean": control_hidden.new_tensor(0.0),
+                    "tube_distance_mean": control_hidden.new_tensor(0.0),
+                    "group_size": 0,
+                }
                 rollout_semantic_context = None
                 if (
                     sdc_semantic_context is not None
                     and bool(sdc_semantic_context["alternative_batch_mask"].any())
-                    and (rollout_guide_loss_weight > 0.0 or rollout_progress_loss_weight > 0.0)
+                    and (
+                        rollout_guide_loss_weight > 0.0
+                        or rollout_progress_loss_weight > 0.0
+                        or rollout_tube_policy_loss_weight > 0.0
+                    )
                 ):
                     rollout_bundle = self._build_sdc_semantic_rollout_guidance(data_dict=data_dict)
                     rollout_guide_bundle = rollout_bundle["guide_bundle"]
                     rollout_progress_bundle = rollout_bundle["progress_bundle"]
                     rollout_semantic_context = rollout_bundle["semantic_context"]
+                if (
+                    sdc_semantic_context is not None
+                    and bool(sdc_semantic_context["alternative_batch_mask"].any())
+                    and rollout_tube_policy_loss_weight > 0.0
+                ):
+                    rollout_tube_policy_bundle = self._build_sdc_semantic_rollout_tube_policy_objective(
+                        data_dict=data_dict
+                    )
                 if guide_loss_weight > 0.0 and sdc_semantic_context is not None:
                     loss = loss + guide_loss_weight * sanitize_scalar_loss(guide_bundle["guide_loss"])
                 if rollout_guide_loss_weight > 0.0 and rollout_semantic_context is not None:
                     loss = loss + rollout_guide_loss_weight * sanitize_scalar_loss(rollout_guide_bundle["guide_loss"])
                 if rollout_progress_loss_weight > 0.0 and rollout_semantic_context is not None:
                     loss = loss + rollout_progress_loss_weight * sanitize_scalar_loss(rollout_progress_bundle["progress_loss"])
+                if rollout_tube_policy_loss_weight > 0.0:
+                    loss = loss + rollout_tube_policy_loss_weight * sanitize_scalar_loss(rollout_tube_policy_bundle["policy_loss"])
                 total_control_objective = (
                     guide_loss_weight * sanitize_scalar_loss(guide_bundle["guide_loss"])
                     + rollout_guide_loss_weight * sanitize_scalar_loss(rollout_guide_bundle["guide_loss"])
                     + rollout_progress_loss_weight * sanitize_scalar_loss(rollout_progress_bundle["progress_loss"])
+                    + rollout_tube_policy_loss_weight * sanitize_scalar_loss(rollout_tube_policy_bundle["policy_loss"])
                     + semantic_loss_weight * sanitize_scalar_loss(semantic_loss)
                 )
                 loss_stat.update(
@@ -1437,6 +1936,17 @@ class MotionLMLightning(pl.LightningModule):
                         "cf/sdc_rollout_progress_valid_fraction": rollout_progress_bundle["progress_valid_fraction"],
                         "cf/sdc_rollout_progress_mean": rollout_progress_bundle["realized_progress_mean"],
                         "cf/sdc_rollout_stall_fraction": rollout_progress_bundle["stall_fraction"],
+                        "cf/sdc_rollout_tube_policy_loss": rollout_tube_policy_bundle["policy_loss"],
+                        "cf/sdc_rollout_tube_policy_loss_weight": rollout_tube_policy_loss_weight,
+                        "cf/sdc_rollout_tube_valid_fraction": rollout_tube_policy_bundle["valid_fraction"],
+                        "cf/sdc_rollout_tube_inside_fraction": rollout_tube_policy_bundle["inside_fraction"],
+                        "cf/sdc_rollout_tube_return_mean": rollout_tube_policy_bundle["return_mean"],
+                        "cf/sdc_rollout_tube_return_std": rollout_tube_policy_bundle["return_std"],
+                        "cf/sdc_rollout_tube_advantage_abs_mean": rollout_tube_policy_bundle["advantage_abs_mean"],
+                        "cf/sdc_rollout_tube_distance_mean": rollout_tube_policy_bundle["tube_distance_mean"],
+                        "cf/sdc_rollout_tube_group_size": control_hidden.new_tensor(
+                            float(rollout_tube_policy_bundle["group_size"])
+                        ),
                         "cf/sdc_control_objective": total_control_objective,
                         "cf/sdc_family_distance_mean": guide_bundle["projected_family_distance"][
                             sdc_semantic_context["sdc_valid_by_t"]

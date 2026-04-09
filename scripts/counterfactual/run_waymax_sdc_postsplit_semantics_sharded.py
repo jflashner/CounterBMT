@@ -57,6 +57,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resample-spacing-m", type=float, default=2.0)
     parser.add_argument("--separability-scale-m", type=float, default=6.0)
     parser.add_argument("--separability-heading-weight-m", type=float, default=2.0)
+    parser.add_argument("--stitch-discontinuities", action="store_true")
+    parser.add_argument("--stitch-radius-m", type=float, default=2.0)
+    parser.add_argument("--stitch-jump-threshold-m", type=float, default=6.0)
     parser.add_argument("--model", type=str, default="gpt-5.4")
     parser.add_argument("--image-detail", type=str, default="original", choices=("low", "high", "original", "auto"))
     parser.add_argument("--save-pkls", action="store_true")
@@ -150,6 +153,10 @@ def _build_render_command(
         str(float(args.separability_scale_m)),
         "--separability-heading-weight-m",
         str(float(args.separability_heading_weight_m)),
+        "--stitch-radius-m",
+        str(float(args.stitch_radius_m)),
+        "--stitch-jump-threshold-m",
+        str(float(args.stitch_jump_threshold_m)),
         "--model",
         str(args.model),
         "--image-detail",
@@ -159,6 +166,8 @@ def _build_render_command(
     ]
     if bool(args.include_off_route_paths):
         cmd.append("--include-off-route-paths")
+    if bool(args.stitch_discontinuities):
+        cmd.append("--stitch-discontinuities")
     if bool(args.show_traffic_lights):
         cmd.append("--show-traffic-lights")
     if bool(args.save_scene_grid):

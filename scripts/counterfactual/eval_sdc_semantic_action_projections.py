@@ -35,14 +35,17 @@ from bmt.counterfactual.sdc_semantic_control import (
     DEFAULT_FAMILY_HEADING_DEADBAND_RAD,
     DEFAULT_FAMILY_PATH_DEADBAND_M,
     DEFAULT_FAMILY_TEACHER_TEMPERATURE,
+    extract_model_frame,
     load_raw_scenario_from_row,
     project_points_to_family_paths_torch,
+    world_direction_to_model_frame,
+    world_xy_to_model_frame,
 )
 from bmt.dataset.dataset import InfgenDataset
 from bmt.models.motionlm_lightning import sanitize_logits_for_loss
 from bmt.utils.checkpoint_loading import load_model_from_checkpoint_forgiving
 from bmt.utils.config import REPO_ROOT, cfg_from_yaml_file, global_config
-from scripts.counterfactual.label_waymax_sdc_path_semantics import (
+from scripts.counterfactual.path_semantics_plot_utils import (
     AGENT_COLOR,
     CONTEXT_SELECTION_RADIUS_M,
     CROSSWALK_FACE,
@@ -72,7 +75,7 @@ from scripts.counterfactual.label_waymax_sdc_path_semantics import (
     _split_route_segments,
     _world_to_sdc_up_frame,
 )
-from scripts.counterfactual.render_waymax_sdc_postsplit_semantics import (
+from scripts.counterfactual.postsplit_render_utils import (
     DEFAULT_RESAMPLE_SPACING_M,
     DEFAULT_SEPARABILITY_HEADING_WEIGHT_M,
     DEFAULT_SEPARABILITY_SCALE_M,
@@ -105,6 +108,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-mode", type=str, default="forgiving_state_dict")
     parser.add_argument("--teacher-ckpt", type=str, default="")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--autoregressive-rollout", action="store_true")
+    parser.add_argument("--rollout-sampling-method", type=str, default="argmax")
+    parser.add_argument("--rollout-temperature", type=float, default=-1.0)
+    parser.add_argument("--rollout-topp", type=float, default=-1.0)
+    parser.add_argument("--save-rollout-gif", action="store_true")
+    parser.add_argument("--rollout-gif-fps", type=float, default=6.0)
     return parser.parse_args()
 
 
@@ -164,6 +173,155 @@ def _to_torch_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, A
         else:
             output[key] = value
     return output
+
+
+def _wrap_angle_array(values: np.ndarray) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32)
+    return np.arctan2(np.sin(array), np.cos(array)).astype(np.float32)
+
+
+def _optional_positive_float(value: float) -> float | None:
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric <= 0.0:
+        return None
+    return numeric
+
+
+def _prepare_batch_for_autoregressive_rollout(
+    batch_torch: Dict[str, Any],
+    *,
+    raw_scenario: Mapping[str, Any],
+) -> Dict[str, Any]:
+    rollout_batch = copy.deepcopy(batch_torch)
+    required = (
+        "decoder/agent_position",
+        "decoder/agent_velocity",
+        "decoder/agent_heading",
+        "decoder/agent_valid_mask",
+    )
+    if all(key in rollout_batch for key in required):
+        return rollout_batch
+
+    modeled_agent_id = rollout_batch.get("encoder/modeled_agent_id")
+    if modeled_agent_id is None:
+        raise KeyError("encoder/modeled_agent_id is required to reconstruct decoder/agent_* tensors for rollout.")
+    if modeled_agent_id.ndim != 2:
+        raise ValueError(f"Expected encoder/modeled_agent_id to be [B,N], got {tuple(modeled_agent_id.shape)}")
+
+    batch_size, num_agents = [int(dim) for dim in modeled_agent_id.shape]
+    if batch_size != 1:
+        raise ValueError(f"Autoregressive rollout eval currently expects batch_size=1, got {batch_size}")
+
+    map_center, map_heading = extract_model_frame(raw_scenario)
+    tracks = dict(raw_scenario.get("tracks", {}) or {})
+    if not tracks:
+        raise ValueError("Raw scenario does not contain any tracks for autoregressive rollout reconstruction.")
+
+    horizon = 0
+    for track_payload in tracks.values():
+        state = dict(dict(track_payload).get("state") or {})
+        horizon = max(horizon, int(np.asarray(state.get("position", []), dtype=np.float32).shape[0]))
+    if horizon <= 0:
+        raise ValueError("Unable to infer rollout horizon from raw scenario track positions.")
+
+    agent_position = np.zeros((batch_size, horizon, num_agents, 3), dtype=np.float32)
+    agent_velocity = np.zeros((batch_size, horizon, num_agents, 2), dtype=np.float32)
+    agent_heading = np.zeros((batch_size, horizon, num_agents), dtype=np.float32)
+    agent_valid_mask = np.zeros((batch_size, horizon, num_agents), dtype=bool)
+
+    track_names = rollout_batch.get("decoder/track_name")
+    track_names_arr = None if track_names is None else np.asarray(track_names)
+    if track_names_arr is not None and track_names_arr.ndim == 2:
+        raw_track_names = track_names_arr[0].astype(str)
+    else:
+        encoder_track_names = rollout_batch.get("encoder/track_name")
+        if encoder_track_names is None:
+            raise KeyError("encoder/track_name is required to reconstruct decoder/agent_* tensors for rollout.")
+        encoder_track_names_np = np.asarray(encoder_track_names[0]).astype(str)
+        modeled_agent_ids_np = modeled_agent_id.detach().cpu().numpy().astype(np.int64)
+        raw_track_names = np.asarray(
+            [encoder_track_names_np[int(agent_id)] for agent_id in modeled_agent_ids_np[0].tolist()],
+            dtype=str,
+        )
+
+    for agent_idx, raw_track_name in enumerate(raw_track_names.tolist()):
+        track = tracks.get(str(raw_track_name))
+        if track is None:
+            continue
+        state = dict(dict(track).get("state") or {})
+        position_world = np.asarray(state.get("position", []), dtype=np.float32)
+        heading_world = np.asarray(state.get("heading", []), dtype=np.float32).reshape(-1)
+        velocity_world = np.asarray(state.get("velocity", []), dtype=np.float32)
+        valid = np.asarray(state.get("valid", []), dtype=bool).reshape(-1)
+        if position_world.ndim != 2 or position_world.shape[0] == 0:
+            continue
+        if velocity_world.ndim != 2 or velocity_world.shape[1] < 2:
+            velocity_world = np.zeros((position_world.shape[0], 2), dtype=np.float32)
+        length = min(horizon, position_world.shape[0], heading_world.shape[0], velocity_world.shape[0], valid.shape[0])
+        if length <= 0:
+            continue
+
+        xy_model = world_xy_to_model_frame(position_world[:length, :2], map_center=map_center, map_heading=map_heading)
+        z_model = (
+            position_world[:length, 2].astype(np.float32) - float(map_center[2])
+            if position_world.shape[1] >= 3
+            else np.zeros((length,), dtype=np.float32)
+        )
+        vel_model = world_direction_to_model_frame(velocity_world[:length, :2], map_heading=map_heading)
+        heading_model = _wrap_angle_array(heading_world[:length] - float(map_heading))
+
+        agent_position[0, :length, agent_idx, :2] = xy_model
+        agent_position[0, :length, agent_idx, 2] = z_model
+        agent_velocity[0, :length, agent_idx, :] = vel_model
+        agent_heading[0, :length, agent_idx] = heading_model
+        agent_valid_mask[0, :length, agent_idx] = valid[:length]
+
+    device = modeled_agent_id.device
+    rollout_batch["decoder/agent_position"] = torch.as_tensor(agent_position, device=device, dtype=torch.float32)
+    rollout_batch["decoder/agent_velocity"] = torch.as_tensor(agent_velocity, device=device, dtype=torch.float32)
+    rollout_batch["decoder/agent_heading"] = torch.as_tensor(agent_heading, device=device, dtype=torch.float32)
+    rollout_batch["decoder/agent_valid_mask"] = torch.as_tensor(agent_valid_mask, device=device, dtype=torch.bool)
+    if "in_evaluation" not in rollout_batch:
+        rollout_batch["in_evaluation"] = torch.ones((batch_size,), dtype=torch.bool, device=device)
+    return rollout_batch
+
+
+def _adapt_rollout_output_for_semantic_eval(
+    *,
+    base_batch: Dict[str, Any],
+    rollout_output: Dict[str, Any],
+) -> Dict[str, Any]:
+    eval_output = copy.deepcopy(rollout_output)
+    rollout_logits = rollout_output["decoder/output_logit"]
+    horizon = int(rollout_logits.shape[1])
+    initial_pos = base_batch["decoder/modeled_agent_position"][:, :1]
+    initial_heading = base_batch["decoder/modeled_agent_heading"][:, :1]
+    initial_velocity = base_batch["decoder/modeled_agent_velocity"][:, :1]
+    rollout_next_pos = rollout_output["decoder/debug_ar_pos"][:, :horizon]
+    rollout_next_heading = rollout_output["decoder/debug_ar_head"][:, :horizon]
+    rollout_next_velocity = rollout_output["decoder/debug_ar_vel"][:, :horizon]
+    if horizon > 1:
+        current_pos = torch.cat([initial_pos, rollout_next_pos[:, :-1]], dim=1)
+        current_heading = torch.cat([initial_heading, rollout_next_heading[:, :-1]], dim=1)
+        current_velocity = torch.cat([initial_velocity, rollout_next_velocity[:, :-1]], dim=1)
+    else:
+        current_pos = initial_pos.clone()
+        current_heading = initial_heading.clone()
+        current_velocity = initial_velocity.clone()
+
+    eval_output["decoder/modeled_agent_position"] = current_pos
+    eval_output["decoder/modeled_agent_heading"] = current_heading
+    eval_output["decoder/modeled_agent_velocity"] = current_velocity
+    eval_output["decoder/modeled_agent_valid_mask"] = rollout_output["decoder/input_action_valid_mask"][:, :horizon]
+    eval_output["decoder/modeled_agent_delta"] = rollout_next_pos[..., :2] - current_pos[..., :2]
+    eval_output["decoder/input_action"] = rollout_output["decoder/output_action"][:, :horizon]
+    eval_output["decoder/input_action_valid_mask"] = rollout_output["decoder/input_action_valid_mask"][:, :horizon]
+    eval_output["decoder/target_action_valid_mask"] = rollout_output["decoder/input_action_valid_mask"][:, :horizon]
+    eval_output["decoder/input_step"] = torch.arange(horizon, device=rollout_logits.device, dtype=torch.long)
+    eval_output["decoder/rollout_next_position"] = rollout_next_pos
+    eval_output["decoder/rollout_next_heading"] = rollout_next_heading
+    eval_output["decoder/rollout_next_velocity"] = rollout_next_velocity
+    return eval_output
 
 
 def _plot_segmented_polyline(ax, points_xy: np.ndarray, *, label: str | None = None, **kwargs) -> None:
@@ -466,8 +624,11 @@ def _draw_vlm_style_scene_ax(
     representative_route_world: np.ndarray | None,
     projection_line_world: np.ndarray | None = None,
     best_arrow_world: np.ndarray | None = None,
+    actual_action_arrow_world: np.ndarray | None = None,
+    teacher_action_arrow_world: np.ndarray | None = None,
     current_marker_world: np.ndarray | None = None,
     sampled_points_world: np.ndarray | None = None,
+    rollout_trajectory_world: np.ndarray | None = None,
     sampled_step_labels: Sequence[int] | None = None,
     info_box_text: str = "",
     show_colorbar: bool = True,
@@ -608,6 +769,23 @@ def _draw_vlm_style_scene_ax(
     if gt_past_local.shape[0] >= 2:
         ax.plot(gt_past_local[:, 0], gt_past_local[:, 1], color="#111827", linewidth=2.8, alpha=0.95, zorder=6)
 
+    if rollout_trajectory_world is not None:
+        rollout_local = _world_to_sdc_up_frame(
+            _finite_xy_rows(np.asarray(rollout_trajectory_world, dtype=np.float64)),
+            center_xy=center_xy,
+            heading_rad=current_heading,
+        )
+        if rollout_local.shape[0] >= 2:
+            ax.plot(
+                rollout_local[:, 0],
+                rollout_local[:, 1],
+                color="#111827",
+                linewidth=2.0,
+                alpha=0.75,
+                linestyle=(0, (4, 3)),
+                zorder=7.2,
+            )
+
     stay_lane_local = _world_to_sdc_up_frame(stay_lane_guide, center_xy=center_xy, heading_rad=current_heading)
     if stay_lane_local.shape[0] >= 2:
         ax.plot(stay_lane_local[:, 0], stay_lane_local[:, 1], color=STAY_GUIDE_COLOR, linewidth=2.0, alpha=0.45, linestyle=(0, (5, 4)), zorder=7)
@@ -673,8 +851,41 @@ def _draw_vlm_style_scene_ax(
                 zorder=12.5,
             )
 
-    if best_arrow_world is not None:
-        best_arrow_local = _world_to_sdc_up_frame(np.asarray(best_arrow_world, dtype=np.float64), center_xy=center_xy, heading_rad=current_heading)
+    if teacher_action_arrow_world is not None:
+        teacher_arrow_local = _world_to_sdc_up_frame(
+            np.asarray(teacher_action_arrow_world, dtype=np.float64),
+            center_xy=center_xy,
+            heading_rad=current_heading,
+        )
+        if teacher_arrow_local.shape[0] >= 2:
+            delta = teacher_arrow_local[1] - teacher_arrow_local[0]
+            ax.arrow(
+                float(teacher_arrow_local[0, 0]),
+                float(teacher_arrow_local[0, 1]),
+                float(delta[0]),
+                float(delta[1]),
+                width=0.14,
+                head_width=0.88,
+                head_length=1.15,
+                color="#7c3aed",
+                length_includes_head=True,
+                zorder=13.2,
+                alpha=0.92,
+            )
+            ax.scatter(
+                [teacher_arrow_local[1, 0]],
+                [teacher_arrow_local[1, 1]],
+                c="#7c3aed",
+                s=24,
+                edgecolors="white",
+                linewidths=0.7,
+                zorder=13.3,
+                alpha=0.96,
+            )
+
+    arrow_world = actual_action_arrow_world if actual_action_arrow_world is not None else best_arrow_world
+    if arrow_world is not None:
+        best_arrow_local = _world_to_sdc_up_frame(np.asarray(arrow_world, dtype=np.float64), center_xy=center_xy, heading_rad=current_heading)
         if best_arrow_local.shape[0] >= 2:
             delta = best_arrow_local[1] - best_arrow_local[0]
             ax.arrow(
@@ -823,14 +1034,70 @@ def _build_action_debug_bundle(model, output: Dict[str, Any], semantic_context: 
     output_logit = output["decoder/output_logit"]
     device = output_logit.device
     dtype = output_logit.dtype
+    decision_agent_mask = semantic_context["decision_agent_mask"]
+    student_logits_sdc = sanitize_logits_for_loss((output_logit * decision_agent_mask[:, None, :, None]).sum(dim=2))
+    energy_terms = _compute_family_action_energy_terms(model, semantic_context, student_logits_sdc)
+    candidate_projection = energy_terms["candidate_projection"]
+    position_penalty = energy_terms["position_penalty"]
+    heading_penalty = energy_terms["heading_penalty"]
+    backward_penalty = energy_terms["backward_penalty"]
+    energy_by_family_action = energy_terms["energy_by_family_action"]
+    family_weights = energy_terms["family_weights"]
+    weighted_action_energy = energy_terms["weighted_action_energy"]
+    energy_temperature = float(energy_terms["energy_temperature"].detach().cpu().item())
+
     teacher_logits = model._run_policy_teacher(output)
     if teacher_logits is None:
         raise RuntimeError("Policy teacher is required for semantic-family inspection.")
     teacher_logits = sanitize_logits_for_loss(teacher_logits.to(device=device, dtype=dtype))
-    decision_agent_mask = semantic_context["decision_agent_mask"]
-    student_logits_sdc = sanitize_logits_for_loss((output_logit * decision_agent_mask[:, None, :, None]).sum(dim=2))
     teacher_logits_sdc = sanitize_logits_for_loss((teacher_logits * decision_agent_mask[:, None, :, None]).sum(dim=2))
+    best_token = torch.argmin(weighted_action_energy, dim=-1)
+    best_token_energy = weighted_action_energy.gather(dim=-1, index=best_token.unsqueeze(-1)).squeeze(-1)
 
+    best_family_energy = torch.gather(
+        energy_by_family_action,
+        dim=-1,
+        index=best_token[:, :, None, None].expand(-1, -1, energy_by_family_action.shape[2], 1),
+    ).squeeze(-1)
+    best_family_idx = torch.argmin(best_family_energy, dim=-1)
+    best_family_energy_value = best_family_energy.gather(dim=-1, index=best_family_idx.unsqueeze(-1)).squeeze(-1)
+
+    teacher_log_probs = F.log_softmax(teacher_logits_sdc, dim=-1)
+    student_log_probs = F.log_softmax(student_logits_sdc, dim=-1)
+    family_teacher = torch.softmax(
+        teacher_log_probs[:, :, None, :] - (energy_by_family_action / max(energy_temperature, 1e-3)),
+        dim=-1,
+    )
+    family_teacher = torch.nan_to_num(family_teacher, nan=0.0, posinf=0.0, neginf=0.0)
+    family_teacher = (family_teacher * family_weights[:, None, :, None]).sum(dim=2)
+    family_teacher = family_teacher / family_teacher.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    student_probs = torch.softmax(student_logits_sdc, dim=-1)
+    base_teacher_probs = torch.softmax(teacher_logits_sdc, dim=-1)
+    guide_weight = (semantic_context["current_gate"] * family_weights[:, None, :]).sum(dim=-1)
+
+    return {
+        "candidate_projection": candidate_projection,
+        "weighted_action_energy": weighted_action_energy,
+        "best_token": best_token,
+        "best_token_energy": best_token_energy,
+        "best_family_idx": best_family_idx,
+        "best_family_energy": best_family_energy_value,
+        "position_penalty": position_penalty,
+        "heading_penalty": heading_penalty,
+        "backward_penalty": backward_penalty,
+        "family_teacher": family_teacher,
+        "student_probs": student_probs,
+        "base_teacher_probs": base_teacher_probs,
+        "guide_weight": guide_weight,
+    }
+
+
+def _compute_family_action_energy_terms(
+    model,
+    semantic_context: Dict[str, Any],
+    student_logits_sdc: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
     candidate_projection = project_points_to_family_paths_torch(
         semantic_context["sdc_next_pos_candidates_world"],
         family_path_polylines_world=semantic_context["family_paths_world"],
@@ -838,7 +1105,6 @@ def _build_action_debug_bundle(model, output: Dict[str, Any], semantic_context: 
         family_path_tangents_world=semantic_context["family_tangents_world"],
         family_path_arc_lengths=semantic_context["family_arc_lengths"],
     )
-
     position_deadband = float(
         model.config.MODEL.get("LOCAL_CONTROL_SDC_FAMILY_PATH_DEADBAND_M", DEFAULT_FAMILY_PATH_DEADBAND_M)
     )
@@ -885,44 +1151,79 @@ def _build_action_debug_bundle(model, output: Dict[str, Any], semantic_context: 
     energy_by_family_action = energy_by_action_family.permute(0, 1, 3, 2)
     family_weights = semantic_context["family_weights"]
     weighted_action_energy = (energy_by_family_action * family_weights[:, None, :, None]).sum(dim=2)
-    best_token = torch.argmin(weighted_action_energy, dim=-1)
-    best_token_energy = weighted_action_energy.gather(dim=-1, index=best_token.unsqueeze(-1)).squeeze(-1)
+    return {
+        "candidate_projection": candidate_projection,
+        "position_penalty": position_penalty,
+        "heading_penalty": heading_penalty,
+        "backward_penalty": backward_penalty,
+        "energy_by_family_action": energy_by_family_action,
+        "family_weights": family_weights,
+        "weighted_action_energy": weighted_action_energy,
+        "energy_temperature": student_logits_sdc.new_tensor(float(energy_temperature)),
+    }
 
-    best_family_energy = torch.gather(
+
+def _gather_sdc_action_tokens(action_tokens: torch.Tensor, decision_agent_mask: torch.Tensor) -> torch.Tensor:
+    if action_tokens.ndim != 3:
+        raise ValueError(f"Expected decoder/output_action to have shape [B,T,N], got {tuple(action_tokens.shape)}")
+    sdc_agent_idx = torch.argmax(decision_agent_mask, dim=-1)
+    return torch.gather(
+        action_tokens,
+        dim=2,
+        index=sdc_agent_idx[:, None, None].expand(-1, action_tokens.shape[1], 1),
+    ).squeeze(-1)
+
+
+def _build_rollout_action_debug_bundle(model, output: Dict[str, Any], semantic_context: Dict[str, Any]) -> Dict[str, Any]:
+    output_logit = output["decoder/output_logit"]
+    device = output_logit.device
+    dtype = output_logit.dtype
+    decision_agent_mask = semantic_context["decision_agent_mask"]
+    student_logits_sdc = sanitize_logits_for_loss((output_logit * decision_agent_mask[:, None, :, None]).sum(dim=2))
+    energy_terms = _compute_family_action_energy_terms(model, semantic_context, student_logits_sdc)
+    weighted_action_energy = energy_terms["weighted_action_energy"]
+    energy_by_family_action = energy_terms["energy_by_family_action"]
+    selected_token = _gather_sdc_action_tokens(output["decoder/output_action"], decision_agent_mask).to(dtype=torch.long)
+    selected_token_energy = weighted_action_energy.gather(dim=-1, index=selected_token.unsqueeze(-1)).squeeze(-1)
+    selected_family_energy = torch.gather(
         energy_by_family_action,
         dim=-1,
-        index=best_token[:, :, None, None].expand(-1, -1, energy_by_family_action.shape[2], 1),
+        index=selected_token[:, :, None, None].expand(-1, -1, energy_by_family_action.shape[2], 1),
     ).squeeze(-1)
-    best_family_idx = torch.argmin(best_family_energy, dim=-1)
-    best_family_energy_value = best_family_energy.gather(dim=-1, index=best_family_idx.unsqueeze(-1)).squeeze(-1)
-
+    selected_family_idx = torch.argmin(selected_family_energy, dim=-1)
+    selected_family_energy_value = selected_family_energy.gather(
+        dim=-1,
+        index=selected_family_idx.unsqueeze(-1),
+    ).squeeze(-1)
+    teacher_logits = model._run_policy_teacher(output)
+    if teacher_logits is None:
+        raise RuntimeError("Policy teacher is required for semantic-family rollout inspection.")
+    teacher_logits = sanitize_logits_for_loss(teacher_logits.to(device=device, dtype=dtype))
+    teacher_logits_sdc = sanitize_logits_for_loss((teacher_logits * decision_agent_mask[:, None, :, None]).sum(dim=2))
     teacher_log_probs = F.log_softmax(teacher_logits_sdc, dim=-1)
-    student_log_probs = F.log_softmax(student_logits_sdc, dim=-1)
+    energy_temperature = float(energy_terms["energy_temperature"].detach().cpu().item())
     family_teacher = torch.softmax(
         teacher_log_probs[:, :, None, :] - (energy_by_family_action / max(energy_temperature, 1e-3)),
         dim=-1,
     )
     family_teacher = torch.nan_to_num(family_teacher, nan=0.0, posinf=0.0, neginf=0.0)
-    family_teacher = (family_teacher * family_weights[:, None, :, None]).sum(dim=2)
+    family_teacher = (family_teacher * semantic_context["family_weights"][:, None, :, None]).sum(dim=2)
     family_teacher = family_teacher / family_teacher.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-
     student_probs = torch.softmax(student_logits_sdc, dim=-1)
-    base_teacher_probs = torch.softmax(teacher_logits_sdc, dim=-1)
-    guide_weight = (semantic_context["current_gate"] * family_weights[:, None, :]).sum(dim=-1)
-
+    guide_weight = (semantic_context["current_gate"] * semantic_context["family_weights"][:, None, :]).sum(dim=-1)
     return {
-        "candidate_projection": candidate_projection,
+        "candidate_projection": energy_terms["candidate_projection"],
         "weighted_action_energy": weighted_action_energy,
-        "best_token": best_token,
-        "best_token_energy": best_token_energy,
-        "best_family_idx": best_family_idx,
-        "best_family_energy": best_family_energy_value,
-        "position_penalty": position_penalty,
-        "heading_penalty": heading_penalty,
-        "backward_penalty": backward_penalty,
+        "best_token": selected_token,
+        "best_token_energy": selected_token_energy,
+        "best_family_idx": selected_family_idx,
+        "best_family_energy": selected_family_energy_value,
+        "position_penalty": energy_terms["position_penalty"],
+        "heading_penalty": energy_terms["heading_penalty"],
+        "backward_penalty": energy_terms["backward_penalty"],
         "family_teacher": family_teacher,
         "student_probs": student_probs,
-        "base_teacher_probs": base_teacher_probs,
+        "base_teacher_probs": torch.softmax(teacher_logits_sdc, dim=-1),
         "guide_weight": guide_weight,
     }
 
@@ -935,6 +1236,7 @@ def _save_overview_plot(
     family_render_items: Sequence[Mapping[str, Any]],
     sampled_world_xy: np.ndarray,
     sampled_steps: np.ndarray,
+    rollout_trajectory_world: np.ndarray | None = None,
 ):
     fig = plt.figure(figsize=(FIG_SIZE_INCH, FIG_SIZE_INCH), dpi=FIG_DPI)
     ax = fig.add_axes([0.005, 0.005, 0.99, 0.99])
@@ -961,6 +1263,7 @@ def _save_overview_plot(
         highlighted_gradient_values=gradient_values,
         representative_route_world=representative_route_world,
         sampled_points_world=sampled_world_xy,
+        rollout_trajectory_world=rollout_trajectory_world,
         sampled_step_labels=sampled_steps.tolist(),
         info_box_text=(
             f"scene={row['scenario_id']}\n"
@@ -972,6 +1275,117 @@ def _save_overview_plot(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=FIG_DPI)
     plt.close(fig)
+
+
+def _figure_rgb_array(fig) -> np.ndarray:
+    fig.canvas.draw()
+    width, height = fig.canvas.get_width_height()
+    rgba = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)
+    return np.ascontiguousarray(rgba[:, :, :3])
+
+
+def _save_rollout_gif(
+    *,
+    out_path: Path,
+    render_context: Mapping[str, Any],
+    row: Mapping[str, Any],
+    family_render_items: Sequence[Mapping[str, Any]],
+    rollout_trajectory_world: np.ndarray,
+    rollout_frame_records: Sequence[Mapping[str, Any]] | None,
+    fps: float,
+) -> None:
+    from PIL import Image
+
+    trajectory_world = _finite_xy_rows(np.asarray(rollout_trajectory_world, dtype=np.float64))
+    if trajectory_world.shape[0] < 2:
+        return
+    all_segments_world: List[np.ndarray] = []
+    all_gradient_values: List[np.ndarray] = []
+    representative_route_world = None
+    for item in family_render_items:
+        segments_world = [
+            np.asarray(seg, dtype=np.float64)
+            for seg in list(item.get("segments_world") or [])
+            if np.asarray(seg).shape[0] >= 2
+        ]
+        if not segments_world:
+            continue
+        if representative_route_world is None:
+            representative_route_world = np.concatenate(segments_world, axis=0)
+        all_segments_world.extend(segments_world)
+        gradient_src = item.get("gradient_values")
+        gradients = np.asarray([] if gradient_src is None else gradient_src, dtype=np.float32).reshape(-1)
+        if gradients.size > 0:
+            all_gradient_values.append(gradients)
+    gradient_values = np.concatenate(all_gradient_values, axis=0) if all_gradient_values else None
+
+    frames: List[Image.Image] = []
+    total_steps = int(max(0, trajectory_world.shape[0] - 1))
+    safe_fps = max(float(fps), 1.0)
+    frame_duration_ms = int(round(1000.0 / safe_fps))
+    for step_idx in range(total_steps + 1):
+        prefix_world = trajectory_world[: step_idx + 1]
+        current_world = prefix_world[-1]
+        frame_record = None
+        if rollout_frame_records is not None and step_idx < len(rollout_frame_records):
+            frame_record = rollout_frame_records[step_idx]
+        actual_arrow_world = None
+        teacher_arrow_world = None
+        token_line = f"step={step_idx}/{total_steps}"
+        legend_line = "orange=model action  purple=family-teacher top"
+        if frame_record is not None:
+            actual_arrow_world = np.asarray(
+                [frame_record["current_world_xy"], frame_record["actual_next_world_xy"]],
+                dtype=np.float64,
+            )
+            teacher_next_world_xy = frame_record.get("teacher_next_world_xy")
+            if teacher_next_world_xy is not None:
+                teacher_arrow_world = np.asarray(
+                    [frame_record["current_world_xy"], teacher_next_world_xy],
+                    dtype=np.float64,
+                )
+            teacher_token = frame_record.get("teacher_token", None)
+            teacher_token_text = "n/a" if teacher_token is None else str(int(teacher_token))
+            token_line = (
+                f"step={step_idx}/{total_steps}  model_token={int(frame_record['actual_token'])}  "
+                f"teacher_token={teacher_token_text}"
+            )
+        fig = plt.figure(figsize=(FIG_SIZE_INCH, FIG_SIZE_INCH), dpi=FIG_DPI)
+        ax = fig.add_axes([0.005, 0.005, 0.99, 0.99])
+        _draw_vlm_style_scene_ax(
+            fig=fig,
+            ax=ax,
+            render_context=render_context,
+            highlighted_segments_world=all_segments_world,
+            highlighted_gradient_values=gradient_values,
+            representative_route_world=representative_route_world,
+            current_marker_world=current_world,
+            actual_action_arrow_world=actual_arrow_world,
+            teacher_action_arrow_world=teacher_arrow_world,
+            rollout_trajectory_world=prefix_world,
+            info_box_text=(
+                f"scene={row['scenario_id']}\n"
+                f"slot={row['selected_slot_id']}\n"
+                f"requested={row['requested_semantic_label']}\n"
+                f"{token_line}\n"
+                f"{legend_line}"
+            ),
+            show_colorbar=True,
+        )
+        frames.append(Image.fromarray(_figure_rgb_array(fig)))
+        plt.close(fig)
+
+    if not frames:
+        return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=frame_duration_ms,
+        loop=0,
+        optimize=False,
+    )
 
 
 def _save_step_grid(
@@ -994,12 +1408,14 @@ def _save_step_grid(
         representative_route_world = (
             np.concatenate(highlighted_segments_world, axis=0) if highlighted_segments_world else np.zeros((0, 2), dtype=np.float64)
         )
+        family_prob_value = record.get("family_teacher_prob", None)
+        family_prob_text = "n/a" if family_prob_value is None else f"{float(family_prob_value):.3f}"
         info_box_text = (
             f"step={record['step_index']}  token={record['best_token']}\n"
             f"path={record.get('best_family_path_id', chosen_item.get('path_id', ''))}\n"
             f"weightedE={record['weighted_energy']:.3f}  familyE={record['chosen_family_energy']:.3f}\n"
             f"pos={record['position_penalty']:.3f}  head={record['heading_penalty']:.3f}  back={record['backward_penalty']:.3f}\n"
-            f"gate={record['guide_weight']:.3f}  student_p={record['student_prob']:.3f}  family_p={record['family_teacher_prob']:.3f}"
+            f"gate={record['guide_weight']:.3f}  student_p={record['student_prob']:.3f}  family_p={family_prob_text}"
         )
         _draw_vlm_style_scene_ax(
             fig=fig,
@@ -1056,19 +1472,36 @@ def _run_single_row(
     outdir: Path,
 ) -> Dict[str, Any]:
     row = dict(rows[row_index])
+    raw_scenario = load_raw_scenario_from_row(row)
     sample = dataset[row_index]
     batch = dataset.collate_batch([sample])
     batch_torch = _to_torch_device(batch, device=device)
 
     with torch.no_grad():
-        output = model(copy.deepcopy(batch_torch))
-        loss, loss_stat = model.get_loss(output)
-        semantic_context = model._extract_sdc_semantic_context(output)
+        forward_output = model(copy.deepcopy(batch_torch))
+        loss, loss_stat = model.get_loss(forward_output)
+        if bool(args.autoregressive_rollout):
+            rollout_batch = _prepare_batch_for_autoregressive_rollout(batch_torch, raw_scenario=raw_scenario)
+            rollout_output = model.model.autoregressive_rollout(
+                rollout_batch,
+                num_decode_steps=None,
+                sampling_method=str(args.rollout_sampling_method),
+                temperature=_optional_positive_float(float(args.rollout_temperature)),
+                topp=_optional_positive_float(float(args.rollout_topp)),
+                autoregressive_start_step=0,
+            )
+            output = _adapt_rollout_output_for_semantic_eval(base_batch=batch_torch, rollout_output=rollout_output)
+            semantic_context = model._extract_sdc_semantic_context(output)
+            action_bundle = _build_rollout_action_debug_bundle(model, output, semantic_context) if semantic_context is not None else None
+        else:
+            output = forward_output
+            semantic_context = model._extract_sdc_semantic_context(output)
+            action_bundle = _build_action_debug_bundle(model, output, semantic_context) if semantic_context is not None else None
     if semantic_context is None:
         raise RuntimeError("Selected row did not produce an sdc_semantic_only context.")
+    if action_bundle is None:
+        raise RuntimeError("Failed to build action debug bundle for the selected row.")
 
-    action_bundle = _build_action_debug_bundle(model, output, semantic_context)
-    raw_scenario = load_raw_scenario_from_row(row)
     render_context = _extract_scene_render_context(raw_scenario, row)
     scene_rows = _scene_rows_for_scenario(rows, str(row.get("scenario_id") or ""))
     family_render_items = _build_family_gradient_render_items(
@@ -1113,6 +1546,22 @@ def _run_single_row(
 
     current_model_xy = np.asarray(semantic_context["sdc_current_pos_world"][0].detach().cpu(), dtype=np.float32)
     current_world_xy = _model_to_world(current_model_xy, map_center_world=map_center_world, map_heading_world=map_heading_world)
+    rollout_trajectory_world = None
+    if bool(args.autoregressive_rollout):
+        sdc_agent_idx = int(np.argmax(np.asarray(semantic_context["decision_agent_mask"][0].detach().cpu(), dtype=np.float32)))
+        rollout_next_model_xy = np.asarray(
+            output["decoder/rollout_next_position"][0, :, sdc_agent_idx, :].detach().cpu(),
+            dtype=np.float32,
+        )
+        rollout_next_world_xy = _model_to_world(
+            rollout_next_model_xy,
+            map_center_world=map_center_world,
+            map_heading_world=map_heading_world,
+        )
+        rollout_trajectory_world = np.concatenate(
+            [current_world_xy[:1], rollout_next_world_xy],
+            axis=0,
+        ).astype(np.float32)
 
     position_penalty = np.asarray(action_bundle["position_penalty"][0].detach().cpu(), dtype=np.float32)
     heading_penalty = np.asarray(action_bundle["heading_penalty"][0].detach().cpu(), dtype=np.float32)
@@ -1124,7 +1573,13 @@ def _run_single_row(
     best_family_energy = np.asarray(action_bundle["best_family_energy"][0].detach().cpu(), dtype=np.float32)
     guide_weight = np.asarray(action_bundle["guide_weight"][0].detach().cpu(), dtype=np.float32)
     student_probs = np.asarray(action_bundle["student_probs"][0].detach().cpu(), dtype=np.float32)
-    family_teacher_probs = np.asarray(action_bundle["family_teacher"][0].detach().cpu(), dtype=np.float32)
+    family_teacher_tensor = action_bundle.get("family_teacher")
+    family_teacher_probs = (
+        None
+        if family_teacher_tensor is None
+        else np.asarray(family_teacher_tensor[0].detach().cpu(), dtype=np.float32)
+    )
+    teacher_top_token = None if family_teacher_probs is None else np.argmax(family_teacher_probs, axis=-1).astype(np.int64)
     best_next_model = np.asarray(semantic_context["sdc_next_pos_candidates_world"][0].detach().cpu(), dtype=np.float32)
     best_next_world_all = np.stack(
         [
@@ -1133,6 +1588,35 @@ def _run_single_row(
         ],
         axis=0,
     )
+    rollout_frame_records: List[Dict[str, Any]] = []
+    if bool(args.autoregressive_rollout):
+        total_rollout_steps = int(
+            min(
+                current_world_xy.shape[0],
+                best_token.shape[0],
+                best_next_world_all.shape[0],
+                sdc_valid_by_t.shape[0],
+            )
+        )
+        for step_idx in range(total_rollout_steps):
+            actual_token_idx = int(best_token[step_idx])
+            current_world = np.asarray(current_world_xy[step_idx], dtype=np.float32)
+            actual_next_world = np.asarray(best_next_world_all[step_idx, actual_token_idx], dtype=np.float32)
+            teacher_token_idx = None
+            teacher_next_world = None
+            if teacher_top_token is not None:
+                teacher_token_idx = int(teacher_top_token[step_idx])
+                teacher_next_world = np.asarray(best_next_world_all[step_idx, teacher_token_idx], dtype=np.float32)
+            rollout_frame_records.append(
+                {
+                    "step_index": int(step_idx),
+                    "current_world_xy": current_world.tolist(),
+                    "actual_token": actual_token_idx,
+                    "actual_next_world_xy": actual_next_world.tolist(),
+                    "teacher_token": teacher_token_idx,
+                    "teacher_next_world_xy": (None if teacher_next_world is None else teacher_next_world.tolist()),
+                }
+            )
 
     sampled_records: List[Dict[str, Any]] = []
     sampled_points_world = []
@@ -1169,7 +1653,9 @@ def _run_single_row(
                 "backward_penalty": float(backward_penalty[step_idx, token_idx, family_idx]),
                 "guide_weight": float(guide_weight[step_idx]),
                 "student_prob": float(student_probs[step_idx, token_idx]),
-                "family_teacher_prob": float(family_teacher_probs[step_idx, token_idx]),
+                "family_teacher_prob": (
+                    None if family_teacher_probs is None else float(family_teacher_probs[step_idx, token_idx])
+                ),
                 "family_weight": float(family_weights[family_idx]),
             }
         )
@@ -1177,6 +1663,7 @@ def _run_single_row(
     overview_path = outdir / "scene_overview.png"
     grid_path = outdir / "sampled_action_projection_grid.png"
     summary_path = outdir / "action_projection_summary.json"
+    rollout_gif_path = outdir / "rollout.gif"
 
     sampled_points_world_arr = np.asarray(sampled_points_world, dtype=np.float32).reshape(-1, 2)
     _save_overview_plot(
@@ -1186,6 +1673,7 @@ def _run_single_row(
         family_render_items=family_render_items,
         sampled_world_xy=sampled_points_world_arr,
         sampled_steps=sampled_steps,
+        rollout_trajectory_world=rollout_trajectory_world,
     )
     _save_step_grid(
         out_path=grid_path,
@@ -1194,6 +1682,16 @@ def _run_single_row(
         family_render_items=family_render_items,
         sampled_records=sampled_records,
     )
+    if bool(args.save_rollout_gif) and rollout_trajectory_world is not None:
+        _save_rollout_gif(
+            out_path=rollout_gif_path,
+            render_context=render_context,
+            row=row,
+            family_render_items=family_render_items,
+            rollout_trajectory_world=rollout_trajectory_world,
+            rollout_frame_records=rollout_frame_records,
+            fps=float(args.rollout_gif_fps),
+        )
 
     summary = {
         "row_index": int(row_index),
@@ -1201,6 +1699,10 @@ def _run_single_row(
         "selected_slot_id": str(row.get("selected_slot_id") or ""),
         "requested_semantic_label": str(row.get("requested_semantic_label") or ""),
         "requested_semantic_confidence": float(row.get("requested_semantic_confidence") or 0.0),
+        "evaluation_mode": ("autoregressive_rollout" if bool(args.autoregressive_rollout) else "teacher_forced_forward"),
+        "rollout_sampling_method": (str(args.rollout_sampling_method) if bool(args.autoregressive_rollout) else None),
+        "rollout_temperature": (_optional_positive_float(float(args.rollout_temperature)) if bool(args.autoregressive_rollout) else None),
+        "rollout_topp": (_optional_positive_float(float(args.rollout_topp)) if bool(args.autoregressive_rollout) else None),
         "checkpoint_load_report": None,
         "total_loss": float(loss.detach().cpu().item()),
         "loss_stat": _scalarize_loss_stat(loss_stat),
@@ -1208,6 +1710,7 @@ def _run_single_row(
         "sampled_steps": sampled_records,
         "scene_overview_png": str(overview_path),
         "sampled_action_projection_grid_png": str(grid_path),
+        "rollout_gif": (str(rollout_gif_path) if bool(args.save_rollout_gif) and rollout_gif_path.exists() else None),
     }
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return summary
@@ -1265,6 +1768,7 @@ def main() -> int:
                     "action_projection_summary_json": str(summary_path),
                     "scene_overview_png": str(summary["scene_overview_png"]),
                     "sampled_action_projection_grid_png": str(summary["sampled_action_projection_grid_png"]),
+                    "rollout_gif": summary.get("rollout_gif"),
                 }
             )
         manifest = {
@@ -1300,6 +1804,7 @@ def main() -> int:
                 {
                     "scene_overview_png": str(summary["scene_overview_png"]),
                     "sampled_action_projection_grid_png": str(summary["sampled_action_projection_grid_png"]),
+                    "rollout_gif": summary.get("rollout_gif"),
                     "action_projection_summary_json": str(summary_path),
                     "row_index": int(row_index),
                     "scenario_id": str(summary["scenario_id"]),

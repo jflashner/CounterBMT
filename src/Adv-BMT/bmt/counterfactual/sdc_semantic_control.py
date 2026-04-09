@@ -11,12 +11,15 @@ import torch
 
 from .normalize import load_raw_scenario
 from .sdc_path_control import (
+    DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
+    DEFAULT_DISCONTINUITY_STITCH_RADIUS_M,
     DEFAULT_RESAMPLE_SPACING_M,
     DEFAULT_SEPARABILITY_HEADING_WEIGHT_M,
     DEFAULT_SEPARABILITY_SCALE_M,
     SDC_PATH_SEMANTIC_LABEL_ORDER,
     ResampledLocalPath,
     _extract_valid_sdc_path_xy,
+    build_selected_path_world,
     compute_path_separability_profile,
     extract_ground_truth_sdc_route_xy,
     extract_sdc_current_pose,
@@ -24,9 +27,11 @@ from .sdc_path_control import (
     normalize_semantic_label,
     polyline_arc_lengths,
     polyline_headings,
+    polyline_segment_valid_mask,
     resample_polyline_xy,
     semantic_label_to_id,
     split_polyline_on_discontinuities,
+    stitch_polyline_discontinuities,
     trim_polyline_from_point,
 )
 
@@ -204,6 +209,9 @@ def build_resampled_world_path(
     current_time_index: int,
     slot: Mapping[str, Any],
     spacing_m: float = DEFAULT_RESAMPLE_SPACING_M,
+    stitch_discontinuities: bool = False,
+    stitch_radius_m: float = DEFAULT_DISCONTINUITY_STITCH_RADIUS_M,
+    stitch_jump_threshold_m: float = DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
 ) -> ResampledWorldPath:
     current_xy_world, _ = extract_sdc_current_pose(
         raw_scenario,
@@ -220,6 +228,12 @@ def build_resampled_world_path(
     else:
         candidate_xy = _extract_valid_sdc_path_xy(raw_scenario, str(slot.get("path_id") or ""))
         world_xy = trim_polyline_from_point(candidate_xy, current_xy_world, prepend_point=True)
+    if bool(stitch_discontinuities):
+        world_xy = stitch_polyline_discontinuities(
+            world_xy,
+            handoff_radius_m=float(stitch_radius_m),
+            jump_threshold_m=float(stitch_jump_threshold_m),
+        )
     resampled_world = resample_polyline_xy(world_xy, spacing_m=float(spacing_m))
     headings_world = polyline_headings(resampled_world)
     tangents_world = tangents_from_headings(headings_world)
@@ -246,6 +260,9 @@ def build_world_paths_for_contract(
     current_time_index: int,
     spacing_m: float = DEFAULT_RESAMPLE_SPACING_M,
     include_stop: bool = True,
+    stitch_discontinuities: bool = False,
+    stitch_radius_m: float = DEFAULT_DISCONTINUITY_STITCH_RADIUS_M,
+    stitch_jump_threshold_m: float = DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
 ) -> Dict[str, ResampledWorldPath]:
     out: Dict[str, ResampledWorldPath] = {}
     for slot in iter_highlighted_slots(contract, include_stop=include_stop):
@@ -258,6 +275,9 @@ def build_world_paths_for_contract(
             current_time_index=int(current_time_index),
             slot=slot,
             spacing_m=float(spacing_m),
+            stitch_discontinuities=bool(stitch_discontinuities),
+            stitch_radius_m=float(stitch_radius_m),
+            stitch_jump_threshold_m=float(stitch_jump_threshold_m),
         )
     return out
 
@@ -341,15 +361,23 @@ def build_sdc_semantic_dataset_fields(
     row: Mapping[str, Any],
     require_trainable: bool,
     include_stop: bool = True,
+    stitch_discontinuities: bool = False,
+    stitch_radius_m: float = DEFAULT_DISCONTINUITY_STITCH_RADIUS_M,
+    stitch_jump_threshold_m: float = DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
 ) -> Dict[str, Any]:
     debug_meta = {
         "schema_version": str(row.get("schema_version") or SDC_SEMANTIC_CONTROL_SCHEMA_VERSION),
         "scenario_id": str(scenario_id),
         "sdc_id": str(row.get("sdc_id") or ""),
+        "selected_slot_id": str(row.get("selected_slot_id") or ""),
+        "selected_path_id": (None if row.get("selected_path_id") is None else str(row.get("selected_path_id"))),
         "requested_semantic_label": normalize_semantic_label(row.get("requested_semantic_label")),
         "source_kind": str(row.get("source_kind") or ""),
         "candidate_family_path_ids": [None if value is None else str(value) for value in list(row.get("candidate_family_path_ids", []) or [])],
         "family_size": int(len(list(row.get("candidate_family_path_ids", []) or []))),
+        "family_stitch_discontinuities": bool(stitch_discontinuities),
+        "family_stitch_radius_m": float(stitch_radius_m),
+        "family_stitch_jump_threshold_m": float(stitch_jump_threshold_m),
     }
     sdc_id = str(row.get("sdc_id") or "")
     decoder_track_names = [str(value) for value in np.asarray(decoder_track_names, dtype=object).reshape(-1).tolist()]
@@ -403,6 +431,31 @@ def build_sdc_semantic_dataset_fields(
     family_paths = np.zeros((0, 0, 2), dtype=np.float32)
     family_tangents = np.zeros((0, 0, 2), dtype=np.float32)
     family_arc = np.zeros((0, 0), dtype=np.float32)
+    selected_raw_path_world = np.zeros((0, 2), dtype=np.float32)
+    selected_raw_path_segment_mask = np.zeros((0,), dtype=np.float32)
+    selected_raw_path_mask = np.zeros((0,), dtype=np.float32)
+    scenario_pkl = str(row.get("scenario_pkl") or "").strip()
+    if scenario_pkl and sdc_id:
+        raw_scenario = load_raw_scenario_from_row(row)
+        selected_raw_path_world = np.asarray(
+            build_selected_path_world(
+                raw_scenario=raw_scenario,
+                sdc_id=sdc_id,
+                current_time_index=int(row.get("current_time_index") or 0),
+                source_kind=str(row.get("source_kind") or ""),
+                selected_path_id=None if row.get("selected_path_id") is None else str(row.get("selected_path_id")),
+            ),
+            dtype=np.float32,
+        ).reshape(-1, 2)
+        selected_raw_path_segment_mask = polyline_segment_valid_mask(
+            selected_raw_path_world,
+            jump_threshold_m=float(stitch_jump_threshold_m),
+        ).astype(np.float32)
+        selected_raw_path_mask = np.ones((selected_raw_path_world.shape[0],), dtype=np.float32)
+        debug_meta["selected_raw_path_num_points"] = int(selected_raw_path_world.shape[0])
+        debug_meta["selected_raw_path_num_segments"] = int(
+            np.maximum(selected_raw_path_segment_mask.sum(), 0.0)
+        )
     num_paths = min(
         len(raw_family_paths),
         len(raw_family_tangents),
@@ -411,6 +464,55 @@ def build_sdc_semantic_dataset_fields(
         int(family_confidences.shape[0]) if family_confidences.size > 0 else len(raw_family_paths),
     )
     if num_paths > 0:
+        if bool(stitch_discontinuities):
+            stitched_paths = []
+            stitched_tangents = []
+            stitched_arcs = []
+            discontinuities_before: List[int] = []
+            discontinuities_after: List[int] = []
+            for idx in range(num_paths):
+                original_path = np.asarray(raw_family_paths[idx], dtype=np.float32).reshape(-1, 2)
+                discontinuities_before.append(
+                    int(
+                        max(
+                            0,
+                            len(
+                                split_polyline_on_discontinuities(
+                                    original_path,
+                                    jump_threshold_m=float(stitch_jump_threshold_m),
+                                )
+                            )
+                            - 1,
+                        )
+                    )
+                )
+                stitched_path = stitch_polyline_discontinuities(
+                    original_path,
+                    handoff_radius_m=float(stitch_radius_m),
+                    jump_threshold_m=float(stitch_jump_threshold_m),
+                )
+                discontinuities_after.append(
+                    int(
+                        max(
+                            0,
+                            len(
+                                split_polyline_on_discontinuities(
+                                    stitched_path,
+                                    jump_threshold_m=float(stitch_jump_threshold_m),
+                                )
+                            )
+                            - 1,
+                        )
+                    )
+                )
+                stitched_paths.append(stitched_path.tolist())
+                stitched_tangents.append(tangents_from_headings(polyline_headings(stitched_path)).tolist())
+                stitched_arcs.append(polyline_arc_lengths(stitched_path).tolist())
+            raw_family_paths = stitched_paths
+            raw_family_tangents = stitched_tangents
+            raw_family_arc = stitched_arcs
+            debug_meta["family_discontinuities_before"] = discontinuities_before
+            debug_meta["family_discontinuities_after"] = discontinuities_after
         path_arrays = [np.asarray(raw_family_paths[idx], dtype=np.float32).reshape(-1, 2) for idx in range(num_paths)]
         tangent_arrays = [np.asarray(raw_family_tangents[idx], dtype=np.float32).reshape(-1, 2) for idx in range(num_paths)]
         arc_arrays = [np.asarray(raw_family_arc[idx], dtype=np.float32).reshape(-1) for idx in range(num_paths)]
@@ -451,6 +553,9 @@ def build_sdc_semantic_dataset_fields(
         "cf/sdc_family_divergence_onsets": family_onsets.astype(np.float32),
         "cf/sdc_family_path_mask": family_mask.astype(np.float32),
         "cf/sdc_family_confidences": family_confidences.astype(np.float32),
+        "cf/sdc_selected_raw_path_world": selected_raw_path_world.astype(np.float32),
+        "cf/sdc_selected_raw_path_mask": selected_raw_path_mask.astype(np.float32),
+        "cf/sdc_selected_raw_path_segment_mask": selected_raw_path_segment_mask.astype(np.float32),
         "cf/sdc_is_factual": int(is_factual),
         "cf/sdc_control_available": int(control_available),
         "cf/sdc_debug_meta": dict(debug_meta),
@@ -519,6 +624,87 @@ def project_points_to_family_paths_torch(
         "nearest_distance": nearest_distance.reshape(out_shape),
         "nearest_arc": nearest_arc.reshape(out_shape),
         "nearest_heading": nearest_heading.reshape(out_shape),
+    }
+
+
+def project_points_to_segment_tube_torch(
+    points_world_xy: torch.Tensor,
+    *,
+    path_points_world: torch.Tensor,
+    path_point_mask: torch.Tensor,
+    path_segment_mask: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    if points_world_xy.ndim < 3 or points_world_xy.shape[-1] != 2:
+        raise ValueError(f"points_world_xy must end with [...,2], got {tuple(points_world_xy.shape)}")
+    if path_points_world.ndim != 3 or path_points_world.shape[-1] != 2:
+        raise ValueError(f"path_points_world must be [B,M,2], got {tuple(path_points_world.shape)}")
+
+    B = points_world_xy.shape[0]
+    flat_shape = points_world_xy.shape[1:-1]
+    num_points = int(np.prod(flat_shape)) if flat_shape else 1
+    points_flat = points_world_xy.reshape(B, num_points, 2)
+    path_points_world = path_points_world.to(device=points_world_xy.device, dtype=points_world_xy.dtype)
+    path_point_mask = path_point_mask.to(device=points_world_xy.device) > 0
+    path_segment_mask = path_segment_mask.to(device=points_world_xy.device) > 0
+
+    if path_points_world.shape[1] == 0:
+        nearest_distance = torch.full(
+            (B, num_points),
+            1e6,
+            device=points_world_xy.device,
+            dtype=points_world_xy.dtype,
+        )
+        out_shape = tuple(points_world_xy.shape[:-1])
+        return {
+            "nearest_distance": nearest_distance.reshape(out_shape),
+            "has_valid_segment": torch.zeros((B,), device=points_world_xy.device, dtype=torch.bool),
+        }
+
+    point_large = torch.full(
+        (B, num_points, path_points_world.shape[1]),
+        1e6,
+        device=points_world_xy.device,
+        dtype=points_world_xy.dtype,
+    )
+    point_distance = torch.linalg.norm(points_flat[:, :, None, :] - path_points_world[:, None, :, :], dim=-1)
+    point_distance = torch.where(path_point_mask[:, None, :], point_distance, point_large)
+    nearest_point_distance = point_distance.min(dim=-1).values
+
+    if path_points_world.shape[1] < 2:
+        out_shape = tuple(points_world_xy.shape[:-1])
+        return {
+            "nearest_distance": nearest_point_distance.reshape(out_shape),
+            "has_valid_segment": torch.zeros((B,), device=points_world_xy.device, dtype=torch.bool),
+        }
+
+    segment_valid = path_point_mask[:, :-1] & path_point_mask[:, 1:]
+    if path_segment_mask.shape[1] == path_points_world.shape[1]:
+        segment_valid = segment_valid & path_segment_mask[:, :-1]
+    else:
+        segment_valid = segment_valid & path_segment_mask[:, : segment_valid.shape[1]]
+
+    seg_start = path_points_world[:, :-1, :]
+    seg_end = path_points_world[:, 1:, :]
+    seg_delta = seg_end - seg_start
+    seg_denom = (seg_delta * seg_delta).sum(dim=-1).clamp_min(1e-6)
+    rel = points_flat[:, :, None, :] - seg_start[:, None, :, :]
+    t = ((rel * seg_delta[:, None, :, :]).sum(dim=-1) / seg_denom[:, None, :]).clamp_(0.0, 1.0)
+    seg_projection = seg_start[:, None, :, :] + t[..., None] * seg_delta[:, None, :, :]
+    seg_distance = torch.linalg.norm(points_flat[:, :, None, :] - seg_projection, dim=-1)
+    seg_large = torch.full_like(seg_distance, 1e6)
+    seg_distance = torch.where(segment_valid[:, None, :], seg_distance, seg_large)
+    nearest_segment_distance = seg_distance.min(dim=-1).values
+
+    has_valid_segment = segment_valid.any(dim=-1)
+    nearest_distance = torch.where(
+        has_valid_segment[:, None],
+        nearest_segment_distance,
+        nearest_point_distance,
+    )
+    out_shape = tuple(points_world_xy.shape[:-1])
+    return {
+        "nearest_distance": nearest_distance.reshape(out_shape),
+        "has_valid_segment": has_valid_segment,
     }
 
 

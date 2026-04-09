@@ -1,4 +1,5 @@
 import datetime
+import ast
 import json
 import os
 import pathlib
@@ -162,7 +163,18 @@ class SemanticRolloutGifCallback(Callback):
         if value is None:
             return []
         if isinstance(value, str):
-            parts = [item.strip() for item in value.split(",")]
+            text = value.strip()
+            if not text:
+                return []
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = ast.literal_eval(text)
+                except Exception:
+                    inner = text[1:-1]
+                    parts = [item.strip().strip("'\"") for item in inner.split(",")]
+                    return [item for item in parts if item]
+                return SemanticRolloutGifCallback._normalize_text_list(parsed)
+            parts = [item.strip().strip("'\"") for item in text.split(",")]
             return [item for item in parts if item]
         if isinstance(value, (list, tuple)):
             items = []
@@ -328,6 +340,206 @@ class SemanticRolloutGifCallback(Callback):
             traceback.print_exc()
 
 
+class SemanticRolloutAdvantageCallback(SemanticRolloutGifCallback):
+    def __init__(self, *, config, artifact_root: pathlib.Path):
+        super().__init__(config=config, artifact_root=artifact_root)
+        self.enabled = bool(config.get("ROLLOUT_ADVANTAGE_EVAL_ENABLED", False))
+        self.every_n_validations = max(1, int(config.get("ROLLOUT_ADVANTAGE_EVAL_EVERY_N_VALIDATIONS", 1)))
+        self.max_scenes = max(1, int(config.get("ROLLOUT_ADVANTAGE_EVAL_MAX_SCENES", 1)))
+        self.include_gt = bool(config.get("ROLLOUT_ADVANTAGE_EVAL_INCLUDE_GT", False))
+        self.scenario_ids = self._normalize_text_list(config.get("ROLLOUT_ADVANTAGE_EVAL_SCENARIO_IDS", []))
+        self.slot_ids = self._normalize_text_list(config.get("ROLLOUT_ADVANTAGE_EVAL_SLOT_IDS", []))
+        self.control_index_override = str(config.get("ROLLOUT_ADVANTAGE_EVAL_CONTROL_INDEX", "")).strip()
+        self.data_dir_override = str(config.get("ROLLOUT_ADVANTAGE_EVAL_DATA_DIR", "")).strip()
+        self.num_rollouts = max(1, int(config.get("ROLLOUT_ADVANTAGE_EVAL_NUM_ROLLOUTS", 8)))
+        self.eval_device = str(config.get("ROLLOUT_ADVANTAGE_EVAL_DEVICE", "cpu")).strip() or "cpu"
+        self.sampling_method = str(config.get("ROLLOUT_ADVANTAGE_EVAL_SAMPLING_METHOD", "softmax")).strip() or "softmax"
+        self.temperature = float(config.get("ROLLOUT_ADVANTAGE_EVAL_TEMPERATURE", 1.0))
+        self.topp = float(config.get("ROLLOUT_ADVANTAGE_EVAL_TOPP", 0.9))
+        self.tube_radius_m = float(config.get("ROLLOUT_ADVANTAGE_EVAL_TUBE_RADIUS_M", 3.0))
+        self.inside_reward = float(config.get("ROLLOUT_ADVANTAGE_EVAL_INSIDE_REWARD", 1.0))
+        self.outside_scale = float(config.get("ROLLOUT_ADVANTAGE_EVAL_OUTSIDE_SCALE", 1.0))
+        self.discount = float(config.get("ROLLOUT_ADVANTAGE_EVAL_DISCOUNT", 1.0))
+        self.grid_step_m = float(config.get("ROLLOUT_ADVANTAGE_EVAL_GRID_STEP_M", 0.35))
+        self.jump_threshold_m = float(config.get("ROLLOUT_ADVANTAGE_EVAL_JUMP_THRESHOLD_M", 6.0))
+        self.seed = int(config.get("ROLLOUT_ADVANTAGE_EVAL_SEED", 0))
+        self.eval_script = self.repo_root / "scripts" / "counterfactual" / "analyze_sdc_semantic_group_rollout_advantages.py"
+
+    def _select_slot_ids(self, control_index: pathlib.Path, *, scenario_id: str):
+        if self.slot_ids:
+            if self.include_gt:
+                return self.slot_ids
+            return [slot_id for slot_id in self.slot_ids if str(slot_id) != "gt"]
+
+        matches = []
+        with control_index.open("rt", encoding="utf-8") as fp:
+            for line in fp:
+                text = line.strip()
+                if not text:
+                    continue
+                row = json.loads(text)
+                if str(row.get("scenario_id") or "") != str(scenario_id):
+                    continue
+                slot_id = str(row.get("selected_slot_id") or "").strip()
+                if not slot_id:
+                    continue
+                if not self.include_gt and slot_id == "gt":
+                    continue
+                matches.append(slot_id)
+
+        def _slot_sort_key(slot_id: str):
+            if slot_id == "gt":
+                return (0, slot_id)
+            if slot_id.startswith("alt_"):
+                suffix = slot_id.split("_", 1)[-1]
+                if suffix.isdigit():
+                    return (1, f"{int(suffix):04d}")
+            return (2, slot_id)
+
+        ordered = []
+        seen = set()
+        for slot_id in sorted(matches, key=_slot_sort_key):
+            if slot_id in seen:
+                continue
+            ordered.append(slot_id)
+            seen.add(slot_id)
+        return ordered
+
+    @staticmethod
+    def _sanitize_name(text):
+        value = str(text).strip()
+        if not value:
+            return "item"
+        return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if not self.enabled or not trainer.is_global_zero or trainer.sanity_checking:
+            return
+
+        self._validation_events += 1
+        if (self._validation_events % self.every_n_validations) != 0:
+            return
+
+        try:
+            control_index = self._resolve_control_index()
+            data_dir = self._resolve_data_dir()
+            scenario_ids = self._select_scenario_ids(control_index)
+            eval_root = self.artifact_root / "rollout_advantage_eval" / f"step_{int(trainer.global_step):06d}"
+            eval_root.mkdir(parents=True, exist_ok=True)
+
+            cfg_path = eval_root / "resolved_train_config.yaml"
+            OmegaConf.save(config=self.config, f=str(cfg_path))
+
+            ckpt_path = eval_root / "_snapshot.ckpt"
+            trainer.save_checkpoint(str(ckpt_path))
+
+            summary = {
+                "global_step": int(trainer.global_step),
+                "current_epoch": int(trainer.current_epoch),
+                "scenario_ids": list(scenario_ids),
+                "control_index": str(control_index),
+                "data_dir": str(data_dir),
+                "device": self.eval_device,
+                "results": [],
+            }
+            env = dict(os.environ)
+            py_path = env.get("PYTHONPATH", "")
+            repo_root_text = str(self.repo_root)
+            env["PYTHONPATH"] = (
+                f"{repo_root_text}:{py_path}" if py_path and repo_root_text not in py_path.split(":") else (py_path or repo_root_text)
+            )
+
+            for scenario_id in scenario_ids:
+                slot_ids = self._select_slot_ids(control_index, scenario_id=str(scenario_id))
+                if not slot_ids:
+                    print(f"[rollout-advantage-eval] no slot ids resolved for scenario={scenario_id}")
+                    continue
+                for slot_id in slot_ids:
+                    slot_outdir = eval_root / self._sanitize_name(str(scenario_id)) / self._sanitize_name(str(slot_id))
+                    slot_outdir.mkdir(parents=True, exist_ok=True)
+                    cmd = [
+                        sys.executable,
+                        str(self.eval_script),
+                        "--config",
+                        str(cfg_path),
+                        "--control-index",
+                        str(control_index),
+                        "--data-dir",
+                        str(data_dir),
+                        "--ckpt",
+                        str(ckpt_path),
+                        "--outdir",
+                        str(slot_outdir),
+                        "--scenario-id",
+                        str(scenario_id),
+                        "--slot-id",
+                        str(slot_id),
+                        "--num-rollouts",
+                        str(self.num_rollouts),
+                        "--tube-radius-m",
+                        str(self.tube_radius_m),
+                        "--inside-reward",
+                        str(self.inside_reward),
+                        "--outside-scale",
+                        str(self.outside_scale),
+                        "--discount",
+                        str(self.discount),
+                        "--sampling-method",
+                        str(self.sampling_method),
+                        "--temperature",
+                        str(self.temperature),
+                        "--topp",
+                        str(self.topp),
+                        "--seed",
+                        str(self.seed),
+                        "--device",
+                        str(self.eval_device),
+                        "--grid-step-m",
+                        str(self.grid_step_m),
+                        "--jump-threshold-m",
+                        str(self.jump_threshold_m),
+                    ]
+                    result = subprocess.run(
+                        cmd,
+                        cwd=str(self.repo_root),
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False,
+                    )
+                    log_path = slot_outdir / "_callback_advantage_eval.log"
+                    log_path.write_text(result.stdout, encoding="utf-8")
+                    slot_summary = {
+                        "scenario_id": str(scenario_id),
+                        "slot_id": str(slot_id),
+                        "returncode": int(result.returncode),
+                        "output_dir": str(slot_outdir),
+                        "log_path": str(log_path),
+                    }
+                    summary["results"].append(slot_summary)
+                    if result.returncode != 0:
+                        print(
+                            f"[rollout-advantage-eval] scenario={scenario_id} slot={slot_id} failed "
+                            f"with return code {result.returncode}. See {log_path}"
+                        )
+                    else:
+                        print(
+                            f"[rollout-advantage-eval] saved grouped rollout analysis for "
+                            f"{scenario_id}/{slot_id} to {slot_outdir}"
+                        )
+
+            summary_path = eval_root / "callback_summary.json"
+            summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+            try:
+                ckpt_path.unlink()
+            except FileNotFoundError:
+                pass
+        except Exception as exc:
+            print(f"[rollout-advantage-eval] callback failed: {exc}")
+            traceback.print_exc()
+
+
 @hydra.main(version_base=None, config_path=str(REPO_ROOT / "cfgs"), config_name="motion_default.yaml")
 def main(config):
     # Unfreeze the config to allow modification
@@ -415,6 +627,12 @@ def main(config):
     )
     if rollout_gif_callback.enabled:
         callbacks.append(rollout_gif_callback)
+    rollout_advantage_callback = SemanticRolloutAdvantageCallback(
+        config=config,
+        artifact_root=ckpt_save_dir,
+    )
+    if rollout_advantage_callback.enabled:
+        callbacks.append(rollout_advantage_callback)
     device = "auto" if torch.cuda.is_available() else "cpu"
     trainer_kwargs = dict(
         num_sanity_val_steps=config.num_sanity_val_steps,

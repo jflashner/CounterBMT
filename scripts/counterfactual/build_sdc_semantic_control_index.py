@@ -28,6 +28,8 @@ if __package__ is None or __package__ == "":
 from bmt.counterfactual.normalize import load_raw_scenario
 from bmt.counterfactual.sdc_path_control import split_polyline_on_discontinuities
 from bmt.counterfactual.sdc_semantic_control import (
+    DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
+    DEFAULT_DISCONTINUITY_STITCH_RADIUS_M,
     DEFAULT_FAMILY_DIVERGENCE_MIN_RUN,
     DEFAULT_FAMILY_DIVERGENCE_THRESHOLD,
     DEFAULT_RESAMPLE_SPACING_M,
@@ -63,6 +65,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--separability-heading-weight-m", type=float, default=DEFAULT_SEPARABILITY_HEADING_WEIGHT_M)
     parser.add_argument("--divergence-threshold", type=float, default=DEFAULT_FAMILY_DIVERGENCE_THRESHOLD)
     parser.add_argument("--divergence-min-run", type=int, default=DEFAULT_FAMILY_DIVERGENCE_MIN_RUN)
+    parser.add_argument("--stitch-discontinuities", action="store_true")
+    parser.add_argument("--stitch-radius-m", type=float, default=DEFAULT_DISCONTINUITY_STITCH_RADIUS_M)
+    parser.add_argument("--stitch-jump-threshold-m", type=float, default=DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M)
     parser.add_argument("--max-examples", type=int, default=0)
     parser.add_argument("--debug-max-rows", type=int, default=4)
     parser.add_argument("--include-stop", action="store_true")
@@ -763,6 +768,9 @@ def main() -> int:
             current_time_index=int(current_time_index),
             spacing_m=float(args.resample_spacing_m),
             include_stop=True,
+            stitch_discontinuities=bool(args.stitch_discontinuities),
+            stitch_radius_m=float(args.stitch_radius_m),
+            stitch_jump_threshold_m=float(args.stitch_jump_threshold_m),
         )
         staged_vlm_artifacts = None
         if bool(args.stage_vlm_artifacts):

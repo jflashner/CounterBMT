@@ -28,6 +28,8 @@ DEFAULT_RESAMPLE_SPACING_M = 2.0
 DEFAULT_SEPARABILITY_SCALE_M = 6.0
 DEFAULT_SEPARABILITY_HEADING_WEIGHT_M = 2.0
 DEFAULT_PATH_DEADBAND_M = 1.0
+DEFAULT_DISCONTINUITY_STITCH_RADIUS_M = 2.0
+DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M = 6.0
 
 
 @dataclass
@@ -125,6 +127,51 @@ def split_polyline_on_discontinuities(
     if final_segment.shape[0] >= int(min_points):
         segments.append(final_segment)
     return segments
+
+
+def stitch_polyline_discontinuities(
+    points_xy: Any,
+    *,
+    handoff_radius_m: float = DEFAULT_DISCONTINUITY_STITCH_RADIUS_M,
+    jump_threshold_m: float = DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
+    min_points: int = 2,
+) -> np.ndarray:
+    xy = _sanitize_polyline(points_xy)
+    if xy.shape[0] <= 1:
+        return xy
+    segments = split_polyline_on_discontinuities(
+        xy,
+        jump_threshold_m=float(jump_threshold_m),
+        min_points=min_points,
+    )
+    if len(segments) <= 1:
+        return xy
+
+    radius = max(float(handoff_radius_m), 1e-3)
+    stitched = np.asarray(segments[0], dtype=np.float32)
+    for next_segment in segments[1:]:
+        current = _sanitize_polyline(stitched)
+        upcoming = _sanitize_polyline(next_segment)
+        if current.shape[0] == 0:
+            stitched = upcoming
+            continue
+        if upcoming.shape[0] == 0:
+            stitched = current
+            continue
+
+        next_start = np.asarray(upcoming[0], dtype=np.float32)
+        distances = np.linalg.norm(current - next_start.reshape(1, 2), axis=-1)
+        within = np.flatnonzero(distances <= radius)
+        if within.size > 0:
+            # Use the latest plausible handoff so we remove the dead-end tail
+            # without jumping prematurely if the segments run near each other.
+            cut_idx = int(within[-1])
+            stitched_prefix = np.asarray(current[: cut_idx + 1], dtype=np.float32)
+            stitched = np.concatenate([stitched_prefix, upcoming], axis=0).astype(np.float32)
+        else:
+            stitched = np.concatenate([current, upcoming], axis=0).astype(np.float32)
+        stitched = _sanitize_polyline(stitched)
+    return stitched
 
 
 def polyline_arc_lengths(points_xy: Any) -> np.ndarray:
@@ -320,6 +367,48 @@ def build_local_selected_path(
         headings=np.asarray(local_headings, dtype=np.float32),
         arc_lengths_m=np.asarray(local_arc, dtype=np.float32),
     )
+
+
+def build_selected_path_world(
+    *,
+    raw_scenario: Mapping[str, Any],
+    sdc_id: str,
+    current_time_index: int,
+    source_kind: str,
+    selected_path_id: Optional[str],
+) -> np.ndarray:
+    current_xy_world, _ = extract_sdc_current_pose(
+        raw_scenario,
+        sdc_id=str(sdc_id),
+        current_time_index=int(current_time_index),
+    )
+    if str(source_kind) == "factual_gt":
+        return extract_ground_truth_sdc_route_xy(
+            raw_scenario,
+            sdc_id=str(sdc_id),
+            current_time_index=int(current_time_index),
+        )
+    if not selected_path_id:
+        raise ValueError("selected_path_id is required for alternative_sdc_path rows")
+    candidate_xy = _extract_valid_sdc_path_xy(raw_scenario, str(selected_path_id))
+    return trim_polyline_from_point(candidate_xy, current_xy_world, prepend_point=True)
+
+
+def polyline_segment_valid_mask(
+    points_xy: Any,
+    *,
+    jump_threshold_m: float = DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
+) -> np.ndarray:
+    xy = _sanitize_polyline(points_xy)
+    if xy.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+    mask = np.zeros((xy.shape[0],), dtype=np.float32)
+    if xy.shape[0] < 2:
+        return mask
+    step_m = np.linalg.norm(xy[1:] - xy[:-1], axis=-1)
+    contiguous = step_m <= float(jump_threshold_m)
+    mask[: contiguous.shape[0]] = contiguous.astype(np.float32)
+    return mask
 
 
 def build_local_competing_paths(

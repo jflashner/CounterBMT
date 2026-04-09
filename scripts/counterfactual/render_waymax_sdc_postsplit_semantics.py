@@ -35,6 +35,8 @@ from scripts.counterfactual.label_waymax_sdc_path_semantics import (
 )
 from scripts.counterfactual.plot_waymax_sdc_path_grids import _plot_scene_grid  # type: ignore[attr-defined]
 from bmt.counterfactual.sdc_path_control import (
+    DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
+    DEFAULT_DISCONTINUITY_STITCH_RADIUS_M,
     ResampledLocalPath,
     _sanitize_polyline,
     compute_path_separability_profile,
@@ -43,6 +45,7 @@ from bmt.counterfactual.sdc_path_control import (
     polyline_length_m,
     resample_polyline_xy,
     split_polyline_on_discontinuities,
+    stitch_polyline_discontinuities,
     trim_polyline_from_point,
     world_to_sdc_up_frame,
 )
@@ -88,6 +91,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resample-spacing-m", type=float, default=DEFAULT_RESAMPLE_SPACING_M)
     parser.add_argument("--separability-scale-m", type=float, default=DEFAULT_SEPARABILITY_SCALE_M)
     parser.add_argument("--separability-heading-weight-m", type=float, default=DEFAULT_SEPARABILITY_HEADING_WEIGHT_M)
+    parser.add_argument("--stitch-discontinuities", action="store_true")
+    parser.add_argument("--stitch-radius-m", type=float, default=DEFAULT_DISCONTINUITY_STITCH_RADIUS_M)
+    parser.add_argument("--stitch-jump-threshold-m", type=float, default=DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M)
     parser.add_argument("--model", type=str, default="gpt-5.4")
     parser.add_argument("--image-detail", type=str, default="original", choices=("low", "high", "original", "auto"))
     parser.add_argument("--save-pkls", action="store_true")
@@ -162,11 +168,24 @@ def _integrated_separability_score(separability: np.ndarray, arc_lengths_m: np.n
     return float(total / max(float(gt_length_m), 1e-3))
 
 
-def _trim_and_split_world_path(points_xy_world: Any, *, current_xy_world: np.ndarray) -> List[np.ndarray]:
+def _trim_and_split_world_path(
+    points_xy_world: Any,
+    *,
+    current_xy_world: np.ndarray,
+    stitch_discontinuities: bool = False,
+    stitch_radius_m: float = DEFAULT_DISCONTINUITY_STITCH_RADIUS_M,
+    stitch_jump_threshold_m: float = DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
+) -> List[np.ndarray]:
     trimmed = trim_polyline_from_point(points_xy_world, current_xy_world, prepend_point=True)
+    if bool(stitch_discontinuities):
+        trimmed = stitch_polyline_discontinuities(
+            trimmed,
+            handoff_radius_m=float(stitch_radius_m),
+            jump_threshold_m=float(stitch_jump_threshold_m),
+        )
     return [
         np.asarray(segment, dtype=np.float32)
-        for segment in split_polyline_on_discontinuities(trimmed)
+        for segment in split_polyline_on_discontinuities(trimmed, jump_threshold_m=float(stitch_jump_threshold_m))
         if np.asarray(segment).shape[0] >= 2
     ]
 
@@ -275,6 +294,9 @@ def _select_top_separable_alternates(
     alt_diversity_weight: float,
     include_off_route_paths: bool,
     diversity_top_k: int,
+    stitch_discontinuities: bool,
+    stitch_radius_m: float,
+    stitch_jump_threshold_m: float,
 ) -> Optional[Dict[str, Any]]:
     track_state = dict(dict(raw_scenario["tracks"]).get(str(sdc_id), {}).get("state", {}))
     current_position = np.asarray(track_state.get("position", []), dtype=np.float32)
@@ -305,6 +327,9 @@ def _select_top_separable_alternates(
         trimmed_segments_world = _trim_and_split_world_path(
             path_row.get("polyline_xy", []),
             current_xy_world=current_xy,
+            stitch_discontinuities=bool(stitch_discontinuities),
+            stitch_radius_m=float(stitch_radius_m),
+            stitch_jump_threshold_m=float(stitch_jump_threshold_m),
         )
         alt_local_path, alt_local_segments, alt_world_resampled_segments = _resampled_local_path_from_world_segments(
             trimmed_segments_world,
@@ -776,6 +801,9 @@ def main() -> int:
             alt_diversity_weight=float(args.alt_diversity_weight),
             include_off_route_paths=bool(args.include_off_route_paths),
             diversity_top_k=int(args.diversity_top_k),
+            stitch_discontinuities=bool(args.stitch_discontinuities),
+            stitch_radius_m=float(args.stitch_radius_m),
+            stitch_jump_threshold_m=float(args.stitch_jump_threshold_m),
         )
         if selected_bundle is None:
             continue

@@ -462,6 +462,8 @@ class InfgenDataset(Dataset):
                     "cf/sdc_path_arc_lengths",
                     "cf/sdc_family_divergence_onsets",
                     "cf/sdc_family_confidences",
+                    "cf/sdc_selected_raw_path_mask",
+                    "cf/sdc_selected_raw_path_segment_mask",
                     # "encoder/modeled_agent_id",
                     # "action_label/labeled_agent_id",
                     "metadata/map_center",  # "decoder/input_step",
@@ -490,6 +492,7 @@ class InfgenDataset(Dataset):
                     "cf/sdc_family_path_tangents_world",
                     "cf/sdc_family_arc_lengths",
                     "cf/sdc_family_path_mask",
+                    "cf/sdc_selected_raw_path_world",
                     "decoder/input_action_valid_mask",
                     "encoder/current_agent_position",
                     "decoder/current_agent_position",
@@ -750,6 +753,15 @@ class InfgenDataset(Dataset):
                         row=inline_control_code,
                         require_trainable=self.mode == "training",
                         include_stop=bool(self.config.DATA.get("COUNTERFACTUAL_SDC_INCLUDE_STOP", True)),
+                        stitch_discontinuities=bool(
+                            self.config.MODEL.get("LOCAL_CONTROL_SDC_FAMILY_STITCH_DISCONTINUITIES", False)
+                        ),
+                        stitch_radius_m=float(
+                            self.config.MODEL.get("LOCAL_CONTROL_SDC_FAMILY_STITCH_RADIUS_M", 2.0)
+                        ),
+                        stitch_jump_threshold_m=float(
+                            self.config.MODEL.get("LOCAL_CONTROL_SDC_FAMILY_STITCH_JUMP_THRESHOLD_M", 6.0)
+                        ),
                     )
                 )
                 return self._apply_counterfactual_mode(output)
