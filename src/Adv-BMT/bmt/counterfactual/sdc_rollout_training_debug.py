@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any, Iterable, List, Mapping, Sequence
+from collections.abc import Iterable, Mapping
+from typing import Any, List, Sequence
 
 import matplotlib
 
@@ -25,7 +26,9 @@ def normalize_text_list(value: Any) -> List[str]:
         if text.startswith("[") and text.endswith("]"):
             text = text[1:-1]
         return [item.strip().strip("'\"") for item in text.split(",") if item.strip().strip("'\"")]
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, Mapping):
+        return []
+    if isinstance(value, Iterable):
         return [str(item).strip() for item in value if str(item).strip()]
     return [str(value).strip()]
 
