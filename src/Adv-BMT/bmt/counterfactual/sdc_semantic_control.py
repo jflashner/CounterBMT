@@ -670,6 +670,8 @@ def project_points_to_segment_tube_torch(
         out_shape = tuple(points_world_xy.shape[:-1])
         return {
             "nearest_distance": nearest_distance.reshape(out_shape),
+            "nearest_arc": torch.zeros((B, num_points), device=points_world_xy.device, dtype=points_world_xy.dtype).reshape(out_shape),
+            "path_total_arc": torch.zeros((B,), device=points_world_xy.device, dtype=points_world_xy.dtype),
             "has_valid_segment": torch.zeros((B,), device=points_world_xy.device, dtype=torch.bool),
         }
 
@@ -681,12 +683,16 @@ def project_points_to_segment_tube_torch(
     )
     point_distance = torch.linalg.norm(points_flat[:, :, None, :] - path_points_world[:, None, :, :], dim=-1)
     point_distance = torch.where(path_point_mask[:, None, :], point_distance, point_large)
-    nearest_point_distance = point_distance.min(dim=-1).values
+    nearest_point = point_distance.min(dim=-1)
+    nearest_point_distance = nearest_point.values
+    nearest_point_idx = nearest_point.indices
 
     if path_points_world.shape[1] < 2:
         out_shape = tuple(points_world_xy.shape[:-1])
         return {
             "nearest_distance": nearest_point_distance.reshape(out_shape),
+            "nearest_arc": torch.zeros((B, num_points), device=points_world_xy.device, dtype=points_world_xy.dtype).reshape(out_shape),
+            "path_total_arc": torch.zeros((B,), device=points_world_xy.device, dtype=points_world_xy.dtype),
             "has_valid_segment": torch.zeros((B,), device=points_world_xy.device, dtype=torch.bool),
         }
 
@@ -699,14 +705,36 @@ def project_points_to_segment_tube_torch(
     seg_start = path_points_world[:, :-1, :]
     seg_end = path_points_world[:, 1:, :]
     seg_delta = seg_end - seg_start
+    seg_length = torch.linalg.norm(seg_delta, dim=-1)
     seg_denom = (seg_delta * seg_delta).sum(dim=-1).clamp_min(1e-6)
+    seg_step = torch.where(segment_valid, seg_length, torch.zeros_like(seg_length))
+    path_arc = torch.cat(
+        [
+            torch.zeros((B, 1), device=points_world_xy.device, dtype=points_world_xy.dtype),
+            torch.cumsum(seg_step, dim=-1),
+        ],
+        dim=-1,
+    )
+    path_total_arc = path_arc[:, -1]
     rel = points_flat[:, :, None, :] - seg_start[:, None, :, :]
     t = ((rel * seg_delta[:, None, :, :]).sum(dim=-1) / seg_denom[:, None, :]).clamp_(0.0, 1.0)
     seg_projection = seg_start[:, None, :, :] + t[..., None] * seg_delta[:, None, :, :]
     seg_distance = torch.linalg.norm(points_flat[:, :, None, :] - seg_projection, dim=-1)
     seg_large = torch.full_like(seg_distance, 1e6)
     seg_distance = torch.where(segment_valid[:, None, :], seg_distance, seg_large)
-    nearest_segment_distance = seg_distance.min(dim=-1).values
+    nearest_segment = seg_distance.min(dim=-1)
+    nearest_segment_distance = nearest_segment.values
+    nearest_segment_idx = nearest_segment.indices
+    nearest_segment_t = torch.gather(t, dim=-1, index=nearest_segment_idx.unsqueeze(-1)).squeeze(-1)
+    seg_arc_start = path_arc[:, :-1]
+    nearest_segment_arc_start = torch.gather(
+        seg_arc_start,
+        dim=-1,
+        index=nearest_segment_idx,
+    )
+    nearest_segment_length = torch.gather(seg_length, dim=-1, index=nearest_segment_idx)
+    nearest_segment_arc = nearest_segment_arc_start + nearest_segment_t * nearest_segment_length
+    nearest_point_arc = torch.gather(path_arc, dim=-1, index=nearest_point_idx)
 
     has_valid_segment = segment_valid.any(dim=-1)
     nearest_distance = torch.where(
@@ -714,9 +742,16 @@ def project_points_to_segment_tube_torch(
         nearest_segment_distance,
         nearest_point_distance,
     )
+    nearest_arc = torch.where(
+        has_valid_segment[:, None],
+        nearest_segment_arc,
+        nearest_point_arc,
+    )
     out_shape = tuple(points_world_xy.shape[:-1])
     return {
         "nearest_distance": nearest_distance.reshape(out_shape),
+        "nearest_arc": nearest_arc.reshape(out_shape),
+        "path_total_arc": path_total_arc,
         "has_valid_segment": has_valid_segment,
     }
 
