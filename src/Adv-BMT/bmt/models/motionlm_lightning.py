@@ -388,6 +388,7 @@ class MotionLMLightning(pl.LightningModule):
         try:
             from bmt.counterfactual.sdc_rollout_training_debug import write_rollout_tube_training_debug
 
+            step_index = int(self.global_step) + 1
             batch_size = int(reward_t.shape[1])
             meta_list = self._extract_rollout_debug_meta_list(data_dict, batch_size=batch_size)
             scenario_filters = set(self._normalize_text_list(self.config.get("ROLLOUT_TRAIN_DEBUG_SCENARIO_IDS", [])))
@@ -396,6 +397,24 @@ class MotionLMLightning(pl.LightningModule):
             max_matches = max(1, int(self.config.get("ROLLOUT_TRAIN_DEBUG_MAX_MATCHES", 4)))
             grid_step_m = float(self.config.get("ROLLOUT_TRAIN_DEBUG_GRID_STEP_M", 0.35))
             output_subdir = str(self.config.get("ROLLOUT_TRAIN_DEBUG_OUTPUT_SUBDIR", "train_rollout_debug")).strip() or "train_rollout_debug"
+
+            printable_meta = [
+                {
+                    "scenario_id": str((meta or {}).get("scenario_id") or ""),
+                    "selected_slot_id": str((meta or {}).get("selected_slot_id") or ""),
+                    "requested_semantic_label": str((meta or {}).get("requested_semantic_label") or ""),
+                }
+                for meta in meta_list
+            ]
+            print(
+                "[rollout_train_debug] "
+                f"step={step_index} "
+                f"scenario_filters={sorted(scenario_filters)} "
+                f"slot_filters={sorted(slot_filters)} "
+                f"include_gt={include_gt} "
+                f"meta={printable_meta}",
+                flush=True,
+            )
 
             matches = []
             for batch_idx, meta in enumerate(meta_list):
@@ -409,9 +428,12 @@ class MotionLMLightning(pl.LightningModule):
                     continue
                 matches.append((batch_idx, meta))
             if not matches:
+                print(
+                    f"[rollout_train_debug] no matches at step={step_index}",
+                    flush=True,
+                )
                 return
 
-            step_index = int(self.global_step) + 1
             root = self._rollout_tube_training_debug_output_root() / output_subdir / f"step_{step_index:06d}"
             raw_path_world = self._as_tensor(
                 data_dict["cf/sdc_selected_raw_path_world"],
@@ -490,10 +512,10 @@ class MotionLMLightning(pl.LightningModule):
                         "requested_semantic_confidence": meta.get("requested_semantic_confidence"),
                     },
                 )
-                print(f"[rollout_train_debug] wrote {outdir}")
+                print(f"[rollout_train_debug] wrote {outdir}", flush=True)
             self._last_rollout_train_debug_step = step_index
         except Exception as exc:  # pragma: no cover - debug path should not crash training
-            print(f"[rollout_train_debug] failed: {exc}")
+            print(f"[rollout_train_debug] failed: {exc}", flush=True)
             logger.warning("Failed to dump rollout tube training debug: %s", exc)
 
     def _next_state_candidates_from_action_space(self, output_logit, data_dict):
