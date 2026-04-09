@@ -506,6 +506,9 @@ class MotionLMLightning(pl.LightningModule):
                     outside_scale=float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_OUTSIDE_SCALE", 1.0)),
                     discount=float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_DISCOUNT", 1.0)),
                     grid_step_m=grid_step_m,
+                    scenario_pkl=str(meta.get("scenario_pkl") or ""),
+                    current_time_index=meta.get("current_time_index"),
+                    sdc_id=str(meta.get("sdc_id") or ""),
                     extra_summary={
                         "mean_total_return": float(total_return[:, batch_idx].mean().detach().cpu().item()),
                         "mean_scalar_group_advantage": float(total_return_adv[:, batch_idx].mean().detach().cpu().item()),

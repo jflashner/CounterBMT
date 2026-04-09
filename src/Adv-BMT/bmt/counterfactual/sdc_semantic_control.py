@@ -369,6 +369,8 @@ def build_sdc_semantic_dataset_fields(
         "schema_version": str(row.get("schema_version") or SDC_SEMANTIC_CONTROL_SCHEMA_VERSION),
         "scenario_id": str(scenario_id),
         "sdc_id": str(row.get("sdc_id") or ""),
+        "scenario_pkl": str(row.get("scenario_pkl") or ""),
+        "current_time_index": int(row.get("current_time_index") or 0),
         "selected_slot_id": str(row.get("selected_slot_id") or ""),
         "selected_path_id": (None if row.get("selected_path_id") is None else str(row.get("selected_path_id"))),
         "requested_semantic_label": normalize_semantic_label(row.get("requested_semantic_label")),

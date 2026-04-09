@@ -16,6 +16,19 @@ DEFAULT_PLOT_RADIUS_M = 60.0
 DEFAULT_VERTICAL_FRACTION = 0.63
 
 
+def _iter_map_feature_polylines(raw_scenario: Mapping[str, Any]) -> Iterable[np.ndarray]:
+    for feature in dict(raw_scenario.get("map_features", {}) or {}).values():
+        payload = dict(feature or {})
+        for key in ("polyline", "polygon"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            arr = np.asarray(value, dtype=np.float32)
+            if arr.ndim == 2 and arr.shape[-1] >= 2 and arr.shape[0] > 1:
+                yield np.asarray(arr[:, :2], dtype=np.float32)
+                break
+
+
 def normalize_text_list(value: Any) -> List[str]:
     if value is None:
         return []
@@ -122,31 +135,82 @@ def polyline_segment_distance_to_points(
     return best.astype(np.float32)
 
 
-def segment_distance_field_in_sdc_frame(
+def _stack_plot_points(
     *,
-    path_segments_world: Sequence[np.ndarray],
-    center_xy_world: Sequence[float],
-    heading_world_rad: float,
+    current_xy: np.ndarray,
+    path_segments_xy: Sequence[np.ndarray],
+    trajectories_xy: Sequence[np.ndarray],
+) -> np.ndarray:
+    pieces: List[np.ndarray] = [np.asarray(current_xy, dtype=np.float32).reshape(1, 2)]
+    pieces.extend(
+        np.asarray(segment, dtype=np.float32).reshape(-1, 2)
+        for segment in path_segments_xy
+        if np.asarray(segment, dtype=np.float32).reshape(-1, 2).shape[0] > 0
+    )
+    pieces.extend(
+        np.asarray(traj, dtype=np.float32).reshape(-1, 2)
+        for traj in trajectories_xy
+        if np.asarray(traj, dtype=np.float32).reshape(-1, 2).shape[0] > 0
+    )
+    return np.concatenate(pieces, axis=0).astype(np.float32)
+
+
+def compute_auto_plot_limits(
+    *,
+    current_xy: np.ndarray,
+    path_segments_xy: Sequence[np.ndarray],
+    trajectories_xy: Sequence[np.ndarray],
+    tube_radius_m: float,
     grid_step_m: float,
+    min_half_extent_m: float = 12.0,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    points = _stack_plot_points(
+        current_xy=np.asarray(current_xy, dtype=np.float32).reshape(2),
+        path_segments_xy=path_segments_xy,
+        trajectories_xy=trajectories_xy,
+    )
+    margin = max(float(tube_radius_m) + 4.0 * float(grid_step_m), 4.0)
+    x_min = float(points[:, 0].min()) - margin
+    x_max = float(points[:, 0].max()) + margin
+    y_min = float(points[:, 1].min()) - margin
+    y_max = float(points[:, 1].max()) + margin
+
+    half_extent = max(
+        float(min_half_extent_m),
+        0.5 * max(x_max - x_min, y_max - y_min),
+    )
+    x_center = 0.5 * (x_min + x_max)
+    y_center = 0.5 * (y_min + y_max)
+    return (
+        (x_center - half_extent, x_center + half_extent),
+        (y_center - half_extent, y_center + half_extent),
+    )
+
+
+def segment_distance_field_in_frame(
+    *,
+    path_segments_xy: Sequence[np.ndarray],
+    grid_step_m: float,
+    x_limits: tuple[float, float] | None = None,
+    y_limits: tuple[float, float] | None = None,
     plot_radius_m: float = DEFAULT_PLOT_RADIUS_M,
     vertical_fraction: float = DEFAULT_VERTICAL_FRACTION,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    half_extent = float(plot_radius_m)
-    vertical_span = 2.0 * half_extent
-    y_min = -float(vertical_fraction) * vertical_span
-    y_max = y_min + vertical_span
-    xs = np.arange(-half_extent, half_extent + 0.5 * float(grid_step_m), float(grid_step_m), dtype=np.float32)
+    if x_limits is None or y_limits is None:
+        half_extent = float(plot_radius_m)
+        vertical_span = 2.0 * half_extent
+        x_min = -half_extent
+        x_max = half_extent
+        y_min = -float(vertical_fraction) * vertical_span
+        y_max = y_min + vertical_span
+    else:
+        x_min, x_max = float(x_limits[0]), float(x_limits[1])
+        y_min, y_max = float(y_limits[0]), float(y_limits[1])
+    xs = np.arange(x_min, x_max + 0.5 * float(grid_step_m), float(grid_step_m), dtype=np.float32)
     ys = np.arange(y_min, y_max + 0.5 * float(grid_step_m), float(grid_step_m), dtype=np.float32)
     xx, yy = np.meshgrid(xs, ys)
-    local_xy = np.stack([xx.reshape(-1), yy.reshape(-1)], axis=-1)
-    center = np.asarray(center_xy_world, dtype=np.float32).reshape(2)
-    rot = float(heading_world_rad) - (math.pi / 2.0)
-    c = math.cos(rot)
-    s = math.sin(rot)
-    world_x = c * local_xy[:, 0] - s * local_xy[:, 1] + float(center[0])
-    world_y = s * local_xy[:, 0] + c * local_xy[:, 1] + float(center[1])
-    world_xy = np.stack([world_x, world_y], axis=-1).astype(np.float32)
-    dist = polyline_segment_distance_to_points(world_xy, path_segments_world=path_segments_world).reshape(xx.shape)
+    frame_xy = np.stack([xx.reshape(-1), yy.reshape(-1)], axis=-1)
+    dist = polyline_segment_distance_to_points(frame_xy, path_segments_world=path_segments_xy).reshape(xx.shape)
     return xx, yy, dist.astype(np.float32)
 
 
@@ -162,6 +226,77 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_ready(v) for v in value]
     return value
+
+
+def _load_scene_context_in_reward_frame(
+    *,
+    scenario_pkl: str | None,
+    current_time_index: int | None,
+    sdc_id: str | None,
+    x_limits: tuple[float, float],
+    y_limits: tuple[float, float],
+    margin_m: float = 20.0,
+) -> dict[str, Any]:
+    if not scenario_pkl:
+        return {"map_segments": [], "agent_points": np.zeros((0, 2), dtype=np.float32)}
+    try:
+        from bmt.counterfactual.normalize import load_raw_scenario
+        from bmt.counterfactual.sdc_semantic_control import extract_model_frame, world_xy_to_model_frame
+    except Exception:
+        return {"map_segments": [], "agent_points": np.zeros((0, 2), dtype=np.float32)}
+
+    raw_scenario = load_raw_scenario(Path(str(scenario_pkl)).expanduser())
+    map_center, map_heading = extract_model_frame(raw_scenario)
+    x_min, x_max = float(x_limits[0]) - float(margin_m), float(x_limits[1]) + float(margin_m)
+    y_min, y_max = float(y_limits[0]) - float(margin_m), float(y_limits[1]) + float(margin_m)
+
+    map_segments: List[np.ndarray] = []
+    for polyline_world in _iter_map_feature_polylines(raw_scenario):
+        polyline_frame = world_xy_to_model_frame(polyline_world, map_center=map_center, map_heading=map_heading)
+        if polyline_frame.shape[0] < 2:
+            continue
+        seg_x_min = float(np.min(polyline_frame[:, 0]))
+        seg_x_max = float(np.max(polyline_frame[:, 0]))
+        seg_y_min = float(np.min(polyline_frame[:, 1]))
+        seg_y_max = float(np.max(polyline_frame[:, 1]))
+        if seg_x_max < x_min or seg_x_min > x_max or seg_y_max < y_min or seg_y_min > y_max:
+            continue
+        map_segments.append(np.asarray(polyline_frame, dtype=np.float32))
+
+    agent_points: List[np.ndarray] = []
+    if current_time_index is not None:
+        time_idx = int(max(int(current_time_index), 0))
+        for track_id, track_payload in dict(raw_scenario.get("tracks", {}) or {}).items():
+            if sdc_id and str(track_id) == str(sdc_id):
+                continue
+            state = dict(dict(track_payload).get("state") or {})
+            position_world = np.asarray(state.get("position", []), dtype=np.float32)
+            valid = np.asarray(state.get("valid", []), dtype=bool).reshape(-1)
+            if position_world.ndim != 2 or position_world.shape[1] < 2 or position_world.shape[0] == 0:
+                continue
+            idx = min(time_idx, position_world.shape[0] - 1)
+            if valid.shape[0] > idx and not bool(valid[idx]):
+                continue
+            point_frame = world_xy_to_model_frame(
+                position_world[idx : idx + 1, :2],
+                map_center=map_center,
+                map_heading=map_heading,
+            )
+            if point_frame.shape[0] == 0:
+                continue
+            x_val, y_val = float(point_frame[0, 0]), float(point_frame[0, 1])
+            if x_val < x_min or x_val > x_max or y_val < y_min or y_val > y_max:
+                continue
+            agent_points.append(np.asarray(point_frame[0], dtype=np.float32))
+
+    return {
+        "map_segments": map_segments,
+        "agent_points": (
+            np.stack(agent_points, axis=0).astype(np.float32)
+            if agent_points
+            else np.zeros((0, 2), dtype=np.float32)
+        ),
+    }
 
 
 def write_rollout_tube_training_debug(
@@ -189,6 +324,9 @@ def write_rollout_tube_training_debug(
     outside_scale: float,
     discount: float,
     grid_step_m: float = 0.35,
+    scenario_pkl: str | None = None,
+    current_time_index: int | None = None,
+    sdc_id: str | None = None,
     extra_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     outdir = Path(outdir).expanduser().resolve()
@@ -208,17 +346,16 @@ def write_rollout_tube_training_debug(
     current_xy = np.asarray(current_xy_world, dtype=np.float32).reshape(2)
     current_heading = float(current_heading_world)
 
-    path_segments_world = split_polyline_by_segment_mask(
+    # Despite the legacy argument names, the training tube reward is computed in the
+    # same frame as decoder positions and selected raw paths. Plot directly in that
+    # frame so the contour matches the reward geometry exactly.
+    path_segments_frame = split_polyline_by_segment_mask(
         path_world_arr,
         point_mask=point_mask_arr,
         segment_mask=segment_mask_arr,
     )
-    trajectory_local_list = [
-        world_to_sdc_up_frame(
-            traj,
-            center_xy_world=current_xy,
-            heading_world_rad=current_heading,
-        )
+    trajectory_frame_list = [
+        np.asarray(traj, dtype=np.float32).reshape(-1, 2)
         for traj in trajectories_world_arr
     ]
 
@@ -228,11 +365,25 @@ def write_rollout_tube_training_debug(
         denom = max(float(total_return.std()), 1e-6)
         scalar_advantage = ((total_return - float(total_return.mean())) / denom).astype(np.float32)
 
-    xx, yy, dist_field = segment_distance_field_in_sdc_frame(
-        path_segments_world=path_segments_world,
-        center_xy_world=current_xy,
-        heading_world_rad=current_heading,
+    x_limits, y_limits = compute_auto_plot_limits(
+        current_xy=current_xy,
+        path_segments_xy=path_segments_frame,
+        trajectories_xy=trajectory_frame_list,
+        tube_radius_m=float(tube_radius_m),
         grid_step_m=float(grid_step_m),
+    )
+    xx, yy, dist_field = segment_distance_field_in_frame(
+        path_segments_xy=path_segments_frame,
+        grid_step_m=float(grid_step_m),
+        x_limits=x_limits,
+        y_limits=y_limits,
+    )
+    scene_context = _load_scene_context_in_reward_frame(
+        scenario_pkl=scenario_pkl,
+        current_time_index=current_time_index,
+        sdc_id=sdc_id,
+        x_limits=x_limits,
+        y_limits=y_limits,
     )
 
     cmap = plt.cm.RdYlGn
@@ -263,32 +414,46 @@ def write_rollout_tube_training_debug(
         linestyles=["--"],
         zorder=2.0,
     )
-    for seg_idx, seg_world in enumerate(path_segments_world):
-        seg_local = world_to_sdc_up_frame(
-            seg_world,
-            center_xy_world=current_xy,
-            heading_world_rad=current_heading,
+    for map_segment in scene_context["map_segments"]:
+        axes[0, 0].plot(
+            map_segment[:, 0],
+            map_segment[:, 1],
+            color="#cbd5e1",
+            linewidth=0.8,
+            alpha=0.75,
+            zorder=2.2,
         )
-        if seg_local.shape[0] < 2:
+    agent_points = np.asarray(scene_context["agent_points"], dtype=np.float32).reshape(-1, 2)
+    if agent_points.shape[0] > 0:
+        axes[0, 0].scatter(
+            agent_points[:, 0],
+            agent_points[:, 1],
+            c="#9ca3af",
+            s=10,
+            alpha=0.55,
+            zorder=2.4,
+        )
+    for seg_idx, seg_frame in enumerate(path_segments_frame):
+        if seg_frame.shape[0] < 2:
             continue
-        axes[0, 0].plot(seg_local[:, 0], seg_local[:, 1], color="#2563eb", linewidth=4.0, alpha=0.96, zorder=3.0)
+        axes[0, 0].plot(seg_frame[:, 0], seg_frame[:, 1], color="#2563eb", linewidth=4.0, alpha=0.96, zorder=3.0)
         if seg_idx > 0:
             axes[0, 0].scatter(
-                [seg_local[0, 0]],
-                [seg_local[0, 1]],
+                [seg_frame[0, 0]],
+                [seg_frame[0, 1]],
                 c="#111827",
                 s=28,
                 marker="x",
                 linewidths=1.2,
                 zorder=3.5,
             )
-    for rollout_idx, (traj_local, color) in enumerate(zip(trajectory_local_list, rollout_colors)):
-        if traj_local.shape[0] < 2:
+    for rollout_idx, (traj_frame, color) in enumerate(zip(trajectory_frame_list, rollout_colors)):
+        if traj_frame.shape[0] < 2:
             continue
-        axes[0, 0].plot(traj_local[:, 0], traj_local[:, 1], color=color, linewidth=2.2, alpha=0.92, zorder=4.0)
+        axes[0, 0].plot(traj_frame[:, 0], traj_frame[:, 1], color=color, linewidth=2.2, alpha=0.92, zorder=4.0)
         axes[0, 0].scatter(
-            [traj_local[-1, 0]],
-            [traj_local[-1, 1]],
+            [traj_frame[-1, 0]],
+            [traj_frame[-1, 1]],
             c=[color],
             s=32,
             edgecolors="white",
@@ -296,8 +461,8 @@ def write_rollout_tube_training_debug(
             zorder=4.2,
         )
         axes[0, 0].text(
-            float(traj_local[-1, 0]) + 0.5,
-            float(traj_local[-1, 1]) + 0.5,
+            float(traj_frame[-1, 0]) + 0.5,
+            float(traj_frame[-1, 1]) + 0.5,
             f"{rollout_idx}",
             fontsize=8,
             color="#111827",
@@ -307,6 +472,8 @@ def write_rollout_tube_training_debug(
     axes[0, 0].set_title("Actual Training Rollouts + Tube", fontsize=12)
     axes[0, 0].set_aspect("equal", adjustable="box")
     axes[0, 0].grid(alpha=0.18)
+    axes[0, 0].set_xlim(*x_limits)
+    axes[0, 0].set_ylim(*y_limits)
     info_box = (
         f"scene={scenario_id}\n"
         f"slot={slot_id}\n"
@@ -399,10 +566,24 @@ def write_rollout_tube_training_debug(
         "analysis_png": str(analysis_png),
         "current_xy_world": current_xy.tolist(),
         "current_heading_world": float(current_heading),
-        "num_path_segments": int(len(path_segments_world)),
+        "num_path_segments": int(len(path_segments_frame)),
         "path_world_xy": path_world_arr.tolist(),
         "path_point_mask": point_mask_arr.tolist(),
         "path_segment_mask": segment_mask_arr.tolist(),
+        "scenario_pkl": str(scenario_pkl or ""),
+        "current_time_index": (None if current_time_index is None else int(current_time_index)),
+        "sdc_id": (None if sdc_id is None else str(sdc_id)),
+        "num_context_map_segments": int(len(scene_context["map_segments"])),
+        "num_context_agents": int(agent_points.shape[0]),
+        "plot_frame": "training_reward_frame",
+        "plot_xlim": [float(x_limits[0]), float(x_limits[1])],
+        "plot_ylim": [float(y_limits[0]), float(y_limits[1])],
+        "path_extent_xy": {
+            "x_min": float(path_world_arr[:, 0].min()) if path_world_arr.size else 0.0,
+            "x_max": float(path_world_arr[:, 0].max()) if path_world_arr.size else 0.0,
+            "y_min": float(path_world_arr[:, 1].min()) if path_world_arr.size else 0.0,
+            "y_max": float(path_world_arr[:, 1].max()) if path_world_arr.size else 0.0,
+        },
         "rollouts": rollouts,
     }
     if extra_summary:
