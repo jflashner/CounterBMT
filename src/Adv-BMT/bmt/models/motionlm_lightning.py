@@ -435,8 +435,8 @@ class MotionLMLightning(pl.LightningModule):
                 return
 
             root = self._rollout_tube_training_debug_output_root() / output_subdir / f"step_{step_index:06d}"
-            raw_path_world = self._as_tensor(
-                data_dict["cf/sdc_selected_raw_path_world"],
+            raw_path_model = self._as_tensor(
+                data_dict.get("cf/sdc_selected_raw_path_model", data_dict["cf/sdc_selected_raw_path_world"]),
                 device=reward_t.device,
                 dtype=reward_t.dtype,
             ).detach().cpu().numpy()
@@ -490,7 +490,7 @@ class MotionLMLightning(pl.LightningModule):
                     global_step=step_index,
                     current_xy_world=current_xy_world[batch_idx],
                     current_heading_world=float(current_heading_world[batch_idx]),
-                    path_world=raw_path_world[batch_idx],
+                    path_world=raw_path_model[batch_idx],
                     point_mask=raw_path_mask[batch_idx],
                     segment_mask=raw_segment_mask[batch_idx],
                     trajectories_world=trajectories_world[:, batch_idx].detach().cpu().numpy(),
@@ -835,8 +835,8 @@ class MotionLMLightning(pl.LightningModule):
             rollout_next_position * decision_agent_mask[:, None, :, None].to(dtype=dtype)
         ).sum(dim=2)
 
-        raw_path_world = self._as_tensor(
-            data_dict["cf/sdc_selected_raw_path_world"],
+        raw_path_model = self._as_tensor(
+            data_dict.get("cf/sdc_selected_raw_path_model", data_dict["cf/sdc_selected_raw_path_world"]),
             device=device,
             dtype=dtype,
         )
@@ -852,7 +852,7 @@ class MotionLMLightning(pl.LightningModule):
         )
         tube_projection = project_points_to_segment_tube_torch(
             sdc_next_pos_world,
-            path_points_world=raw_path_world,
+            path_points_world=raw_path_model,
             path_point_mask=raw_path_mask,
             path_segment_mask=raw_path_segment_mask,
         )

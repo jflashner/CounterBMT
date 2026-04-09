@@ -241,6 +241,16 @@ def main() -> int:
     batch_torch = _to_torch_device(batch, device=device)
     rollout_base = _prepare_batch_for_autoregressive_rollout(batch_torch, raw_scenario=raw_scenario)
 
+    path_model = np.asarray(
+        batch["cf/sdc_selected_raw_path_model"][0]
+        if "cf/sdc_selected_raw_path_model" in batch
+        else batch["cf/sdc_selected_raw_path_world"][0],
+        dtype=np.float32,
+    )
+    path_model_mask = np.asarray(batch["cf/sdc_selected_raw_path_mask"][0], dtype=np.float32).reshape(-1) > 0.5
+    if path_model_mask.shape[0] > 0:
+        path_model = path_model[: path_model_mask.shape[0]][path_model_mask[: path_model.shape[0]]]
+
     map_center_world = np.asarray(row.get("candidate_family_map_center", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)
     map_heading_world = float(row.get("candidate_family_map_heading", 0.0) or 0.0)
     rollout_records: List[Dict[str, Any]] = []
@@ -290,21 +300,23 @@ def main() -> int:
             ).squeeze(-1)
 
         distance_m = polyline_segment_distance_to_points(rollout_next_world_xy, path_world)
+        distance_model_m = polyline_segment_distance_to_points(rollout_next_model_xy, path_model)
         reward_t = tube_reward_from_distance(
-            distance_m,
+            distance_model_m,
             tube_radius_m=float(args.tube_radius_m),
             inside_reward=float(args.inside_reward),
             outside_scale=float(args.outside_scale),
         )
         rtg_t = return_to_go(reward_t, gamma=float(args.discount))
-        inside_mask = distance_m <= float(args.tube_radius_m)
+        inside_mask = distance_model_m <= float(args.tube_radius_m)
         first_exit = np.flatnonzero(~inside_mask)
         rollout_records.append(
             {
                 "rollout_id": int(rollout_idx),
                 "seed": int(current_seed),
                 "trajectory_world_xy": trajectory_world_xy.tolist(),
-                "distance_to_tube_m": distance_m.astype(np.float32).tolist(),
+                "trajectory_model_xy": rollout_next_model_xy.astype(np.float32).tolist(),
+                "distance_to_tube_m": distance_model_m.astype(np.float32).tolist(),
                 "inside_valid_tube": inside_mask.astype(bool).tolist(),
                 "reward_t": reward_t.astype(np.float32).tolist(),
                 "return_to_go_t": rtg_t.astype(np.float32).tolist(),

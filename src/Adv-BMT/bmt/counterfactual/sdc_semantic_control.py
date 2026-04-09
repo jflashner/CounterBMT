@@ -432,11 +432,13 @@ def build_sdc_semantic_dataset_fields(
     family_tangents = np.zeros((0, 0, 2), dtype=np.float32)
     family_arc = np.zeros((0, 0), dtype=np.float32)
     selected_raw_path_world = np.zeros((0, 2), dtype=np.float32)
+    selected_raw_path_model = np.zeros((0, 2), dtype=np.float32)
     selected_raw_path_segment_mask = np.zeros((0,), dtype=np.float32)
     selected_raw_path_mask = np.zeros((0,), dtype=np.float32)
     scenario_pkl = str(row.get("scenario_pkl") or "").strip()
     if scenario_pkl and sdc_id:
         raw_scenario = load_raw_scenario_from_row(row)
+        map_center, map_heading = extract_model_frame(raw_scenario)
         selected_raw_path_world = np.asarray(
             build_selected_path_world(
                 raw_scenario=raw_scenario,
@@ -447,15 +449,23 @@ def build_sdc_semantic_dataset_fields(
             ),
             dtype=np.float32,
         ).reshape(-1, 2)
-        selected_raw_path_segment_mask = polyline_segment_valid_mask(
+        selected_raw_path_model = world_xy_to_model_frame(
             selected_raw_path_world,
+            map_center=map_center,
+            map_heading=map_heading,
+        ).astype(np.float32)
+        selected_raw_path_segment_mask = polyline_segment_valid_mask(
+            selected_raw_path_model,
             jump_threshold_m=float(stitch_jump_threshold_m),
         ).astype(np.float32)
-        selected_raw_path_mask = np.ones((selected_raw_path_world.shape[0],), dtype=np.float32)
+        selected_raw_path_mask = np.ones((selected_raw_path_model.shape[0],), dtype=np.float32)
         debug_meta["selected_raw_path_num_points"] = int(selected_raw_path_world.shape[0])
         debug_meta["selected_raw_path_num_segments"] = int(
             np.maximum(selected_raw_path_segment_mask.sum(), 0.0)
         )
+        debug_meta["selected_raw_path_frame"] = "model_map_centered"
+        debug_meta["selected_raw_path_map_center"] = np.asarray(map_center, dtype=np.float32).tolist()
+        debug_meta["selected_raw_path_map_heading"] = float(map_heading)
     num_paths = min(
         len(raw_family_paths),
         len(raw_family_tangents),
@@ -554,6 +564,7 @@ def build_sdc_semantic_dataset_fields(
         "cf/sdc_family_path_mask": family_mask.astype(np.float32),
         "cf/sdc_family_confidences": family_confidences.astype(np.float32),
         "cf/sdc_selected_raw_path_world": selected_raw_path_world.astype(np.float32),
+        "cf/sdc_selected_raw_path_model": selected_raw_path_model.astype(np.float32),
         "cf/sdc_selected_raw_path_mask": selected_raw_path_mask.astype(np.float32),
         "cf/sdc_selected_raw_path_segment_mask": selected_raw_path_segment_mask.astype(np.float32),
         "cf/sdc_is_factual": int(is_factual),

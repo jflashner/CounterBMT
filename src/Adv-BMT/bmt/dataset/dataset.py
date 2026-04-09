@@ -493,6 +493,7 @@ class InfgenDataset(Dataset):
                     "cf/sdc_family_arc_lengths",
                     "cf/sdc_family_path_mask",
                     "cf/sdc_selected_raw_path_world",
+                    "cf/sdc_selected_raw_path_model",
                     "decoder/input_action_valid_mask",
                     "encoder/current_agent_position",
                     "decoder/current_agent_position",
