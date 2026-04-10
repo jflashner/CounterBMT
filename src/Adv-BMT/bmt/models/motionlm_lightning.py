@@ -2675,13 +2675,21 @@ class MotionLMLightning(pl.LightningModule):
         self._trace_first_step("training_step:end")
         return loss
 
+    def on_before_backward(self, loss):
+        self._trace_first_step("before_backward", loss=loss)
+
+    def on_after_backward(self):
+        self._trace_first_step("after_backward")
+
     def optimizer_step(self, *args, **kwargs):
+        self._trace_first_step("optimizer_step:enter")
         grad_clip_norm = float(self.config.MODEL.get("LOCAL_CONTROL_GRAD_CLIP_NORM", 1.0))
         if grad_clip_norm > 0.0:
             parameters = [p for p in self.parameters() if p.requires_grad and p.grad is not None]
             if parameters:
                 torch.nn.utils.clip_grad_norm_(parameters, max_norm=grad_clip_norm)
         super().optimizer_step(*args, **kwargs)
+        self._trace_first_step("optimizer_step:exit")
 
     def on_validation_start(self):
         torch.cuda.empty_cache()
