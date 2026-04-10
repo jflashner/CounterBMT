@@ -769,6 +769,34 @@ class MotionLMLightning(pl.LightningModule):
         rollout_batch["decoder/agent_valid_mask"] = agent_valid_mask[:, None]
         return rollout_batch
 
+    def _get_rollout_step_dt_s(self):
+        tokenizer_dt = getattr(self._tokenizer, "dt", None)
+        if tokenizer_dt is not None:
+            return float(tokenizer_dt)
+        num_skipped_steps = int(self.config.TOKENIZATION.get("NUM_SKIPPED_STEPS", 5))
+        return float(num_skipped_steps) / 10.0
+
+    def _extract_sdc_current_speed_mps(self, *, data_dict, semantic_context, output_logit):
+        if semantic_context is None:
+            return output_logit.new_zeros((output_logit.shape[0],), dtype=torch.float32)
+        decision_agent_mask = semantic_context["decision_agent_mask"]
+        if "decoder/current_agent_velocity" in data_dict:
+            current_velocity = self._as_tensor(
+                data_dict["decoder/current_agent_velocity"],
+                device=output_logit.device,
+                dtype=output_logit.dtype,
+            )
+        else:
+            current_velocity = self._as_tensor(
+                data_dict["decoder/modeled_agent_velocity"][:, 0],
+                device=output_logit.device,
+                dtype=output_logit.dtype,
+            )
+        sdc_velocity = (
+            current_velocity[:, :, :2] * decision_agent_mask[:, :, None].to(dtype=output_logit.dtype)
+        ).sum(dim=1)
+        return torch.linalg.norm(sdc_velocity.to(dtype=torch.float32), dim=-1)
+
     def _compute_discounted_return_to_go(self, reward_t, valid_mask, *, discount):
         reward_t = reward_t.to(dtype=torch.float32)
         valid_mask = valid_mask.to(dtype=torch.bool)
@@ -908,35 +936,64 @@ class MotionLMLightning(pl.LightningModule):
         progress_reward_scale = float(
             self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_REWARD_SCALE", 0.0)
         )
-        progress_exponent = float(
-            self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_EXPONENT", 2.0)
-        )
-        progress_unit_m = float(
-            self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_UNIT_M", 10.0)
-        )
         progress_gate_mult = float(
             self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_GATE_MULT", 1.0)
         )
+        progress_pref_accel_mps2 = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_PREF_ACCEL_MPS2", 1.0)
+        )
+        progress_min_budget_m = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_MIN_BUDGET_M", 8.0)
+        )
+        progress_max_budget_m = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_MAX_BUDGET_M", 25.0)
+        )
+        progress_tau_frac = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_TAU_FRACTION", 0.5)
+        )
         progress_reward_t = torch.zeros_like(reward_t)
         frontier_arc_t = torch.zeros_like(reward_t)
+        progress_budget_t = torch.zeros_like(reward_t)
+        progress_horizon_s = torch.zeros((reward_t.shape[0],), device=reward_t.device, dtype=torch.float32)
+        current_speed_mps = torch.zeros((reward_t.shape[0],), device=reward_t.device, dtype=torch.float32)
         if progress_reward_scale > 0.0:
             progress_gate_radius = max(float(tube_radius_m) * float(progress_gate_mult), 0.0)
+            current_speed_mps = self._extract_sdc_current_speed_mps(
+                data_dict=data_dict,
+                semantic_context=semantic_context,
+                output_logit=output_logit,
+            )
+            step_dt_s = self._get_rollout_step_dt_s()
+            valid_steps = semantic_context["sdc_valid_by_t"].to(dtype=torch.float32).sum(dim=-1)
+            progress_horizon_s = valid_steps * float(step_dt_s)
+            progress_budget_m = (
+                current_speed_mps * progress_horizon_s
+                + 0.5 * float(progress_pref_accel_mps2) * progress_horizon_s.square()
+            )
+            progress_budget_m = progress_budget_m.clamp(
+                min=float(progress_min_budget_m),
+                max=float(progress_max_budget_m),
+            )
+            progress_budget_m = torch.minimum(progress_budget_m, path_total_arc)
             progress_active = (
                 valid_mask
-                & (path_total_arc[:, None] > 1e-3)
+                & (progress_budget_m[:, None] > 1e-3)
                 & (tube_distance <= progress_gate_radius)
             )
-            scaled_arc = torch.clamp(nearest_arc / max(progress_unit_m, 1e-3), min=0.0)
+            budget_safe = progress_budget_m.clamp_min(1e-3)
+            capped_arc = torch.minimum(nearest_arc, budget_safe[:, None])
+            tau_m = (budget_safe * max(progress_tau_frac, 1e-3)).clamp_min(1e-3)
             progress_potential = torch.where(
                 progress_active,
-                scaled_arc.pow(max(progress_exponent, 1.0)),
-                torch.zeros_like(scaled_arc),
+                1.0 - torch.exp(-capped_arc / tau_m[:, None]),
+                torch.zeros_like(capped_arc),
             )
             frontier_potential = torch.cummax(progress_potential, dim=-1).values
             frontier_arc_t = torch.cummax(
-                torch.where(progress_active, nearest_arc, torch.zeros_like(nearest_arc)),
+                torch.where(progress_active, capped_arc, torch.zeros_like(capped_arc)),
                 dim=-1,
             ).values
+            progress_budget_t = budget_safe[:, None].expand_as(reward_t)
             prev_frontier = torch.cat(
                 [torch.zeros_like(frontier_potential[:, :1]), frontier_potential[:, :-1]],
                 dim=-1,
@@ -952,10 +1009,16 @@ class MotionLMLightning(pl.LightningModule):
             "tube_distance": tube_distance,
             "progress_reward_t": progress_reward_t,
             "frontier_arc_t": frontier_arc_t,
+            "progress_budget_t": progress_budget_t,
+            "progress_horizon_s": progress_horizon_s,
+            "current_speed_mps": current_speed_mps,
             "inside_fraction": sanitize_scalar_loss(inside_mask.float().mean()) if bool(valid_mask.any()) else zero,
             "first_step_reward_mean": sanitize_scalar_loss(reward_t[:, 0].mean()) if reward_t.shape[1] > 0 else zero,
             "progress_reward_mean": sanitize_scalar_loss(progress_reward_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
             "frontier_arc_final_mean": sanitize_scalar_loss(frontier_arc_t[:, -1][valid_frontier].mean()) if bool(valid_frontier.any()) else zero,
+            "progress_budget_mean": sanitize_scalar_loss(progress_budget_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "progress_horizon_s_mean": sanitize_scalar_loss(progress_horizon_s[valid_frontier].mean()) if bool(valid_frontier.any()) else zero,
+            "current_speed_mps_mean": sanitize_scalar_loss(current_speed_mps[valid_frontier].mean()) if bool(valid_frontier.any()) else zero,
         }
 
     def _build_sdc_semantic_rollout_tube_policy_objective(self, *, data_dict):
@@ -971,6 +1034,11 @@ class MotionLMLightning(pl.LightningModule):
                 "return_std": zero,
                 "advantage_abs_mean": zero,
                 "tube_distance_mean": zero,
+                "progress_reward_mean": zero,
+                "frontier_arc_final_mean": zero,
+                "progress_budget_mean": zero,
+                "progress_horizon_s_mean": zero,
+                "current_speed_mps_mean": zero,
                 "group_size": 0,
             }
 
@@ -987,6 +1055,9 @@ class MotionLMLightning(pl.LightningModule):
         distance_list = []
         progress_reward_list = []
         frontier_arc_list = []
+        progress_budget_list = []
+        progress_horizon_list = []
+        current_speed_list = []
         inside_fraction_list = []
         trajectory_list = []
         action_token_list = []
@@ -1046,6 +1117,9 @@ class MotionLMLightning(pl.LightningModule):
                 distance_list.append(reward_bundle["tube_distance"])
                 progress_reward_list.append(reward_bundle["progress_reward_t"])
                 frontier_arc_list.append(reward_bundle["frontier_arc_t"])
+                progress_budget_list.append(reward_bundle["progress_budget_t"])
+                progress_horizon_list.append(reward_bundle["progress_horizon_s"])
+                current_speed_list.append(reward_bundle["current_speed_mps"])
                 inside_fraction_list.append(reward_bundle["inside_fraction"])
                 trajectory_list.append(
                     torch.cat(
@@ -1070,6 +1144,11 @@ class MotionLMLightning(pl.LightningModule):
                 "return_std": zero,
                 "advantage_abs_mean": zero,
                 "tube_distance_mean": zero,
+                "progress_reward_mean": zero,
+                "frontier_arc_final_mean": zero,
+                "progress_budget_mean": zero,
+                "progress_horizon_s_mean": zero,
+                "current_speed_mps_mean": zero,
                 "group_size": 0,
             }
 
@@ -1079,6 +1158,9 @@ class MotionLMLightning(pl.LightningModule):
         tube_distance = torch.stack(distance_list, dim=0)
         progress_reward_t = torch.stack(progress_reward_list, dim=0)
         frontier_arc_t = torch.stack(frontier_arc_list, dim=0)
+        progress_budget_t = torch.stack(progress_budget_list, dim=0)
+        progress_horizon_s = torch.stack(progress_horizon_list, dim=0)
+        current_speed_mps = torch.stack(current_speed_list, dim=0)
         trajectories_world = torch.stack(trajectory_list, dim=0)
         action_token_t = torch.stack(action_token_list, dim=0)
         rtg = self._compute_discounted_return_to_go(reward_t, valid_mask, discount=discount)
@@ -1118,6 +1200,9 @@ class MotionLMLightning(pl.LightningModule):
             "tube_distance_mean": distance_mean,
             "progress_reward_mean": sanitize_scalar_loss(progress_reward_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
             "frontier_arc_final_mean": sanitize_scalar_loss(frontier_arc_t[:, :, -1][valid_return].mean()) if bool(valid_return.any()) else zero,
+            "progress_budget_mean": sanitize_scalar_loss(progress_budget_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "progress_horizon_s_mean": sanitize_scalar_loss(progress_horizon_s[valid_return].mean()) if bool(valid_return.any()) else zero,
+            "current_speed_mps_mean": sanitize_scalar_loss(current_speed_mps[valid_return].mean()) if bool(valid_return.any()) else zero,
             "group_size": int(len(reward_list)),
         }
 
@@ -1959,6 +2044,9 @@ class MotionLMLightning(pl.LightningModule):
                     "tube_distance_mean": control_hidden.new_tensor(0.0),
                     "progress_reward_mean": control_hidden.new_tensor(0.0),
                     "frontier_arc_final_mean": control_hidden.new_tensor(0.0),
+                    "progress_budget_mean": control_hidden.new_tensor(0.0),
+                    "progress_horizon_s_mean": control_hidden.new_tensor(0.0),
+                    "current_speed_mps_mean": control_hidden.new_tensor(0.0),
                     "group_size": 0,
                 }
                 rollout_semantic_context = None
@@ -2040,6 +2128,9 @@ class MotionLMLightning(pl.LightningModule):
                         "cf/sdc_rollout_tube_distance_mean": rollout_tube_policy_bundle["tube_distance_mean"],
                         "cf/sdc_rollout_tube_progress_reward_mean": rollout_tube_policy_bundle["progress_reward_mean"],
                         "cf/sdc_rollout_tube_frontier_arc_final_mean": rollout_tube_policy_bundle["frontier_arc_final_mean"],
+                        "cf/sdc_rollout_tube_progress_budget_mean": rollout_tube_policy_bundle["progress_budget_mean"],
+                        "cf/sdc_rollout_tube_progress_horizon_s_mean": rollout_tube_policy_bundle["progress_horizon_s_mean"],
+                        "cf/sdc_rollout_tube_current_speed_mps_mean": rollout_tube_policy_bundle["current_speed_mps_mean"],
                         "cf/sdc_rollout_tube_group_size": control_hidden.new_tensor(
                             float(rollout_tube_policy_bundle["group_size"])
                         ),
