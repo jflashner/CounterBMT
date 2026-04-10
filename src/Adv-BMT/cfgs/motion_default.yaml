@@ -24,6 +24,7 @@ CKPT_LOAD_MODE: legacy_merge
 deterministic: False
 detect_anomaly: False
 check_val_every_n_epoch: 1
+DDP_STRATEGY_OVERRIDE: ""
 
 eval_backward_model: False
 
@@ -82,6 +83,7 @@ DATA:
     COUNTERFACTUAL_CONTROL_INDEX_TRAIN: ''
     COUNTERFACTUAL_CONTROL_INDEX_VAL: ''
     COUNTERFACTUAL_MODE: 'default'
+    COUNTERFACTUAL_ALT_ONLY_TRAIN: false
     COUNTERFACTUAL_WEIGHTED_SAMPLER: false
     COUNTERFACTUAL_USE_VLM_SEMANTICS: false
     COUNTERFACTUAL_VLM_CONFIDENCE_THRESHOLD: 0.75

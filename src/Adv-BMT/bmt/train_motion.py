@@ -85,6 +85,92 @@ def _serialize_metric_mapping(values):
     return serialized
 
 
+def _resolve_configured_path(path_text: str) -> pathlib.Path:
+    path = pathlib.Path(str(path_text).strip()).expanduser()
+    if not path.is_absolute():
+        path = (REPO_ROOT / path).resolve()
+    return path
+
+
+def _prepare_counterfactual_train_index(config) -> None:
+    counterfactual_mode = str(OmegaConf.select(config, "DATA.COUNTERFACTUAL_MODE", default="") or "").strip()
+    if counterfactual_mode != "sdc_semantic_only":
+        return
+
+    rollout_objective_enabled = any(
+        float(OmegaConf.select(config, key, default=0.0) or 0.0) > 0.0
+        for key in (
+            "MODEL.LOCAL_CONTROL_SDC_ROLLOUT_GUIDE_LOSS_WEIGHT",
+            "MODEL.LOCAL_CONTROL_SDC_ROLLOUT_PROGRESS_LOSS_WEIGHT",
+            "MODEL.LOCAL_CONTROL_SDC_ROLLOUT_TUBE_POLICY_LOSS_WEIGHT",
+        )
+    )
+    if not rollout_objective_enabled:
+        return
+
+    requested_alt_only = bool(OmegaConf.select(config, "DATA.COUNTERFACTUAL_ALT_ONLY_TRAIN", default=False))
+    multi_gpu_rollout_rl = torch.cuda.is_available() and torch.cuda.device_count() > 1
+    if not (requested_alt_only or multi_gpu_rollout_rl):
+        return
+
+    source_key = "DATA.COUNTERFACTUAL_CONTROL_INDEX_TRAIN"
+    source_value = str(OmegaConf.select(config, source_key, default="") or "").strip()
+    if not source_value:
+        source_key = "DATA.COUNTERFACTUAL_CONTROL_INDEX"
+        source_value = str(OmegaConf.select(config, source_key, default="") or "").strip()
+    if not source_value:
+        return
+
+    source_path = _resolve_configured_path(source_value)
+    if not source_path.is_file() or source_path.suffix != ".jsonl":
+        return
+
+    if source_path.stem.endswith("_altonly"):
+        filtered_path = source_path
+    else:
+        filtered_path = source_path.with_name(f"{source_path.stem}_altonly.jsonl")
+
+    total_rows = 0
+    kept_rows = 0
+    removed_rows = 0
+    with source_path.open("rt", encoding="utf-8") as src, filtered_path.open("wt", encoding="utf-8") as dst:
+        for line in src:
+            text = line.strip()
+            if not text:
+                continue
+            total_rows += 1
+            row = json.loads(text)
+            slot_id = str(row.get("selected_slot_id") or row.get("slot_id") or "").strip()
+            if slot_id == "gt":
+                removed_rows += 1
+                continue
+            kept_rows += 1
+            dst.write(json.dumps(row, sort_keys=True))
+            dst.write("\n")
+
+    if kept_rows <= 0:
+        raise RuntimeError(
+            f"Alt-only counterfactual train index is empty after filtering: {source_path}"
+        )
+
+    OmegaConf.set_struct(config, False)
+    config.DATA.COUNTERFACTUAL_CONTROL_INDEX_TRAIN = str(filtered_path)
+    OmegaConf.set_struct(config, True)
+
+    reason = "explicit config" if requested_alt_only else "automatic multi-GPU rollout-RL safeguard"
+    print(
+        "[counterfactual-train-index] using alt-only train index",
+        {
+            "reason": reason,
+            "source": str(source_path),
+            "filtered": str(filtered_path),
+            "total_rows": total_rows,
+            "kept_rows": kept_rows,
+            "removed_gt_rows": removed_rows,
+        },
+    )
+
+
 def _write_training_artifacts(
     *,
     artifact_root: pathlib.Path,
@@ -568,6 +654,8 @@ def main(config):
     if log_dir is not None:
         log_dir = pathlib.Path(log_dir)
 
+    _prepare_counterfactual_train_index(config)
+
     # Setup wandb logger
     trial_id = get_time_str(no_time=True)
     name = "{}_{}".format(exp_name, trial_id)
@@ -687,8 +775,11 @@ def main(config):
         val_num_workers=val_num_workers,
         val_prefetch_factor=config.prefetch_factor,
     )
+    ddp_strategy_override = str(config.get("DDP_STRATEGY_OVERRIDE", "") or "").strip()
     if torch.cuda.device_count() > 1:
-        if bool(config.MODEL.get("LOCAL_CONTROL_FORWARD_ENABLED", False)):
+        if ddp_strategy_override:
+            trainer_kwargs["strategy"] = ddp_strategy_override
+        elif bool(config.MODEL.get("LOCAL_CONTROL_FORWARD_ENABLED", False)):
             trainer_kwargs["strategy"] = 'ddp_find_unused_parameters_true'
         else:
             trainer_kwargs["strategy"] = 'ddp'

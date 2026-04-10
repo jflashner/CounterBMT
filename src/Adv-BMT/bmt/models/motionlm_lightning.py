@@ -2244,7 +2244,6 @@ class MotionLMLightning(pl.LightningModule):
                     and (
                         rollout_guide_loss_weight > 0.0
                         or rollout_progress_loss_weight > 0.0
-                        or rollout_tube_policy_loss_weight > 0.0
                     )
                 ):
                     rollout_bundle = self._build_sdc_semantic_rollout_guidance(data_dict=data_dict)
