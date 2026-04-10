@@ -2694,6 +2694,37 @@ class MotionLMLightning(pl.LightningModule):
     def on_validation_start(self):
         torch.cuda.empty_cache()
 
+    def _normalize_validation_loss_stat(self, loss_stat):
+        if not isinstance(loss_stat, dict):
+            return loss_stat
+
+        zero = None
+        for value in loss_stat.values():
+            if torch.is_tensor(value):
+                zero = value.new_tensor(0.0)
+                break
+        if zero is None:
+            device = self.device if hasattr(self, "device") else None
+            zero = torch.tensor(0.0, device=device)
+
+        optional_keys = [
+            "cf/sdc_semantic_acc",
+            "cf/path_acc",
+            "cf/compliance_acc",
+            "cf/timing_acc",
+            "accuracy_in_backward",
+            "accuracy_in_forward",
+        ]
+        for key in optional_keys:
+            loss_stat.setdefault(key, zero)
+
+        if self.counterfactual_mode == "sdc_semantic_only":
+            for label_name in SDC_PATH_SEMANTIC_LABEL_ORDER:
+                loss_stat.setdefault(f"cf/sdc_family_guide_loss_by_label/{label_name}", zero)
+                loss_stat.setdefault(f"cf/sdc_rollout_family_guide_loss_by_label/{label_name}", zero)
+
+        return loss_stat
+
     def validation_step(self, data_dict, batch_idx):
 
         if self.config.EVAL_MOTION and hasattr(self, "evaluator"):
@@ -2733,6 +2764,7 @@ class MotionLMLightning(pl.LightningModule):
 
         data_dict = self(data_dict)
         loss, loss_stat = self.get_loss(data_dict)
+        loss_stat = self._normalize_validation_loss_stat(loss_stat)
         motion_stat = {k: v for k, v in loss_stat.items() if k.startswith("motion_stat")}
         loss_stat = {k: v for k, v in loss_stat.items() if not k.startswith("motion_stat")}
 

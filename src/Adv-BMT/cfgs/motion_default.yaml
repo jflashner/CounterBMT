@@ -26,6 +26,7 @@ detect_anomaly: False
 check_val_every_n_epoch: 1
 DDP_STRATEGY_OVERRIDE: ""
 DDP_FIRST_STEP_TRACE: false
+DATALOADER_MULTIPROCESSING_CONTEXT: ""
 
 eval_backward_model: False
 

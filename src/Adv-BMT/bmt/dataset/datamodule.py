@@ -21,6 +21,23 @@ class InfgenDataModule(pl.LightningDataModule):
         self.val_batch_size = val_batch_size
         self.val_num_workers = val_num_workers
         self.val_prefetch_factor = val_prefetch_factor
+        multiprocessing_context = str(config.get("DATALOADER_MULTIPROCESSING_CONTEXT", "") or "").strip()
+        self.dataloader_multiprocessing_context = multiprocessing_context or None
+
+    def _loader_kwargs(self, *, is_train: bool):
+        num_workers = self.train_num_workers if is_train else self.val_num_workers
+        kwargs = {}
+        if num_workers > 0:
+            kwargs["prefetch_factor"] = (
+                self.train_prefetch_factor if is_train else self.val_prefetch_factor
+            )
+            kwargs["persistent_workers"] = True
+            if self.dataloader_multiprocessing_context is not None:
+                kwargs["multiprocessing_context"] = self.dataloader_multiprocessing_context
+        else:
+            kwargs["prefetch_factor"] = None
+            kwargs["persistent_workers"] = False
+        return kwargs
 
     def setup(self, stage: str):
         self.train_dataset = dataset.InfgenDataset(config=self.config, mode="training")
@@ -45,9 +62,8 @@ class InfgenDataModule(pl.LightningDataModule):
             num_workers=self.train_num_workers,
             shuffle=shuffle,
             sampler=sampler,
-            persistent_workers=True if self.train_num_workers > 0 else False,
             collate_fn=self.train_dataset.collate_batch,
-            prefetch_factor=self.train_prefetch_factor if self.train_num_workers > 0 else None,
+            **self._loader_kwargs(is_train=True),
         )
 
     def val_dataloader(self):
@@ -58,5 +74,5 @@ class InfgenDataModule(pl.LightningDataModule):
             num_workers=self.val_num_workers,
             shuffle=False,
             collate_fn=self.val_dataset.collate_batch,
-            prefetch_factor=self.val_prefetch_factor if self.val_num_workers > 0 else None,
+            **self._loader_kwargs(is_train=False),
         )
