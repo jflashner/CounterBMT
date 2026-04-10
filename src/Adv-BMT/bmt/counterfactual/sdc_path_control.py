@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+try:
+    from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Polygon
+    from shapely.ops import unary_union
+except Exception:  # pragma: no cover - optional geometry dependency for progress trace construction
+    GeometryCollection = None
+    LineString = None
+    MultiPolygon = None
+    Polygon = None
+    unary_union = None
 
 from .geometry import heading_from_points
 from .normalize import load_raw_scenario
@@ -30,6 +40,9 @@ DEFAULT_SEPARABILITY_HEADING_WEIGHT_M = 2.0
 DEFAULT_PATH_DEADBAND_M = 1.0
 DEFAULT_DISCONTINUITY_STITCH_RADIUS_M = 2.0
 DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M = 6.0
+DEFAULT_PROGRESS_CENTERLINE_SPACING_M = 0.5
+DEFAULT_PROGRESS_CENTERLINE_FORWARD_BIN_M = 1.0
+DEFAULT_PROGRESS_CENTERLINE_TANGENT_LOOKAHEAD_M = 8.0
 
 
 @dataclass
@@ -189,6 +202,503 @@ def polyline_length_m(points_xy: Any) -> float:
     if arc.size == 0:
         return 0.0
     return float(arc[-1])
+
+
+def sample_point_along_polyline(points_xy: Any, arc_m: float) -> np.ndarray:
+    xy = _sanitize_polyline(points_xy)
+    if xy.shape[0] == 0:
+        return np.zeros((2,), dtype=np.float32)
+    if xy.shape[0] == 1:
+        return np.asarray(xy[0], dtype=np.float32)
+    arc = polyline_arc_lengths(xy)
+    target = float(np.clip(float(arc_m), 0.0, float(arc[-1])))
+    right_idx = int(np.searchsorted(arc, target, side="right"))
+    if right_idx <= 0:
+        return np.asarray(xy[0], dtype=np.float32)
+    if right_idx >= xy.shape[0]:
+        return np.asarray(xy[-1], dtype=np.float32)
+    left_idx = right_idx - 1
+    left_arc = float(arc[left_idx])
+    right_arc = float(arc[right_idx])
+    denom = max(right_arc - left_arc, 1e-6)
+    alpha = float(np.clip((target - left_arc) / denom, 0.0, 1.0))
+    point = (1.0 - alpha) * xy[left_idx] + alpha * xy[right_idx]
+    return np.asarray(point, dtype=np.float32)
+
+
+def build_forward_progress_centerline(
+    points_xy: Any,
+    *,
+    divergence_onset_m: float,
+    spacing_m: float = DEFAULT_PROGRESS_CENTERLINE_SPACING_M,
+    forward_bin_m: float = DEFAULT_PROGRESS_CENTERLINE_FORWARD_BIN_M,
+    tangent_lookahead_m: float = DEFAULT_PROGRESS_CENTERLINE_TANGENT_LOOKAHEAD_M,
+    forward_slack_m: float = 0.5,
+) -> np.ndarray:
+    xy = _sanitize_polyline(points_xy)
+    if xy.shape[0] < 2:
+        return xy
+
+    resampled = resample_polyline_xy(xy, spacing_m=max(float(spacing_m), 0.25))
+    if resampled.shape[0] < 2:
+        return resampled
+
+    total_arc = float(polyline_length_m(resampled))
+    onset = float(np.clip(float(divergence_onset_m), 0.0, total_arc))
+    divergence_point = sample_point_along_polyline(resampled, onset)
+
+    back_arc = max(0.0, onset - 2.0)
+    fwd_arc = min(total_arc, onset + max(float(tangent_lookahead_m), 1.0))
+    tangent = sample_point_along_polyline(resampled, fwd_arc) - sample_point_along_polyline(resampled, back_arc)
+    tangent_norm = float(np.linalg.norm(tangent))
+    if tangent_norm <= 1e-6:
+        arc = polyline_arc_lengths(resampled)
+        start_idx = int(np.searchsorted(arc, onset, side="right"))
+        if start_idx >= resampled.shape[0]:
+            start_idx = int(resampled.shape[0] - 1)
+        next_idx = min(start_idx + 1, int(resampled.shape[0] - 1))
+        prev_idx = max(start_idx - 1, 0)
+        tangent = np.asarray(resampled[next_idx] - resampled[prev_idx], dtype=np.float32)
+        tangent_norm = float(np.linalg.norm(tangent))
+    if tangent_norm <= 1e-6:
+        tangent = np.asarray([1.0, 0.0], dtype=np.float32)
+        tangent_norm = 1.0
+    forward_unit = np.asarray(tangent / tangent_norm, dtype=np.float32)
+    lateral_unit = np.asarray([-forward_unit[1], forward_unit[0]], dtype=np.float32)
+
+    arc = polyline_arc_lengths(resampled)
+    start_idx = int(np.searchsorted(arc, onset, side="right"))
+    start_idx = min(max(start_idx, 1), int(resampled.shape[0] - 1))
+    tail_points = np.concatenate([divergence_point[None, :], resampled[start_idx:]], axis=0).astype(np.float32)
+    rel = tail_points - divergence_point.reshape(1, 2)
+    forward_coord = rel @ forward_unit.reshape(2, 1)
+    lateral_coord = rel @ lateral_unit.reshape(2, 1)
+    forward_coord = np.asarray(forward_coord, dtype=np.float32).reshape(-1)
+    lateral_coord = np.asarray(lateral_coord, dtype=np.float32).reshape(-1)
+
+    forward_mask = forward_coord >= -float(forward_slack_m)
+    forward_coord = forward_coord[forward_mask]
+    lateral_coord = lateral_coord[forward_mask]
+    if forward_coord.size == 0:
+        return np.asarray(divergence_point[None, :], dtype=np.float32)
+
+    bin_size = max(float(forward_bin_m), 0.25)
+    bin_ids = np.floor(np.maximum(forward_coord, 0.0) / bin_size + 1e-6).astype(np.int64)
+    unique_bins = np.unique(bin_ids)
+    local_points = [np.zeros((2,), dtype=np.float32)]
+    last_x = 0.0
+    for bin_id in unique_bins:
+        mask = bin_ids == int(bin_id)
+        x_vals = np.asarray(forward_coord[mask], dtype=np.float32)
+        y_vals = np.asarray(lateral_coord[mask], dtype=np.float32)
+        if x_vals.size == 0:
+            continue
+        x_center = float(np.max(x_vals))
+        if x_center <= last_x + 1e-3:
+            continue
+        y_center = float(np.median(y_vals))
+        local_points.append(np.asarray([x_center, y_center], dtype=np.float32))
+        last_x = x_center
+
+    local_xy = np.asarray(local_points, dtype=np.float32)
+    world_xy = (
+        divergence_point.reshape(1, 2)
+        + local_xy[:, [0]] * forward_unit.reshape(1, 2)
+        + local_xy[:, [1]] * lateral_unit.reshape(1, 2)
+    ).astype(np.float32)
+    return _sanitize_polyline(world_xy)
+
+
+def build_right_wall_progress_trace(
+    points_xy: Any,
+    *,
+    divergence_onset_m: float,
+    current_xy_world: Optional[Sequence[float]] = None,
+    current_heading_world: Optional[float] = None,
+    tube_radius_m: float = 3.0,
+    resample_spacing_m: float = DEFAULT_PROGRESS_CENTERLINE_SPACING_M,
+    grid_step_m: float = 0.5,
+    tangent_lookahead_m: float = DEFAULT_PROGRESS_CENTERLINE_TANGENT_LOOKAHEAD_M,
+    margin_m: float = 4.0,
+    seed_search_radius_m: float = 4.0,
+) -> np.ndarray:
+    xy = _sanitize_polyline(points_xy)
+    if xy.shape[0] < 2:
+        return xy
+
+    resampled = resample_polyline_xy(xy, spacing_m=max(float(resample_spacing_m), 0.25))
+    if resampled.shape[0] < 2:
+        return resampled
+
+    total_arc = float(polyline_length_m(resampled))
+    onset = float(np.clip(float(divergence_onset_m), 0.0, total_arc))
+    divergence_point = sample_point_along_polyline(resampled, onset)
+    back_arc = max(0.0, onset - 2.0)
+    fwd_arc = min(total_arc, onset + max(float(tangent_lookahead_m), 1.0))
+    tangent = sample_point_along_polyline(resampled, fwd_arc) - sample_point_along_polyline(resampled, back_arc)
+    tangent_norm = float(np.linalg.norm(tangent))
+    if tangent_norm <= 1e-6:
+        arc = polyline_arc_lengths(resampled)
+        start_idx = int(np.searchsorted(arc, onset, side="right"))
+        start_idx = min(max(start_idx, 1), int(resampled.shape[0] - 1))
+        next_idx = min(start_idx + 1, int(resampled.shape[0] - 1))
+        prev_idx = max(start_idx - 1, 0)
+        tangent = np.asarray(resampled[next_idx] - resampled[prev_idx], dtype=np.float32)
+        tangent_norm = float(np.linalg.norm(tangent))
+    if tangent_norm <= 1e-6:
+        tangent = np.asarray([1.0, 0.0], dtype=np.float32)
+        tangent_norm = 1.0
+    forward_unit = np.asarray(tangent / tangent_norm, dtype=np.float32)
+    if current_heading_world is not None and np.isfinite(float(current_heading_world)):
+        heading_unit = np.asarray(
+            [math.cos(float(current_heading_world)), math.sin(float(current_heading_world))],
+            dtype=np.float32,
+        )
+        if float(np.dot(forward_unit, heading_unit)) < 0.0:
+            forward_unit = -forward_unit
+    right_unit = np.asarray([forward_unit[1], -forward_unit[0]], dtype=np.float32)
+
+    rel = np.asarray(resampled - divergence_point.reshape(1, 2), dtype=np.float32)
+    local_x = np.asarray(rel @ forward_unit.reshape(2, 1), dtype=np.float32).reshape(-1)
+    local_y = np.asarray(rel @ right_unit.reshape(2, 1), dtype=np.float32).reshape(-1)
+    local_xy = np.stack([local_x, local_y], axis=-1).astype(np.float32)
+
+    radius = max(float(tube_radius_m), 0.5)
+    step = max(float(grid_step_m), 0.25)
+    x_min = float(min(-radius - 2.0, np.min(local_x) - radius - margin_m))
+    x_max = float(max(radius + 2.0, np.max(local_x) + radius + margin_m))
+    y_min = float(np.min(local_y) - radius - margin_m)
+    y_max = float(np.max(local_y) + radius + margin_m)
+    xs = np.arange(x_min, x_max + 0.5 * step, step, dtype=np.float32)
+    ys = np.arange(y_min, y_max + 0.5 * step, step, dtype=np.float32)
+    if xs.size < 2 or ys.size < 2:
+        return np.asarray(divergence_point[None, :], dtype=np.float32)
+
+    occupancy = np.zeros((ys.size, xs.size), dtype=bool)
+    radius_sq = float(radius * radius)
+    cell_radius_x = int(math.ceil(radius / step))
+    cell_radius_y = int(math.ceil(radius / step))
+    for point in local_xy:
+        cx = int(np.clip(np.searchsorted(xs, float(point[0])), 0, xs.size - 1))
+        cy = int(np.clip(np.searchsorted(ys, float(point[1])), 0, ys.size - 1))
+        x0 = max(0, cx - cell_radius_x)
+        x1 = min(xs.size, cx + cell_radius_x + 1)
+        y0 = max(0, cy - cell_radius_y)
+        y1 = min(ys.size, cy + cell_radius_y + 1)
+        grid_x = xs[x0:x1][None, :]
+        grid_y = ys[y0:y1][:, None]
+        dist_sq = (grid_x - float(point[0])) ** 2 + (grid_y - float(point[1])) ** 2
+        occupancy[y0:y1, x0:x1] |= dist_sq <= radius_sq
+
+    if current_xy_world is not None:
+        current_xy = np.asarray(current_xy_world, dtype=np.float32).reshape(-1)
+        if current_xy.shape[0] >= 2 and np.isfinite(current_xy[:2]).all():
+            seed_world = current_xy[:2] + radius * right_unit
+            seed_rel = seed_world - divergence_point
+            seed_local = np.asarray(
+                [
+                    float(np.dot(seed_rel, forward_unit)),
+                    float(np.dot(seed_rel, right_unit)),
+                ],
+                dtype=np.float32,
+            )
+        else:
+            seed_local = np.asarray([0.0, radius], dtype=np.float32)
+    else:
+        seed_local = np.asarray([0.0, radius], dtype=np.float32)
+    seed_ix = int(np.argmin(np.abs(xs - seed_local[0])))
+    seed_iy = int(np.argmin(np.abs(ys - seed_local[1])))
+    if not occupancy[seed_iy, seed_ix]:
+        search_cells = int(math.ceil(max(float(seed_search_radius_m), step) / step))
+        best = None
+        for iy in range(max(0, seed_iy - search_cells), min(ys.size, seed_iy + search_cells + 1)):
+            for ix in range(max(0, seed_ix - search_cells), min(xs.size, seed_ix + search_cells + 1)):
+                if not occupancy[iy, ix]:
+                    continue
+                dist = float((xs[ix] - seed_local[0]) ** 2 + (ys[iy] - seed_local[1]) ** 2)
+                if best is None or dist < best[0]:
+                    best = (dist, iy, ix)
+        if best is None:
+            return np.asarray(divergence_point[None, :], dtype=np.float32)
+        _, seed_iy, seed_ix = best
+
+    component = np.zeros_like(occupancy, dtype=bool)
+    q = deque([(seed_iy, seed_ix)])
+    component[seed_iy, seed_ix] = True
+    while q:
+        iy, ix = q.popleft()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                ny = iy + dy
+                nx = ix + dx
+                if ny < 0 or ny >= ys.size or nx < 0 or nx >= xs.size:
+                    continue
+                if component[ny, nx] or not occupancy[ny, nx]:
+                    continue
+                component[ny, nx] = True
+                q.append((ny, nx))
+
+    local_trace = []
+    last_x = -1e9
+    for ix in range(xs.size):
+        y_idxs = np.flatnonzero(component[:, ix])
+        if y_idxs.size == 0:
+            continue
+        x_val = float(xs[ix])
+        if x_val < -step:
+            continue
+        y_idx = int(y_idxs[-1])
+        if x_val <= last_x + 1e-4:
+            continue
+        local_trace.append([x_val, float(ys[y_idx])])
+        last_x = x_val
+    if not local_trace:
+        return np.asarray(divergence_point[None, :], dtype=np.float32)
+
+    local_trace_xy = np.asarray(local_trace, dtype=np.float32)
+    world_trace = (
+        divergence_point.reshape(1, 2)
+        + local_trace_xy[:, [0]] * forward_unit.reshape(1, 2)
+        + local_trace_xy[:, [1]] * right_unit.reshape(1, 2)
+    ).astype(np.float32)
+    return _sanitize_polyline(world_trace)
+
+
+def _sdc_up_to_world_frame(
+    points_xy_local: Any,
+    *,
+    origin_xy_world: Sequence[float],
+    origin_heading_world: float,
+) -> np.ndarray:
+    local_xy = _finite_xy_rows(points_xy_local)
+    if local_xy.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    rot = float(origin_heading_world) - (math.pi / 2.0)
+    c = math.cos(rot)
+    s = math.sin(rot)
+    x_world = c * local_xy[:, 0] - s * local_xy[:, 1] + float(origin_xy_world[0])
+    y_world = s * local_xy[:, 0] + c * local_xy[:, 1] + float(origin_xy_world[1])
+    return np.stack([x_world, y_world], axis=-1).astype(np.float32)
+
+
+def _extract_polygon_exteriors_xy(geometry: Any) -> List[np.ndarray]:
+    if geometry is None:
+        return []
+    if Polygon is not None and isinstance(geometry, Polygon):
+        coords = np.asarray(geometry.exterior.coords, dtype=np.float32).reshape(-1, 2)
+        return [coords] if coords.shape[0] >= 2 else []
+    if MultiPolygon is not None and isinstance(geometry, MultiPolygon):
+        out: List[np.ndarray] = []
+        for geom in geometry.geoms:
+            out.extend(_extract_polygon_exteriors_xy(geom))
+        return out
+    if GeometryCollection is not None and isinstance(geometry, GeometryCollection):
+        out: List[np.ndarray] = []
+        for geom in geometry.geoms:
+            out.extend(_extract_polygon_exteriors_xy(geom))
+        return out
+    return []
+
+
+def _find_rightward_ray_hit_on_polyline(polyline_local: Any, *, y0: float = 0.0) -> Optional[Tuple[int, float, np.ndarray]]:
+    points = _sanitize_polyline(polyline_local)
+    if points.shape[0] < 2:
+        return None
+    best: Optional[Tuple[float, int, float, np.ndarray]] = None
+    eps = 1e-6
+    for idx in range(int(points.shape[0] - 1)):
+        p0 = points[idx]
+        p1 = points[idx + 1]
+        y_start = float(p0[1] - y0)
+        y_end = float(p1[1] - y0)
+        if abs(y_start) <= eps and abs(y_end) <= eps:
+            x_min = min(float(p0[0]), float(p1[0]))
+            x_max = max(float(p0[0]), float(p1[0]))
+            if x_max < -eps:
+                continue
+            x_hit = max(0.0, x_min)
+            if x_hit > x_max + eps:
+                continue
+            denom = float(p1[0] - p0[0])
+            if abs(denom) <= eps:
+                t = 0.0
+            else:
+                t = float(np.clip((x_hit - float(p0[0])) / denom, 0.0, 1.0))
+            point = np.asarray([x_hit, float(y0)], dtype=np.float32)
+        else:
+            if (y_start > 0.0 and y_end > 0.0) or (y_start < 0.0 and y_end < 0.0):
+                continue
+            denom = float(y_end - y_start)
+            if abs(denom) <= eps:
+                continue
+            t = float(np.clip((-y_start) / denom, 0.0, 1.0))
+            x_hit = float((1.0 - t) * p0[0] + t * p1[0])
+            if x_hit < -eps:
+                continue
+            point = np.asarray([x_hit, float(y0)], dtype=np.float32)
+        candidate = (float(point[0]), idx, t, point)
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+    if best is None:
+        return None
+    _, idx, t, point = best
+    return idx, float(t), np.asarray(point, dtype=np.float32)
+
+
+def _orient_contour_forward_from_hit(polyline_local: Any, seg_idx: int, t: float) -> np.ndarray:
+    points = _sanitize_polyline(polyline_local)
+    if points.shape[0] < 2:
+        return points
+    closed = points.shape[0] >= 3 and float(np.linalg.norm(points[0] - points[-1])) <= 1.5
+    if closed:
+        points = np.asarray(points[:-1], dtype=np.float32)
+    if points.shape[0] < 2:
+        return points
+    start = ((1.0 - float(t)) * points[seg_idx] + float(t) * points[(seg_idx + 1) % points.shape[0]]).astype(np.float32)
+
+    def _build(direction: int) -> np.ndarray:
+        if closed:
+            if direction > 0:
+                order = [((seg_idx + 1 + step) % points.shape[0]) for step in range(points.shape[0])]
+            else:
+                order = [((seg_idx - step) % points.shape[0]) for step in range(points.shape[0])]
+            tail = points[np.asarray(order, dtype=np.int64)]
+        else:
+            tail = points[seg_idx + 1 :] if direction > 0 else points[seg_idx::-1]
+        if tail.shape[0] == 0:
+            return start[None, :]
+        trace = np.vstack([start[None, :], tail]).astype(np.float32)
+        return _sanitize_polyline(trace)
+
+    def _score(trace: np.ndarray) -> float:
+        if trace.shape[0] < 2:
+            return -1e9
+        step = min(int(trace.shape[0]), 25)
+        y_gain = float(np.max(trace[:step, 1] - trace[0, 1]))
+        x_penalty = 0.1 * float(np.max(np.abs(trace[:step, 0] - trace[0, 0])))
+        return y_gain - x_penalty
+
+    forward_trace = _build(+1)
+    backward_trace = _build(-1)
+    return forward_trace if _score(forward_trace) >= _score(backward_trace) else backward_trace
+
+
+def build_actual_right_wall_progress_trace(
+    points_xy: Any,
+    *,
+    current_xy_world: Optional[Sequence[float]] = None,
+    current_heading_world: Optional[float] = None,
+    tube_radius_m: float = 3.0,
+    jump_threshold_m: float = DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
+) -> np.ndarray:
+    xy = _sanitize_polyline(points_xy)
+    if xy.shape[0] < 2 or current_xy_world is None or current_heading_world is None:
+        return xy
+    if LineString is None or unary_union is None:
+        return build_right_wall_progress_trace(
+            xy,
+            divergence_onset_m=0.0,
+            current_xy_world=current_xy_world,
+            current_heading_world=current_heading_world,
+            tube_radius_m=tube_radius_m,
+        )
+
+    local_segments: List[np.ndarray] = []
+    for seg in split_polyline_on_discontinuities(xy, jump_threshold_m=float(jump_threshold_m)):
+        seg_local = world_to_sdc_up_frame(
+            seg,
+            origin_xy_world=current_xy_world,
+            origin_heading_world=float(current_heading_world),
+        )
+        seg_local = _sanitize_polyline(seg_local)
+        if seg_local.shape[0] >= 2:
+            local_segments.append(seg_local)
+    if not local_segments:
+        return xy
+
+    buffered = []
+    radius = max(float(tube_radius_m), 0.5)
+    for seg_local in local_segments:
+        try:
+            buffered.append(LineString(seg_local.tolist()).buffer(radius))
+        except Exception:
+            continue
+    if not buffered:
+        return build_right_wall_progress_trace(
+            xy,
+            divergence_onset_m=0.0,
+            current_xy_world=current_xy_world,
+            current_heading_world=current_heading_world,
+            tube_radius_m=tube_radius_m,
+        )
+
+    try:
+        tube_geometry = unary_union(buffered)
+    except Exception:
+        return build_right_wall_progress_trace(
+            xy,
+            divergence_onset_m=0.0,
+            current_xy_world=current_xy_world,
+            current_heading_world=current_heading_world,
+            tube_radius_m=tube_radius_m,
+        )
+
+    contour_segments = [
+        _sanitize_polyline(seg)
+        for seg in _extract_polygon_exteriors_xy(tube_geometry)
+        if _sanitize_polyline(seg).shape[0] >= 2
+    ]
+    if not contour_segments:
+        return build_right_wall_progress_trace(
+            xy,
+            divergence_onset_m=0.0,
+            current_xy_world=current_xy_world,
+            current_heading_world=current_heading_world,
+            tube_radius_m=tube_radius_m,
+        )
+
+    chosen_trace = None
+    best_x: Optional[float] = None
+    for contour_local in contour_segments:
+        hit = _find_rightward_ray_hit_on_polyline(contour_local, y0=0.0)
+        if hit is None:
+            continue
+        seg_idx, t, point = hit
+        if best_x is None or float(point[0]) < float(best_x):
+            best_x = float(point[0])
+            chosen_trace = _orient_contour_forward_from_hit(contour_local, seg_idx, t)
+
+    if chosen_trace is None or chosen_trace.shape[0] < 2:
+        seed = np.asarray([radius, 0.0], dtype=np.float32)
+        best_dist = None
+        best_seg = None
+        best_seg_idx = 0
+        for contour_local in contour_segments:
+            d = np.linalg.norm(contour_local - seed[None, :], axis=-1)
+            idx = int(np.argmin(d))
+            dist = float(d[idx])
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_seg = contour_local
+                best_seg_idx = min(idx, int(contour_local.shape[0] - 2))
+        if best_seg is None:
+            return build_right_wall_progress_trace(
+                xy,
+                divergence_onset_m=0.0,
+                current_xy_world=current_xy_world,
+                current_heading_world=current_heading_world,
+                tube_radius_m=tube_radius_m,
+            )
+        chosen_trace = _orient_contour_forward_from_hit(best_seg, best_seg_idx, 0.0)
+
+    trace_world = _sdc_up_to_world_frame(
+        chosen_trace,
+        origin_xy_world=current_xy_world,
+        origin_heading_world=float(current_heading_world),
+    )
+    return _sanitize_polyline(trace_world)
 
 
 def nearest_point_index(points_xy: Any, point_xy: Sequence[float]) -> int:

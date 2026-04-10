@@ -835,6 +835,100 @@ class MotionLMLightning(pl.LightningModule):
         sdc_action = (selected_action * decision_agent_mask[:, None, :].to(dtype=torch.long)).sum(dim=2)
         return F.log_softmax(sdc_logits, dim=-1).gather(-1, sdc_action.unsqueeze(-1)).squeeze(-1)
 
+    @staticmethod
+    def _sample_point_along_polyline_torch(points_xy: torch.Tensor, arc_m: torch.Tensor) -> torch.Tensor:
+        points = points_xy.to(dtype=torch.float32)
+        if points.shape[0] == 0:
+            return points.new_zeros((2,), dtype=torch.float32)
+        if points.shape[0] == 1:
+            return points[0]
+        segment_vec = points[1:] - points[:-1]
+        segment_len = torch.linalg.norm(segment_vec, dim=-1)
+        cumulative = torch.cat(
+            [points.new_zeros((1,), dtype=torch.float32), torch.cumsum(segment_len, dim=0)],
+            dim=0,
+        )
+        target = torch.clamp(
+            arc_m.to(dtype=torch.float32),
+            min=0.0,
+            max=float(cumulative[-1].item()),
+        )
+        right_idx = int(torch.searchsorted(cumulative, target, right=True).item())
+        if right_idx <= 0:
+            return points[0]
+        if right_idx >= points.shape[0]:
+            return points[-1]
+        left_idx = right_idx - 1
+        left_arc = cumulative[left_idx]
+        right_arc = cumulative[right_idx]
+        denom = torch.clamp(right_arc - left_arc, min=1e-6)
+        alpha = torch.clamp((target - left_arc) / denom, min=0.0, max=1.0)
+        return (1.0 - alpha) * points[left_idx] + alpha * points[right_idx]
+
+    @classmethod
+    def _compute_sdc_progress_radius_cap_arc(
+        cls,
+        *,
+        path_xy: torch.Tensor,
+        path_mask: torch.Tensor,
+        circle_center_xy: torch.Tensor,
+        radius_from_divergence_m: float,
+        path_total_arc: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = int(path_xy.shape[0])
+        out = path_total_arc.to(dtype=torch.float32).clone()
+        radius = max(float(radius_from_divergence_m), 1e-3)
+        radius_sq = float(radius * radius)
+        for batch_idx in range(batch_size):
+            if not bool(path_mask[batch_idx].any()):
+                out[batch_idx] = 0.0
+                continue
+            points = path_xy[batch_idx][path_mask[batch_idx]].to(dtype=torch.float32)
+            if points.shape[0] < 2:
+                out[batch_idx] = 0.0
+                continue
+            circle_center = circle_center_xy[batch_idx].to(dtype=torch.float32)
+            if circle_center.numel() < 2 or not bool(torch.isfinite(circle_center).all()):
+                out[batch_idx] = path_total_arc[batch_idx].to(dtype=torch.float32)
+                continue
+            segment_vec = points[1:] - points[:-1]
+            segment_len = torch.linalg.norm(segment_vec, dim=-1)
+            cumulative = torch.cat(
+                [points.new_zeros((1,), dtype=torch.float32), torch.cumsum(segment_len, dim=0)],
+                dim=0,
+            )
+            rel = points - circle_center[None, :]
+            dist_sq = torch.sum(rel * rel, dim=-1)
+            crossing_idx = None
+            for idx in range(1, int(points.shape[0])):
+                if float(dist_sq[idx].item()) >= radius_sq and float(dist_sq[idx - 1].item()) < radius_sq:
+                    crossing_idx = idx
+                    break
+            if crossing_idx is None:
+                out[batch_idx] = path_total_arc[batch_idx].to(dtype=torch.float32)
+                continue
+            seg_start = points[crossing_idx - 1] - circle_center
+            seg_end = points[crossing_idx] - circle_center
+            seg = seg_end - seg_start
+            a = float(torch.dot(seg, seg).item())
+            b = float(2.0 * torch.dot(seg_start, seg).item())
+            c = float(torch.dot(seg_start, seg_start).item() - radius_sq)
+            t = 1.0
+            if a > 1e-8:
+                disc = max(b * b - 4.0 * a * c, 0.0)
+                root = math.sqrt(disc)
+                candidates = [(-b - root) / (2.0 * a), (-b + root) / (2.0 * a)]
+                valid_t = [val for val in candidates if -1e-6 <= val <= 1.0 + 1e-6]
+                if valid_t:
+                    t = float(min(max(valid_t[0], 0.0), 1.0))
+            crossing_arc = cumulative[crossing_idx - 1] + float(t) * segment_len[crossing_idx - 1]
+            out[batch_idx] = torch.clamp(
+                crossing_arc,
+                min=0.0,
+                max=path_total_arc[batch_idx].to(dtype=torch.float32),
+            )
+        return out.to(dtype=torch.float32)
+
     def _compute_sdc_rollout_tube_rewards(self, *, data_dict, semantic_context):
         output_logit = data_dict["decoder/output_logit"]
         device = output_logit.device
@@ -888,6 +982,21 @@ class MotionLMLightning(pl.LightningModule):
             device=device,
             dtype=dtype,
         )
+        progress_path_model = self._as_tensor(
+            data_dict.get("cf/sdc_selected_progress_centerline_model", data_dict.get("cf/sdc_selected_raw_path_model", data_dict["cf/sdc_selected_raw_path_world"])),
+            device=device,
+            dtype=dtype,
+        )
+        progress_path_mask = self._as_tensor(
+            data_dict.get("cf/sdc_selected_progress_centerline_mask", data_dict["cf/sdc_selected_raw_path_mask"]),
+            device=device,
+            dtype=dtype,
+        )
+        progress_path_segment_mask = self._as_tensor(
+            data_dict.get("cf/sdc_selected_progress_centerline_segment_mask", data_dict["cf/sdc_selected_raw_path_segment_mask"]),
+            device=device,
+            dtype=dtype,
+        )
         tube_projection = project_points_to_segment_tube_torch(
             sdc_next_pos_world,
             path_points_world=raw_path_model,
@@ -908,6 +1017,24 @@ class MotionLMLightning(pl.LightningModule):
         ).to(dtype=torch.float32)
         path_total_arc = torch.nan_to_num(
             tube_projection["path_total_arc"],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).to(dtype=torch.float32)
+        progress_projection = project_points_to_segment_tube_torch(
+            sdc_next_pos_world,
+            path_points_world=progress_path_model,
+            path_point_mask=progress_path_mask,
+            path_segment_mask=progress_path_segment_mask,
+        )
+        progress_nearest_arc = torch.nan_to_num(
+            progress_projection["nearest_arc"],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).to(dtype=torch.float32)
+        progress_path_total_arc = torch.nan_to_num(
+            progress_projection["path_total_arc"],
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
@@ -948,8 +1075,8 @@ class MotionLMLightning(pl.LightningModule):
         progress_gate_mult = float(
             self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_GATE_MULT", 1.0)
         )
-        progress_cap_after_divergence_m = float(
-            self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_CAP_AFTER_DIVERGENCE_M", 50.0)
+        progress_radius_from_divergence_m = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_RADIUS_FROM_DIVERGENCE_M", 80.0)
         )
         family_divergence_onsets = self._as_tensor(
             data_dict["cf/sdc_family_divergence_onsets"],
@@ -975,16 +1102,83 @@ class MotionLMLightning(pl.LightningModule):
                 divergence_onset_m,
                 torch.zeros_like(divergence_onset_m),
             )
-            progress_cap_arc_m = divergence_onset_m + float(progress_cap_after_divergence_m)
-            progress_cap_arc_m = torch.minimum(progress_cap_arc_m, path_total_arc)
+            divergence_point_model = torch.zeros(
+                (raw_path_model.shape[0], 2),
+                device=device,
+                dtype=torch.float32,
+            )
+            for batch_idx in range(int(raw_path_model.shape[0])):
+                point_mask = raw_path_mask[batch_idx] > 0.5
+                if not bool(point_mask.any()):
+                    continue
+                raw_points = raw_path_model[batch_idx][point_mask].to(dtype=torch.float32)
+                if raw_points.shape[0] == 0:
+                    continue
+                onset = torch.clamp(
+                    divergence_onset_m[batch_idx].to(dtype=torch.float32),
+                    min=0.0,
+                    max=path_total_arc[batch_idx].to(dtype=torch.float32),
+                )
+                divergence_point_model[batch_idx] = self._sample_point_along_polyline_torch(raw_points, onset)
+            progress_cap_arc_m = self._compute_sdc_progress_radius_cap_arc(
+                path_xy=progress_path_model.to(dtype=torch.float32),
+                path_mask=progress_path_mask > 0.5,
+                circle_center_xy=divergence_point_model,
+                radius_from_divergence_m=float(progress_radius_from_divergence_m),
+                path_total_arc=progress_path_total_arc,
+            )
             progress_cap_arc_m = progress_cap_arc_m.clamp_min(0.0)
+            prefix_point_mask = torch.zeros_like(progress_path_mask, dtype=torch.bool)
+            prefix_segment_mask = torch.zeros_like(progress_path_segment_mask, dtype=torch.bool)
+            for batch_idx in range(int(progress_path_model.shape[0])):
+                point_mask = progress_path_mask[batch_idx] > 0.5
+                valid_idx = torch.nonzero(point_mask, as_tuple=False).reshape(-1)
+                if int(valid_idx.numel()) < 2:
+                    prefix_point_mask[batch_idx] = point_mask
+                    prefix_segment_mask[batch_idx] = progress_path_segment_mask[batch_idx] > 0.5
+                    continue
+                valid_points = progress_path_model[batch_idx][valid_idx].to(dtype=torch.float32)
+                seg_len = torch.linalg.norm(valid_points[1:] - valid_points[:-1], dim=-1)
+                cumulative = torch.cat(
+                    [
+                        torch.zeros((1,), device=device, dtype=torch.float32),
+                        torch.cumsum(seg_len, dim=0),
+                    ],
+                    dim=0,
+                )
+                cap = torch.clamp(
+                    progress_cap_arc_m[batch_idx].to(dtype=torch.float32),
+                    min=0.0,
+                    max=cumulative[-1],
+                )
+                cutoff_idx = int(torch.searchsorted(cumulative, cap, right=True).item())
+                keep_n = min(max(cutoff_idx + 1, 2), int(valid_idx.numel()))
+                kept_idx = valid_idx[:keep_n]
+                prefix_point_mask[batch_idx, kept_idx] = True
+                seg_keep_n = max(keep_n - 1, 0)
+                if prefix_segment_mask.shape[1] == progress_path_model.shape[1]:
+                    prefix_segment_mask[batch_idx, kept_idx[:seg_keep_n]] = True
+                else:
+                    prefix_segment_mask[batch_idx, :seg_keep_n] = True
+            progress_projection = project_points_to_segment_tube_torch(
+                sdc_next_pos_world,
+                path_points_world=progress_path_model,
+                path_point_mask=prefix_point_mask.to(dtype=progress_path_mask.dtype),
+                path_segment_mask=prefix_segment_mask.to(dtype=progress_path_segment_mask.dtype),
+            )
+            progress_nearest_arc = torch.nan_to_num(
+                progress_projection["nearest_arc"],
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).to(dtype=torch.float32)
             progress_active = (
                 valid_mask
                 & (progress_cap_arc_m[:, None] > 1e-3)
                 & (tube_distance <= progress_gate_radius)
             )
             cap_safe = progress_cap_arc_m.clamp_min(1e-3)
-            capped_arc = torch.minimum(nearest_arc, cap_safe[:, None])
+            capped_arc = torch.minimum(progress_nearest_arc, cap_safe[:, None])
             scaled_arc = torch.clamp(capped_arc / max(progress_unit_m, 1e-3), min=0.0)
             progress_potential = torch.where(
                 progress_active,

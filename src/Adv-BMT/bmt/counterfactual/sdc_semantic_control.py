@@ -18,6 +18,7 @@ from .sdc_path_control import (
     DEFAULT_SEPARABILITY_SCALE_M,
     SDC_PATH_SEMANTIC_LABEL_ORDER,
     ResampledLocalPath,
+    build_actual_right_wall_progress_trace,
     _extract_valid_sdc_path_xy,
     build_selected_path_world,
     compute_path_separability_profile,
@@ -437,6 +438,10 @@ def build_sdc_semantic_dataset_fields(
     selected_raw_path_model = np.zeros((0, 2), dtype=np.float32)
     selected_raw_path_segment_mask = np.zeros((0,), dtype=np.float32)
     selected_raw_path_mask = np.zeros((0,), dtype=np.float32)
+    selected_progress_centerline_world = np.zeros((0, 2), dtype=np.float32)
+    selected_progress_centerline_model = np.zeros((0, 2), dtype=np.float32)
+    selected_progress_centerline_segment_mask = np.zeros((0,), dtype=np.float32)
+    selected_progress_centerline_mask = np.zeros((0,), dtype=np.float32)
     scenario_pkl = str(row.get("scenario_pkl") or "").strip()
     if scenario_pkl and sdc_id:
         raw_scenario = load_raw_scenario_from_row(row)
@@ -451,6 +456,11 @@ def build_sdc_semantic_dataset_fields(
             ),
             dtype=np.float32,
         ).reshape(-1, 2)
+        current_xy_world, current_heading_world = extract_sdc_current_pose(
+            raw_scenario,
+            sdc_id=sdc_id,
+            current_time_index=int(row.get("current_time_index") or 0),
+        )
         selected_raw_path_model = world_xy_to_model_frame(
             selected_raw_path_world,
             map_center=map_center,
@@ -461,10 +471,35 @@ def build_sdc_semantic_dataset_fields(
             jump_threshold_m=float(stitch_jump_threshold_m),
         ).astype(np.float32)
         selected_raw_path_mask = np.ones((selected_raw_path_model.shape[0],), dtype=np.float32)
+        selected_progress_centerline_world = np.asarray(
+            build_actual_right_wall_progress_trace(
+                selected_raw_path_world,
+                current_xy_world=current_xy_world,
+                current_heading_world=float(current_heading_world),
+                tube_radius_m=3.0,
+                jump_threshold_m=float(stitch_jump_threshold_m),
+            ),
+            dtype=np.float32,
+        ).reshape(-1, 2)
+        selected_progress_centerline_model = world_xy_to_model_frame(
+            selected_progress_centerline_world,
+            map_center=map_center,
+            map_heading=map_heading,
+        ).astype(np.float32)
+        selected_progress_centerline_segment_mask = polyline_segment_valid_mask(
+            selected_progress_centerline_model,
+            jump_threshold_m=float(stitch_jump_threshold_m),
+        ).astype(np.float32)
+        selected_progress_centerline_mask = np.ones((selected_progress_centerline_model.shape[0],), dtype=np.float32)
         debug_meta["selected_raw_path_num_points"] = int(selected_raw_path_world.shape[0])
         debug_meta["selected_raw_path_num_segments"] = int(
             np.maximum(selected_raw_path_segment_mask.sum(), 0.0)
         )
+        debug_meta["selected_progress_centerline_num_points"] = int(selected_progress_centerline_world.shape[0])
+        debug_meta["selected_progress_centerline_num_segments"] = int(
+            np.maximum(selected_progress_centerline_segment_mask.sum(), 0.0)
+        )
+        debug_meta["selected_progress_centerline_type"] = "actual_right_wall_contour_trace"
         debug_meta["selected_raw_path_frame"] = "model_map_centered"
         debug_meta["selected_raw_path_map_center"] = np.asarray(map_center, dtype=np.float32).tolist()
         debug_meta["selected_raw_path_map_heading"] = float(map_heading)
@@ -569,6 +604,10 @@ def build_sdc_semantic_dataset_fields(
         "cf/sdc_selected_raw_path_model": selected_raw_path_model.astype(np.float32),
         "cf/sdc_selected_raw_path_mask": selected_raw_path_mask.astype(np.float32),
         "cf/sdc_selected_raw_path_segment_mask": selected_raw_path_segment_mask.astype(np.float32),
+        "cf/sdc_selected_progress_centerline_world": selected_progress_centerline_world.astype(np.float32),
+        "cf/sdc_selected_progress_centerline_model": selected_progress_centerline_model.astype(np.float32),
+        "cf/sdc_selected_progress_centerline_mask": selected_progress_centerline_mask.astype(np.float32),
+        "cf/sdc_selected_progress_centerline_segment_mask": selected_progress_centerline_segment_mask.astype(np.float32),
         "cf/sdc_is_factual": int(is_factual),
         "cf/sdc_control_available": int(control_available),
         "cf/sdc_debug_meta": dict(debug_meta),
