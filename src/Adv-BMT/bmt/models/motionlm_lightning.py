@@ -1,6 +1,7 @@
 import copy
 import logging
 import math
+import time
 from pathlib import Path
 
 import lightning.pytorch as pl
@@ -330,6 +331,29 @@ class MotionLMLightning(pl.LightningModule):
         if self._last_rollout_train_debug_step == step_index:
             return False
         return True
+
+    def _trace_first_step(self, stage: str, **extra):
+        if not bool(self.config.get("DDP_FIRST_STEP_TRACE", False)):
+            return
+        step_index = int(getattr(self, "global_step", 0))
+        if step_index > 0:
+            return
+        payload = {
+            "rank": int(getattr(self, "global_rank", -1)),
+            "local_rank": int(getattr(self, "local_rank", -1)),
+            "stage": str(stage),
+            "global_step": step_index,
+            "time": round(time.time(), 3),
+        }
+        for key, value in extra.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    payload[key] = float(value.detach().cpu().item())
+                else:
+                    payload[key] = list(value.shape)
+            else:
+                payload[key] = value
+        print(f"[ddp_first_step_trace] {payload}", flush=True)
 
     def _rollout_tube_training_debug_output_root(self):
         logger_obj = getattr(self, "logger", None)
@@ -1217,10 +1241,12 @@ class MotionLMLightning(pl.LightningModule):
         }
 
     def _build_sdc_semantic_rollout_tube_policy_objective(self, *, data_dict):
+        self._trace_first_step("tube_policy:start")
         output_logit = data_dict["decoder/output_logit"]
         zero = output_logit.new_tensor(0.0)
         group_size = int(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_GROUP_SIZE", 0))
         if group_size <= 0:
+            self._trace_first_step("tube_policy:group_size_zero")
             return {
                 "policy_loss": zero,
                 "valid_fraction": zero,
@@ -1260,7 +1286,9 @@ class MotionLMLightning(pl.LightningModule):
         if motion_decoder is not None and previous_null_dropout_prob is not None:
             motion_decoder.cf_null_dropout_prob = 0.0
         try:
-            for _ in range(group_size):
+            for rollout_idx in range(group_size):
+                if rollout_idx == 0:
+                    self._trace_first_step("tube_policy:first_rollout:enter", group_size=int(group_size))
                 rollout_input = self._prepare_batch_for_training_autoregressive_rollout(data_dict)
                 rollout_output = self.model.autoregressive_rollout(
                     rollout_input,
@@ -1323,11 +1351,18 @@ class MotionLMLightning(pl.LightningModule):
                     )
                 )
                 action_token_list.append(sdc_action_tokens)
+                if rollout_idx == 0:
+                    self._trace_first_step(
+                        "tube_policy:first_rollout:exit",
+                        reward_shape=list(reward_bundle["reward_t"].shape),
+                        valid_fraction=reward_bundle["valid_mask"].float().mean(),
+                    )
         finally:
             if motion_decoder is not None and previous_null_dropout_prob is not None:
                 motion_decoder.cf_null_dropout_prob = previous_null_dropout_prob
 
         if not reward_list:
+            self._trace_first_step("tube_policy:no_reward_list")
             return {
                 "policy_loss": zero,
                 "valid_fraction": zero,
@@ -1379,6 +1414,12 @@ class MotionLMLightning(pl.LightningModule):
             advantage_t=advantage_t,
             trajectories_world=trajectories_world,
             action_token_t=action_token_t,
+        )
+        self._trace_first_step(
+            "tube_policy:end",
+            policy_loss=policy_loss,
+            valid_fraction=valid_mask.float().mean(),
+            return_mean=return_mean,
         )
         return {
             "policy_loss": policy_loss,
@@ -2590,6 +2631,7 @@ class MotionLMLightning(pl.LightningModule):
 
         # For profiling GPU usage.
         # torch.cuda.empty_cache()
+        self._trace_first_step("training_step:start", batch_idx=int(batch_idx))
 
         if "in_evaluation" in data_dict:
             in_evaluation = data_dict["in_evaluation"]
@@ -2597,9 +2639,12 @@ class MotionLMLightning(pl.LightningModule):
                 in_evaluation = torch.as_tensor(in_evaluation)
             data_dict["in_evaluation"] = torch.zeros_like(in_evaluation, dtype=torch.bool)
 
+        self._trace_first_step("training_step:before_forward")
         data_dict = self(data_dict)
+        self._trace_first_step("training_step:after_forward")
 
         loss, loss_stat = self.get_loss(data_dict)
+        self._trace_first_step("training_step:after_get_loss", loss=loss)
 
         pbar_keys = ("total_loss", "toks", "lr")
 
@@ -2627,6 +2672,7 @@ class MotionLMLightning(pl.LightningModule):
             prog_bar=False,
         )
         self.log('monitoring_step', float(self.global_step))
+        self._trace_first_step("training_step:end")
         return loss
 
     def optimizer_step(self, *args, **kwargs):
