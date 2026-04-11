@@ -461,6 +461,44 @@ class EvaluationLightningModule(pl.LightningModule):
             input_data[key] = value
         return input_data
 
+    def _maybe_expand_semantic_control_eval_tensors(self, input_data):
+        if not self.multi_mode or int(self.num_modes) <= 1:
+            return input_data
+
+        semantic_control_keys = (
+            "cf/sdc_semantic_label_id",
+            "cf/sdc_semantic_confidence",
+            "cf/sdc_family_path_polylines_world",
+            "cf/sdc_family_path_mask",
+            "cf/sdc_path_waypoints",
+            "cf/sdc_path_waypoint_mask",
+            "cf/sdc_path_separability",
+            "cf/time_window_mask",
+            "cf/decision_agent_mask",
+            "cf/conditioning_eligible",
+            "cf/sdc_control_available",
+            "cf/sdc_is_factual",
+        )
+
+        for key in semantic_control_keys:
+            if key not in input_data:
+                continue
+
+            value = input_data[key]
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value, device=self.model.device)
+            else:
+                value = value.to(self.model.device)
+
+            if value.ndim == 0:
+                value = utils.expand_for_modes(value.reshape(1), num_modes=self.num_modes)
+            elif int(value.shape[0]) == 1:
+                value = utils.expand_for_modes(value, num_modes=self.num_modes)
+
+            input_data[key] = value
+
+        return input_data
+
 
     def GPT_AR(self, input_data, backward_prediction=False, teacher_forcing=False):
         if not teacher_forcing:
@@ -732,6 +770,7 @@ class EvaluationLightningModule(pl.LightningModule):
         tok_data_dict, _ = self.tokenizer.tokenize(input_data, backward_prediction=True)
         input_data.update(tok_data_dict)
         input_data = self._maybe_attach_dag_eval_tensors(data_dict, input_data)
+        input_data = self._maybe_expand_semantic_control_eval_tensors(input_data)
 
         input_data["in_backward_prediction"] = torch.tensor([True] * self.num_modes, dtype=bool).to(self.model.device)
 
@@ -765,6 +804,7 @@ class EvaluationLightningModule(pl.LightningModule):
         tok_data_dict, _ = self.tokenizer.tokenize(input_data, backward_prediction=backward_prediction)
         input_data.update(tok_data_dict)
         input_data = self._maybe_attach_dag_eval_tensors(raw_data, input_data)
+        input_data = self._maybe_expand_semantic_control_eval_tensors(input_data)
 
         if not backward_prediction: # handle backward flag
             if self.config.BACKWARD_PREDICTION:
