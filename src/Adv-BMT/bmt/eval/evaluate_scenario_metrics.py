@@ -1,9 +1,11 @@
 import os
 import pathlib
 import sys
+import pickle
+
+import numpy as np
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
-import pickle
 
 _WORKSPACE_ROOT = pathlib.Path(__file__).resolve().parents[4]
 for package_root in (_WORKSPACE_ROOT / "metadrive", _WORKSPACE_ROOT / "scenarionet"):
@@ -15,8 +17,27 @@ for package_root in (_WORKSPACE_ROOT / "metadrive", _WORKSPACE_ROOT / "scenarion
 from bmt.dataset.scenarionet_utils import overwrite_gt_to_pred_field, merge_preds_along_mode_dim
 import copy
 import hydra
-import numpy as np
 import omegaconf
+
+
+def _install_numpy_pickle_compat_aliases():
+    """Allow scenario pickles written with newer NumPy module paths to load here."""
+    numpy_core = getattr(np, "core", None)
+    if numpy_core is None:
+        return
+
+    sys.modules.setdefault("numpy._core", numpy_core)
+
+    multiarray = getattr(numpy_core, "multiarray", None)
+    if multiarray is not None:
+        sys.modules.setdefault("numpy._core.multiarray", multiarray)
+
+    numeric = getattr(numpy_core, "numeric", None)
+    if numeric is not None:
+        sys.modules.setdefault("numpy._core.numeric", numeric)
+
+
+_install_numpy_pickle_compat_aliases()
 
 from bmt.utils import utils
 from bmt.dataset.dataset import InfgenDataset
