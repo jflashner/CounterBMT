@@ -726,6 +726,7 @@ def main(config):
         num_sanity_val_steps=config.num_sanity_val_steps,
         limit_val_batches=config.limit_val_batches if config.limit_val_batches >= 0 else None,
         limit_train_batches=config.limit_train_batches if config.limit_train_batches >= 0 else None,
+        accumulate_grad_batches=max(1, int(config.get("accumulate_grad_batches", 1))),
         gradient_clip_val=config.OPTIMIZATION.GRAD_NORM_CLIP,
         max_epochs=max_epochs,
         callbacks=callbacks,

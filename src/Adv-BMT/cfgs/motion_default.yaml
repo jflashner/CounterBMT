@@ -12,6 +12,7 @@ val_batch_size: 4
 num_workers: 16
 val_num_workers: 16
 num_sanity_val_steps: 100
+accumulate_grad_batches: 1
 wandb: False
 log_dir: Null
 limit_train_batches: -1
