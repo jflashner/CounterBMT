@@ -1245,6 +1245,7 @@ class MotionLMLightning(pl.LightningModule):
         output_logit = data_dict["decoder/output_logit"]
         zero = output_logit.new_tensor(0.0)
         group_size = int(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_GROUP_SIZE", 0))
+        debug_required = self._should_dump_rollout_tube_training_debug()
         if group_size <= 0:
             self._trace_first_step("tube_policy:group_size_zero")
             return {
@@ -1278,8 +1279,8 @@ class MotionLMLightning(pl.LightningModule):
         progress_cap_arc_list = []
         divergence_onset_list = []
         inside_fraction_list = []
-        trajectory_list = []
-        action_token_list = []
+        trajectory_list = [] if debug_required else None
+        action_token_list = [] if debug_required else None
 
         motion_decoder = getattr(self.model, "motion_decoder", None)
         previous_null_dropout_prob = getattr(motion_decoder, "cf_null_dropout_prob", None)
@@ -1306,19 +1307,24 @@ class MotionLMLightning(pl.LightningModule):
                 rollout_semantic_context = self._extract_sdc_semantic_context(rollout_eval_dict)
                 if rollout_semantic_context is None:
                     continue
-                reward_bundle = self._compute_sdc_rollout_tube_rewards(
-                    data_dict=rollout_eval_dict,
-                    semantic_context=rollout_semantic_context,
-                )
+                # The reward serves only as a detached REINFORCE-style baseline/advantage
+                # target, so keeping it out of autograd saves a large amount of memory.
+                with torch.no_grad():
+                    reward_bundle = self._compute_sdc_rollout_tube_rewards(
+                        data_dict=rollout_eval_dict,
+                        semantic_context=rollout_semantic_context,
+                    )
                 decision_agent_mask = rollout_semantic_context["decision_agent_mask"]
                 rollout_next_position = self._as_tensor(
                     rollout_eval_dict["decoder/rollout_next_position"][:, : output_logit.shape[1], :, :2],
                     device=output_logit.device,
                     dtype=output_logit.dtype,
                 )
-                sdc_next_pos_world = (
-                    rollout_next_position * decision_agent_mask[:, None, :, None].to(dtype=output_logit.dtype)
-                ).sum(dim=2)
+                sdc_next_pos_world = None
+                if debug_required:
+                    sdc_next_pos_world = (
+                        rollout_next_position * decision_agent_mask[:, None, :, None].to(dtype=output_logit.dtype)
+                    ).sum(dim=2).detach()
                 selected_action = self._as_tensor(
                     rollout_eval_dict["decoder/input_action"][:, : output_logit.shape[1], : output_logit.shape[2]],
                     device=output_logit.device,
@@ -1341,16 +1347,17 @@ class MotionLMLightning(pl.LightningModule):
                 progress_cap_arc_list.append(reward_bundle["progress_cap_arc_t"])
                 divergence_onset_list.append(reward_bundle["divergence_onset_m"])
                 inside_fraction_list.append(reward_bundle["inside_fraction"])
-                trajectory_list.append(
-                    torch.cat(
-                        [
-                            rollout_semantic_context["sdc_current_pos_world"][:, :1],
-                            sdc_next_pos_world,
-                        ],
-                        dim=1,
+                if debug_required:
+                    trajectory_list.append(
+                        torch.cat(
+                            [
+                                rollout_semantic_context["sdc_current_pos_world"][:, :1].detach(),
+                                sdc_next_pos_world,
+                            ],
+                            dim=1,
+                        )
                     )
-                )
-                action_token_list.append(sdc_action_tokens)
+                    action_token_list.append(sdc_action_tokens.detach())
                 if rollout_idx == 0:
                     self._trace_first_step(
                         "tube_policy:first_rollout:exit",
@@ -1386,8 +1393,6 @@ class MotionLMLightning(pl.LightningModule):
         frontier_arc_t = torch.stack(frontier_arc_list, dim=0)
         progress_cap_arc_t = torch.stack(progress_cap_arc_list, dim=0)
         divergence_onset_m = torch.stack(divergence_onset_list, dim=0)
-        trajectories_world = torch.stack(trajectory_list, dim=0)
-        action_token_t = torch.stack(action_token_list, dim=0)
         rtg = self._compute_discounted_return_to_go(reward_t, valid_mask, discount=discount)
         advantage_t = self._group_normalize_advantages(rtg, valid_mask)
         policy_loss = sanitize_scalar_loss(
@@ -1404,17 +1409,20 @@ class MotionLMLightning(pl.LightningModule):
         inside_fraction = sanitize_scalar_loss(
             torch.stack(inside_fraction_list).mean()
         ) if inside_fraction_list else zero
-        self._maybe_dump_rollout_tube_training_debug(
-            data_dict=data_dict,
-            reward_t=reward_t,
-            valid_mask=valid_mask,
-            selected_log_probs=selected_log_probs,
-            tube_distance=tube_distance,
-            rtg=rtg,
-            advantage_t=advantage_t,
-            trajectories_world=trajectories_world,
-            action_token_t=action_token_t,
-        )
+        if debug_required:
+            trajectories_world = torch.stack(trajectory_list, dim=0)
+            action_token_t = torch.stack(action_token_list, dim=0)
+            self._maybe_dump_rollout_tube_training_debug(
+                data_dict=data_dict,
+                reward_t=reward_t,
+                valid_mask=valid_mask,
+                selected_log_probs=selected_log_probs,
+                tube_distance=tube_distance,
+                rtg=rtg,
+                advantage_t=advantage_t,
+                trajectories_world=trajectories_world,
+                action_token_t=action_token_t,
+            )
         self._trace_first_step(
             "tube_policy:end",
             policy_loss=policy_loss,
