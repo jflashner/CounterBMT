@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 
-SDC_PATH_SEMANTIC_CONTRACT_SCHEMA_VERSION = "sdc_path_semantic_contract_v1"
+SDC_PATH_SEMANTIC_CONTRACT_SCHEMA_VERSION = "sdc_path_semantic_contract_v2"
 SDC_PATH_LABELS = (
     "left",
     "right",
@@ -12,6 +12,7 @@ SDC_PATH_LABELS = (
     "straight",
     "stop",
 )
+RISK_LEVELS = ("low", "medium", "high")
 AMBIGUITY_LEVELS = ("low", "medium", "high")
 SOURCE_KINDS = ("ground_truth", "sdc_path")
 SLOT_IDS = ("gt", "alt_1", "alt_2", "alt_3")
@@ -78,6 +79,8 @@ def sdc_path_semantic_json_schema() -> Dict[str, Any]:
                             "source_kind": {"type": "string", "enum": list(SOURCE_KINDS)},
                             "path_id": {"type": ["string", "null"]},
                             "semantic_label": {"type": "string", "enum": list(SDC_PATH_LABELS)},
+                            "risk_level": {"type": "string", "enum": list(RISK_LEVELS)},
+                            "risk_rationale_short": {"type": "string"},
                             "confidence": {"type": "number"},
                             "is_valid_target": {"type": "boolean"},
                             "rationale_short": {"type": "string"},
@@ -87,6 +90,8 @@ def sdc_path_semantic_json_schema() -> Dict[str, Any]:
                             "source_kind",
                             "path_id",
                             "semantic_label",
+                            "risk_level",
+                            "risk_rationale_short",
                             "confidence",
                             "is_valid_target",
                             "rationale_short",
@@ -179,6 +184,8 @@ def normalize_sdc_path_contract(
                 "source_kind": _safe_enum(row.get("source_kind"), allowed=SOURCE_KINDS, default="sdc_path"),
                 "path_id": None if row.get("path_id") is None else str(row.get("path_id")),
                 "semantic_label": _safe_enum(row.get("semantic_label"), allowed=SDC_PATH_LABELS, default="straight"),
+                "risk_level": _safe_enum(row.get("risk_level"), allowed=RISK_LEVELS, default="medium"),
+                "risk_rationale_short": str(row.get("risk_rationale_short") or ""),
                 "confidence": _safe_float(row.get("confidence"), 0.0),
                 "is_valid_target": _safe_bool(row.get("is_valid_target"), default=False),
                 "rationale_short": str(row.get("rationale_short") or ""),

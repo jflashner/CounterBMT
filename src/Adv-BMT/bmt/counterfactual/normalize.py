@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
@@ -19,7 +20,39 @@ from .types import (
 _DEFAULT_DT_S = 0.1
 
 
+def _install_numpy_pickle_compat_aliases() -> None:
+    """Alias NumPy 2.x pickle module paths for older NumPy envs.
+
+    Some scenario pickles were created in environments that reference
+    ``numpy._core`` modules. Older NumPy builds expose the same objects under
+    ``numpy.core`` only, which makes plain ``pickle.load`` fail with
+    ``ModuleNotFoundError``. Registering these aliases is harmless when the
+    newer paths already exist and keeps old environments able to read the same
+    artifacts.
+    """
+
+    try:
+        import numpy.core as np_core
+    except Exception:
+        return
+
+    sys.modules.setdefault("numpy._core", np_core)
+
+    alias_pairs = (
+        ("multiarray", "multiarray"),
+        ("numeric", "numeric"),
+        ("numerictypes", "numerictypes"),
+        ("umath", "umath"),
+        ("_multiarray_umath", "_multiarray_umath"),
+    )
+    for alias_name, attr_name in alias_pairs:
+        target = getattr(np_core, attr_name, None)
+        if target is not None:
+            sys.modules.setdefault(f"numpy._core.{alias_name}", target)
+
+
 def load_raw_scenario(path: str | Path) -> Any:
+    _install_numpy_pickle_compat_aliases()
     with Path(path).expanduser().open("rb") as f:
         return pickle.load(f)
 

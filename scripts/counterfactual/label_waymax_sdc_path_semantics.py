@@ -56,7 +56,10 @@ ALT_COLORS = ["#2563eb", "#f97316", "#7c3aed"]
 ROAD_COLOR = "#334155"
 LANE_COLOR = "#cbd5e1"
 CROSSWALK_FACE = "#e2e8f0"
-AGENT_COLOR = "#cbd5e1"
+AGENT_PAST_COLOR = "#94a3b8"
+AGENT_BODY_FILL = "#d1d5db"
+AGENT_BODY_EDGE = "#475569"
+AGENT_ARROW_COLOR = "#111827"
 SDC_ARROW_COLOR = "#111827"
 SDC_DOT_COLOR = "#f43f5e"
 START_LANE_SHADE = "#60a5fa"
@@ -193,6 +196,9 @@ def _select_nearby_agents(raw_scenario: Mapping[str, Any], *, sdc_id: str, cente
         state = dict(track.get("state", {}))
         valid = np.asarray(state.get("valid", []), dtype=bool)
         position = np.asarray(state.get("position", []), dtype=np.float64)
+        heading = np.asarray(state.get("heading", []), dtype=np.float64).reshape(-1)
+        length = np.asarray(state.get("length", []), dtype=np.float64).reshape(-1)
+        width = np.asarray(state.get("width", []), dtype=np.float64).reshape(-1)
         if valid.ndim != 1 or position.ndim != 2 or position.shape[0] == 0:
             continue
         idx = int(np.clip(int(current_idx), 0, valid.shape[0] - 1))
@@ -206,7 +212,21 @@ def _select_nearby_agents(raw_scenario: Mapping[str, Any], *, sdc_id: str, cente
             continue
         start_idx = max(0, idx - int(PAST_STEPS))
         past_xy = _finite_xy_rows(position[start_idx : idx + 1][valid[start_idx : idx + 1]])
-        rows.append({"track_id": str(track_id), "current_xy": current_xy[0], "past_xy": past_xy, "distance_m": dist})
+        current_heading = float(heading[idx]) if heading.shape[0] > idx and np.isfinite(heading[idx]) else 0.0
+        current_length_m = float(length[idx]) if length.shape[0] > idx and np.isfinite(length[idx]) else 4.5
+        current_width_m = float(width[idx]) if width.shape[0] > idx and np.isfinite(width[idx]) else 2.0
+        rows.append(
+            {
+                "track_id": str(track_id),
+                "track_type": str(track.get("type", "UNKNOWN")),
+                "current_xy": current_xy[0],
+                "past_xy": past_xy,
+                "current_heading": current_heading,
+                "current_length_m": current_length_m,
+                "current_width_m": current_width_m,
+                "distance_m": dist,
+            }
+        )
     rows.sort(key=lambda row: (row["distance_m"], row["track_id"]))
     return rows[:18]
 
@@ -214,6 +234,28 @@ def _select_nearby_agents(raw_scenario: Mapping[str, Any], *, sdc_id: str, cente
 def _heading_arrow(pose_xy: np.ndarray, heading: float, *, length_m: float = 10.0) -> np.ndarray:
     x, y = float(pose_xy[0]), float(pose_xy[1])
     return np.asarray([[x, y], [x + length_m * math.cos(float(heading)), y + length_m * math.sin(float(heading))]], dtype=np.float64)
+
+
+def _agent_box_world(*, center_xy: np.ndarray, heading: float, length_m: float, width_m: float) -> np.ndarray:
+    center = _finite_xy_rows(np.asarray(center_xy, dtype=np.float64))
+    if center.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    c = center[0]
+    forward = np.asarray([math.cos(float(heading)), math.sin(float(heading))], dtype=np.float64)
+    left = np.asarray([-forward[1], forward[0]], dtype=np.float64)
+    half_l = 0.5 * max(0.6, float(length_m))
+    half_w = 0.5 * max(0.4, float(width_m))
+    corners = np.stack(
+        [
+            c + half_l * forward + half_w * left,
+            c + half_l * forward - half_w * left,
+            c - half_l * forward - half_w * left,
+            c - half_l * forward + half_w * left,
+            c + half_l * forward + half_w * left,
+        ],
+        axis=0,
+    )
+    return np.asarray(corners, dtype=np.float64)
 
 
 def _world_to_sdc_up_frame(xy_world: np.ndarray, *, center_xy: np.ndarray, heading_rad: float) -> np.ndarray:
@@ -761,14 +803,33 @@ def _render_single_image(
             heading_rad=current_heading,
         )
         if past_xy.shape[0] >= 2:
-            ax.plot(past_xy[:, 0], past_xy[:, 1], color=AGENT_COLOR, linewidth=1.0, alpha=0.55, zorder=3)
+            ax.plot(past_xy[:, 0], past_xy[:, 1], color=AGENT_PAST_COLOR, linewidth=1.1, alpha=0.42, zorder=3)
+        current_agent_xy_world = np.asarray([agent["current_xy"]], dtype=np.float64)
         current_agent_xy = _world_to_sdc_up_frame(
-            np.asarray([agent["current_xy"]], dtype=np.float64),
+            current_agent_xy_world,
             center_xy=center_xy,
             heading_rad=current_heading,
         )
+        agent_box_world = _agent_box_world(
+            center_xy=np.asarray(agent["current_xy"], dtype=np.float64),
+            heading=float(agent.get("current_heading", 0.0)),
+            length_m=float(agent.get("current_length_m", 4.5)),
+            width_m=float(agent.get("current_width_m", 2.0)),
+        )
+        agent_box_local = _world_to_sdc_up_frame(agent_box_world, center_xy=center_xy, heading_rad=current_heading)
+        if agent_box_local.shape[0] >= 4:
+            ax.fill(agent_box_local[:, 0], agent_box_local[:, 1], color=AGENT_BODY_FILL, alpha=0.90, zorder=4)
+            ax.plot(agent_box_local[:, 0], agent_box_local[:, 1], color=AGENT_BODY_EDGE, linewidth=1.5, alpha=0.98, zorder=5)
         if current_agent_xy.shape[0] > 0:
-            ax.scatter([current_agent_xy[0, 0]], [current_agent_xy[0, 1]], c=AGENT_COLOR, s=14, alpha=0.85, zorder=4)
+            arrow_world = _heading_arrow(
+                np.asarray(agent["current_xy"], dtype=np.float64),
+                float(agent.get("current_heading", 0.0)),
+                length_m=max(2.5, 0.65 * float(agent.get("current_length_m", 4.5))),
+            )
+            arrow_local = _world_to_sdc_up_frame(arrow_world, center_xy=center_xy, heading_rad=current_heading)
+            if arrow_local.shape[0] >= 2:
+                ax.plot(arrow_local[:, 0], arrow_local[:, 1], color=AGENT_ARROW_COLOR, linewidth=1.6, alpha=0.98, zorder=6)
+                ax.scatter([arrow_local[-1, 0]], [arrow_local[-1, 1]], c=AGENT_ARROW_COLOR, s=10, alpha=0.98, zorder=6)
 
     for light in traffic_lights:
         stop_xy = _world_to_sdc_up_frame(

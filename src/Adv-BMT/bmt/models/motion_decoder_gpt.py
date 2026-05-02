@@ -272,6 +272,10 @@ class MotionDecoderGPT(nn.Module):
             return bool(value.reshape(-1)[0].item()) if value.numel() > 0 else False
         return bool(value)
 
+    @staticmethod
+    def _has_any_input_key(input_dict, *candidates):
+        return any(str(key) in input_dict for key in candidates)
+
     def _maybe_build_local_control(self, input_dict, *, device, dtype, batch_size, horizon, num_agents):
         if not self.local_control_forward_enabled:
             return None
@@ -283,15 +287,6 @@ class MotionDecoderGPT(nn.Module):
             "cf/time_window_mask",
             "cf/decision_agent_mask",
         )
-        if all(key in input_dict for key in sdc_semantic_required):
-            return self._build_sdc_semantic_only_local_control(
-                input_dict,
-                device=device,
-                dtype=dtype,
-                batch_size=batch_size,
-                horizon=horizon,
-                num_agents=num_agents,
-            )
         sdc_required = (
             "cf/sdc_semantic_label_id",
             "cf/sdc_semantic_confidence",
@@ -303,6 +298,21 @@ class MotionDecoderGPT(nn.Module):
         )
         if all(key in input_dict for key in sdc_required):
             return self._build_sdc_path_local_control(
+                input_dict,
+                device=device,
+                dtype=dtype,
+                batch_size=batch_size,
+                horizon=horizon,
+                num_agents=num_agents,
+            )
+        semantic_only_minimal_available = (
+            self._has_any_input_key(input_dict, "cf/semantic_label_id", "cf/sdc_semantic_label_id")
+            and self._has_any_input_key(input_dict, "cf/semantic_confidence", "cf/sdc_semantic_confidence")
+            and "cf/time_window_mask" in input_dict
+            and "cf/decision_agent_mask" in input_dict
+        )
+        if all(key in input_dict for key in sdc_semantic_required) or semantic_only_minimal_available:
+            return self._build_sdc_semantic_only_local_control(
                 input_dict,
                 device=device,
                 dtype=dtype,
@@ -412,8 +422,14 @@ class MotionDecoderGPT(nn.Module):
         }
 
     def _build_sdc_semantic_only_local_control(self, input_dict, *, device, dtype, batch_size, horizon, num_agents):
-        def _to_tensor(name, *, as_long=False):
-            value = input_dict[name]
+        def _to_tensor(*names, as_long=False):
+            value = None
+            for name in names:
+                if name in input_dict:
+                    value = input_dict[name]
+                    break
+            if value is None:
+                raise KeyError(f"Missing required local-control input; tried {names}")
             if not torch.is_tensor(value):
                 value = torch.as_tensor(value, device=device)
             value = value.to(device=device)
@@ -421,18 +437,20 @@ class MotionDecoderGPT(nn.Module):
                 return value.long()
             return value.to(dtype=dtype)
 
-        semantic_label_id = _to_tensor("cf/sdc_semantic_label_id", as_long=True).reshape(batch_size, -1)[:, 0]
-        semantic_confidence = _to_tensor("cf/sdc_semantic_confidence").reshape(batch_size, -1)[:, 0]
+        semantic_label_id = _to_tensor("cf/semantic_label_id", "cf/sdc_semantic_label_id", as_long=True).reshape(batch_size, -1)[:, 0]
+        semantic_confidence = _to_tensor("cf/semantic_confidence", "cf/sdc_semantic_confidence").reshape(batch_size, -1)[:, 0]
         time_window_mask = _to_tensor("cf/time_window_mask")
         decision_agent_mask = _to_tensor("cf/decision_agent_mask")
         conditioning_eligible = (
             _to_tensor("cf/conditioning_eligible").reshape(batch_size, -1)[:, 0] > 0
             if "cf/conditioning_eligible" in input_dict
-            else (_to_tensor("cf/sdc_control_available").reshape(batch_size, -1)[:, 0] > 0)
+            else (
+                _to_tensor("cf/control_available", "cf/sdc_control_available").reshape(batch_size, -1)[:, 0] > 0
+            )
         )
         is_factual = (
-            _to_tensor("cf/sdc_is_factual").reshape(batch_size, -1)[:, 0]
-            if "cf/sdc_is_factual" in input_dict
+            _to_tensor("cf/is_factual", "cf/sdc_is_factual").reshape(batch_size, -1)[:, 0]
+            if ("cf/is_factual" in input_dict or "cf/sdc_is_factual" in input_dict)
             else torch.ones((batch_size,), device=device, dtype=dtype)
         )
 
@@ -455,6 +473,9 @@ class MotionDecoderGPT(nn.Module):
         else:
             keep_mask = torch.ones((batch_size,), device=device, dtype=torch.bool)
         available_mask = available_mask & keep_mask
+        no_intervention_id = int(SDC_PATH_SEMANTIC_LABEL_ORDER.index("no_intervention"))
+        no_intervention_mask = semantic_label_id == no_intervention_id
+        available_mask = available_mask & (~no_intervention_mask)
 
         semantic_token = self.cf_sdc_semantic_embed(semantic_label_id)
         zero_summary = torch.zeros_like(semantic_token)
@@ -486,8 +507,14 @@ class MotionDecoderGPT(nn.Module):
         }
 
     def _build_sdc_path_local_control(self, input_dict, *, device, dtype, batch_size, horizon, num_agents):
-        def _to_tensor(name, *, as_long=False):
-            value = input_dict[name]
+        def _to_tensor(*names, as_long=False):
+            value = None
+            for name in names:
+                if name in input_dict:
+                    value = input_dict[name]
+                    break
+            if value is None:
+                raise KeyError(f"Missing required local-control input; tried {names}")
             if not torch.is_tensor(value):
                 value = torch.as_tensor(value, device=device)
             value = value.to(device=device)
@@ -495,8 +522,8 @@ class MotionDecoderGPT(nn.Module):
                 return value.long()
             return value.to(dtype=dtype)
 
-        semantic_label_id = _to_tensor("cf/sdc_semantic_label_id", as_long=True).reshape(batch_size, -1)[:, 0]
-        semantic_confidence = _to_tensor("cf/sdc_semantic_confidence").reshape(batch_size, -1)[:, 0]
+        semantic_label_id = _to_tensor("cf/semantic_label_id", "cf/sdc_semantic_label_id", as_long=True).reshape(batch_size, -1)[:, 0]
+        semantic_confidence = _to_tensor("cf/semantic_confidence", "cf/sdc_semantic_confidence").reshape(batch_size, -1)[:, 0]
         path_waypoints = _to_tensor("cf/sdc_path_waypoints")
         path_waypoint_mask = _to_tensor("cf/sdc_path_waypoint_mask")
         time_window_mask = _to_tensor("cf/time_window_mask")
@@ -504,11 +531,13 @@ class MotionDecoderGPT(nn.Module):
         conditioning_eligible = (
             _to_tensor("cf/conditioning_eligible").reshape(batch_size, -1)[:, 0] > 0
             if "cf/conditioning_eligible" in input_dict
-            else (_to_tensor("cf/sdc_control_available").reshape(batch_size, -1)[:, 0] > 0)
+            else (
+                _to_tensor("cf/control_available", "cf/sdc_control_available").reshape(batch_size, -1)[:, 0] > 0
+            )
         )
         is_factual = (
-            _to_tensor("cf/sdc_is_factual").reshape(batch_size, -1)[:, 0]
-            if "cf/sdc_is_factual" in input_dict
+            _to_tensor("cf/is_factual", "cf/sdc_is_factual").reshape(batch_size, -1)[:, 0]
+            if ("cf/is_factual" in input_dict or "cf/sdc_is_factual" in input_dict)
             else torch.ones((batch_size,), device=device, dtype=dtype)
         )
 
@@ -1055,6 +1084,12 @@ class MotionDecoderGPT(nn.Module):
             input_dict["decoder/control_probe_after_next_shared_block"] = probe_after_next_shared_block
             input_dict["decoder/control_probe_after_full_decoder"] = decoded_tokens
             input_dict["decoder/control_forward_mode"] = self.local_control_forward_mode
+            if local_control is not None:
+                input_dict["decoder/control_probe_control_kind"] = str(local_control.get("control_kind", ""))
+                input_dict["decoder/control_probe_available_mask"] = local_control["available_mask"]
+                input_dict["decoder/control_probe_supervision_pos_mask"] = local_control["supervision_pos_mask"]
+                input_dict["decoder/control_probe_control_pos_mask"] = local_control["control_pos_mask"]
+                input_dict["decoder/control_probe_local_bias"] = local_control["local_bias"]
         if local_control is not None:
             control_mask = local_control["supervision_pos_mask"] > 0
             pooled_valid = control_mask.reshape(B, -1).any(dim=-1)

@@ -25,7 +25,10 @@ import hydra
 import matplotlib.pyplot as plt
 import omegaconf
 from omegaconf import OmegaConf
-import seaborn as sns
+try:
+    import seaborn as sns  # type: ignore
+except Exception:  # pragma: no cover - plotting-only optional dependency
+    sns = None
 
 from bmt.dataset.dataset import InfgenDataset
 from bmt.utils import REPO_ROOT
@@ -34,6 +37,7 @@ import copy
 import pdb
 
 import lightning.pytorch as pl
+from bmt.utils.checkpoint_loading import load_model_from_checkpoint_forgiving, summarize_load_report_by_module
 
 
 def _to_dict(d):
@@ -598,7 +602,27 @@ def main():
     omegaconf.OmegaConf.set_struct(config, True)
 
     if CKPT_PATH:
-        model = utils.get_model(checkpoint_path=CKPT_PATH)
+        model, load_report = load_model_from_checkpoint_forgiving(
+            config=config,
+            ckpt_path=CKPT_PATH,
+            load_mode="forgiving_state_dict",
+            strict_state_dict=False,
+            map_location="cpu",
+            checkpoint_surgery_func=utils.checkpoint_surgery_func,
+        )
+        print(
+            "Safety-critical generator load report:",
+            {
+                "num_loaded_keys": load_report["num_loaded_keys"],
+                "num_missing_keys": load_report["num_missing_keys"],
+                "num_unexpected_keys": load_report["num_unexpected_keys"],
+                "num_shape_mismatch_keys": load_report["num_shape_mismatch_keys"],
+                "expected_new_path_control_prefix_counts": summarize_load_report_by_module(load_report).get(
+                    "expected_new_path_control_prefix_counts", {}
+                ),
+                "unexpected_missing_keys": load_report["unexpected_missing_keys"][:10],
+            },
+        )
     else:
         model = utils.get_model(config=config)
 
@@ -690,4 +714,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

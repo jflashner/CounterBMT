@@ -40,7 +40,8 @@ In the image:
 - the image is rotated so the current SDC heading points straight up
 - roads / lanes / boundaries are the map context
 - the highlighted route is the thick bright path to classify
-- nearby agents and traffic lights are context only
+- nearby agents are shown as oriented rectangular footprints with dark outlines, plus small black forward arrows indicating their heading / motion direction
+- traffic lights and stop points are context only
 - the starting lane is shaded to show the current lane more clearly
 - the final lane reached by the highlighted path may be shaded differently
 - a dashed guide may show the \"stay in current lane\" continuation
@@ -64,6 +65,20 @@ Classify the highlighted route with exactly one label:
 - right_lane_change
 - straight
 - stop
+
+Also assign exactly one maneuver risk level for this route in this scene:
+- low
+- medium
+- high
+
+Risk-level guidance:
+- low = benign / compliant maneuver with little obvious safety-critical interaction
+- medium = meaningful interaction, tighter geometry, or some plausible safety concern
+- high = likely safety-critical maneuver, such as a restrictive-signal violation, tight conflict, or obviously dangerous interaction
+- This is risk of the maneuver in the shown scene context, not your confidence in the label.
+- Include a short `risk_rationale_short` explaining why the maneuver may be risky in this scene.
+- Use nearby agents, their relative motion, and traffic-light context as primary evidence for risk.
+- Read nearby-agent black direction arrows as direction-of-travel cues when judging conflict and risk.
 
 Interpretation rules:
 - left / right = intersection turn maneuver
@@ -92,6 +107,8 @@ Required output behavior:
 - Produce exactly one highlighted_paths entry for slot_id={slot_id}.
 - source_kind must be {source_kind}.
 - path_id must match the metadata above. If the path is GT, path_id must be null.
+- Include risk_level as one of: low, medium, high.
+- Include risk_rationale_short as one short sentence.
 - Use confidence in [0, 1].
 - Set is_valid_target=false if the highlighted path is too weak / degenerate / not a meaningful maneuver target.
 """.strip()
@@ -112,7 +129,8 @@ In the image:
 - roads / lanes / boundaries are the map context
 - the highlighted route is the thick bright path to classify
 - the highlighted route is colored with a gradient tied to route separability
-- nearby agents and traffic lights are context only
+- nearby agents are shown as oriented rectangular footprints with dark outlines, plus small black forward arrows indicating their heading / motion direction
+- traffic lights and stop points are context only
 
 Gradient meaning:
 - dark / cool colors = this part of the highlighted route is still shared with or very similar to competing routes
@@ -130,6 +148,20 @@ Classify the highlighted route with exactly one label:
 - right_lane_change
 - straight
 - stop
+
+Also assign exactly one maneuver risk level for this route in this scene:
+- low
+- medium
+- high
+
+Risk-level guidance:
+- low = benign / compliant maneuver with little obvious safety-critical interaction
+- medium = meaningful interaction, tighter geometry, or some plausible safety concern
+- high = likely safety-critical maneuver, such as a restrictive-signal violation, tight conflict, or obviously dangerous interaction
+- This is risk of the maneuver in the shown scene context, not your confidence in the label.
+- Include a short `risk_rationale_short` explaining why the maneuver may be risky in this scene.
+- Use nearby agents, their relative motion, and traffic-light context as primary evidence for risk.
+- Read nearby-agent black direction arrows as direction-of-travel cues when judging conflict and risk.
 
 Interpretation rules:
 - left / right = intersection turn maneuver
@@ -159,6 +191,8 @@ Required output behavior:
 - Produce exactly one highlighted_paths entry for slot_id={slot_id}.
 - source_kind must be {source_kind}.
 - path_id must match the metadata above. If the path is GT, path_id must be null.
+- Include risk_level as one of: low, medium, high.
+- Include risk_rationale_short as one short sentence.
 - Use confidence in [0, 1].
 - Set is_valid_target=false if the highlighted path is too weak / degenerate / not a meaningful maneuver target.
 """.strip()
@@ -180,7 +214,8 @@ In every image:
 - the image is rotated so the current SDC heading points straight up
 - roads / lanes / boundaries are the map context
 - the highlighted route is the thick bright path to classify
-- nearby agents and traffic lights are context only
+- nearby agents are shown as oriented rectangular footprints with dark outlines, plus small black forward arrows indicating their heading / motion direction
+- traffic lights and stop points are context only
 - the starting lane is shaded to show the current lane more clearly
 - the final lane reached by the highlighted path may be shaded differently
 - a dashed guide may show the \"stay in current lane\" continuation
@@ -204,6 +239,20 @@ Classify each highlighted route with exactly one label:
 - right_lane_change
 - straight
 - stop
+
+Also assign exactly one maneuver risk level for each route in this scene:
+- low
+- medium
+- high
+
+Risk-level guidance:
+- low = benign / compliant maneuver with little obvious safety-critical interaction
+- medium = meaningful interaction, tighter geometry, or some plausible safety concern
+- high = likely safety-critical maneuver, such as a restrictive-signal violation, tight conflict, or obviously dangerous interaction
+- This is risk of the maneuver in the shown scene context, not your confidence in the label.
+- Include a short `risk_rationale_short` for each highlighted path explaining why that maneuver may be risky in this scene.
+- Use nearby agents, their relative motion, and traffic-light context as primary evidence for risk.
+- Read nearby-agent black direction arrows as direction-of-travel cues when judging conflict and risk.
 
 Interpretation rules:
 - left / right = intersection turn maneuver
@@ -232,6 +281,8 @@ Required output behavior:
 - Produce one highlighted_paths entry for each slot_id: gt, alt_1, alt_2, alt_3.
 - For gt, source_kind must be ground_truth and path_id should be null.
 - For alt_1/alt_2/alt_3, source_kind must be sdc_path and path_id must match the metadata above.
+- Include risk_level for each highlighted path as one of: low, medium, high.
+- Include risk_rationale_short for each highlighted path as one short sentence.
 - Use confidence in [0, 1].
 - Set is_valid_target=false if a highlighted path is too weak / degenerate / not a meaningful maneuver target.
 """.strip()

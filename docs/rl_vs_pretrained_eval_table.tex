@@ -1,0 +1,56 @@
+% Paper-ready comparison table for pretrained Adv-BMT vs RL fine-tuned model.
+% Source metrics:
+% - pretrained all-labels diversity:
+%   /data/home/grads/jflashner/CounterBMT_run/eval_runs/top500_val400_alllabels_pretrainedlast_scenegrouped/
+%     0412_GPTmodel_top500_val400_alllabels_pretrainedlast_scenegrouped_multi_mode_open_loop_results.json
+% - RL all-labels diversity (epoch 59):
+%   /data/home/grads/jflashner/CounterBMT_run/eval_runs/top500_val400_alllabels_epoch59_scenegrouped/
+%     0412_GPTmodel_top500_val400_alllabels_epoch59_scenegrouped_multi_mode_open_loop_results.json
+% - pretrained GT-only clipped SDC realism:
+%   /data/home/grads/jflashner/CounterBMT_run/eval_runs/top500_val100_gt_pretrained_clipgtarc_fast_h200/
+%     aggregated_pretrained_clipgtarc_metrics.json
+% - RL GT-only clipped SDC realism (epoch 59):
+%   /data/home/grads/jflashner/CounterBMT_run/eval_runs/top500_val100_gt_epoch59_clipgtarc_fast_h200/
+%     aggregated_clipgtarc_metrics.json
+
+\begin{table*}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3.5pt}
+\renewcommand{\arraystretch}{0.95}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Metric} &
+\textbf{Pretrain} &
+\textbf{RL-All} &
+\textbf{RL-GT} \\
+&
+\textbf{400 rows} &
+\textbf{400 rows} &
+\textbf{100 rows} \\
+\midrule
+\multicolumn{4}{l}{\textit{Control-fair realism on GT-only split} (clipped SDC metrics; lower is better)} \\
+cADE $\downarrow$ & \textbf{0.90} & -- & 1.20 \\
+min-cADE $\downarrow$ & \textbf{0.32} & -- & 0.89 \\
+cFDE $\downarrow$ & 4.26 & -- & \textbf{2.84} \\
+min-cFDE $\downarrow$ & \textbf{1.47} & -- & 2.01 \\
+\midrule
+\multicolumn{4}{l}{\textit{All-label diversity metrics} (higher is better)} \\
+ADD $\uparrow$ & \textbf{4.77} & 3.52 & -- \\
+FDD $\uparrow$ & \textbf{11.44} & 10.13 & -- \\
+\midrule
+\multicolumn{4}{l}{\textit{Scene-grouped semantic diversity} (higher is better)} \\
+Scene ADD $\uparrow$ & 7.49 & \textbf{40.42} & -- \\
+Scene FDD $\uparrow$ & 20.20 & \textbf{87.46} & -- \\
+\bottomrule
+\end{tabular}
+\caption{
+Comparison of the original pretrained Adv-BMT checkpoint and the RL fine-tuned counterfactual-control model.
+For realism, we report GT-only clipped-SDC metrics, where the controlled SDC rollout is compared against ground truth only up to the GT-traveled arc length.
+For diversity, we report the all-label evaluation where each scene is queried with all semantic alternatives.
+Here, cADE/cFDE denote clipped SDC ADE/FDE.
+Under the clipped-SDC realism metric, pretrained Adv-BMT remains stronger on ADE-style matching, while the RL model achieves better clipped SDC FDE.
+At the same time, the RL model is dramatically more diverse across semantic alternatives at the scene level.
+}
+\label{tab:pretrained_vs_rl_eval}
+\end{table*}

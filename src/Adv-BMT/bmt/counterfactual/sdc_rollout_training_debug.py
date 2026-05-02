@@ -327,6 +327,15 @@ def write_rollout_tube_training_debug(
     scenario_pkl: str | None = None,
     current_time_index: int | None = None,
     sdc_id: str | None = None,
+    traffic_speed_penalty_t: Any | None = None,
+    traffic_speed_reference_t: Any | None = None,
+    traffic_speed_neighbor_mean_t: Any | None = None,
+    traffic_speed_neighbor_median_t: Any | None = None,
+    traffic_speed_floor_threshold_t: Any | None = None,
+    traffic_speed_cap_threshold_t: Any | None = None,
+    traffic_speed_cap_penalty_t: Any | None = None,
+    traffic_speed_sdc_t: Any | None = None,
+    traffic_speed_neighbor_count_t: Any | None = None,
     extra_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     outdir = Path(outdir).expanduser().resolve()
@@ -343,6 +352,27 @@ def write_rollout_tube_training_debug(
     action_logprob_arr = np.asarray(action_logprob_t, dtype=np.float32)
     tube_distance_arr = np.asarray(tube_distance_t, dtype=np.float32)
     valid_mask_arr = np.asarray(valid_mask_t, dtype=bool)
+    traffic_speed_penalty_arr = None if traffic_speed_penalty_t is None else np.asarray(traffic_speed_penalty_t, dtype=np.float32)
+    traffic_speed_reference_arr = None if traffic_speed_reference_t is None else np.asarray(traffic_speed_reference_t, dtype=np.float32)
+    traffic_speed_neighbor_mean_arr = (
+        None if traffic_speed_neighbor_mean_t is None else np.asarray(traffic_speed_neighbor_mean_t, dtype=np.float32)
+    )
+    traffic_speed_neighbor_median_arr = (
+        None if traffic_speed_neighbor_median_t is None else np.asarray(traffic_speed_neighbor_median_t, dtype=np.float32)
+    )
+    traffic_speed_floor_threshold_arr = (
+        None if traffic_speed_floor_threshold_t is None else np.asarray(traffic_speed_floor_threshold_t, dtype=np.float32)
+    )
+    traffic_speed_cap_threshold_arr = (
+        None if traffic_speed_cap_threshold_t is None else np.asarray(traffic_speed_cap_threshold_t, dtype=np.float32)
+    )
+    traffic_speed_cap_penalty_arr = (
+        None if traffic_speed_cap_penalty_t is None else np.asarray(traffic_speed_cap_penalty_t, dtype=np.float32)
+    )
+    traffic_speed_sdc_arr = None if traffic_speed_sdc_t is None else np.asarray(traffic_speed_sdc_t, dtype=np.float32)
+    traffic_speed_neighbor_count_arr = (
+        None if traffic_speed_neighbor_count_t is None else np.asarray(traffic_speed_neighbor_count_t, dtype=np.float32)
+    )
     current_xy = np.asarray(current_xy_world, dtype=np.float32).reshape(2)
     current_heading = float(current_heading_world)
 
@@ -364,6 +394,7 @@ def write_rollout_tube_training_debug(
     if total_return.size > 1:
         denom = max(float(total_return.std()), 1e-6)
         scalar_advantage = ((total_return - float(total_return.mean())) / denom).astype(np.float32)
+    valid_any = bool(np.any(valid_mask_arr))
 
     x_limits, y_limits = compute_auto_plot_limits(
         current_xy=current_xy,
@@ -550,6 +581,43 @@ def write_rollout_tube_training_debug(
                 "total_return": float(total_return[rollout_idx]),
                 "scalar_group_advantage": float(scalar_advantage[rollout_idx]),
                 "first_exit_step": (None if first_exit.size == 0 else int(first_exit[0])),
+                "traffic_speed_penalty_t": (
+                    None if traffic_speed_penalty_arr is None else traffic_speed_penalty_arr[rollout_idx].tolist()
+                ),
+                "traffic_speed_reference_t": (
+                    None if traffic_speed_reference_arr is None else traffic_speed_reference_arr[rollout_idx].tolist()
+                ),
+                "traffic_speed_neighbor_mean_t": (
+                    None
+                    if traffic_speed_neighbor_mean_arr is None
+                    else traffic_speed_neighbor_mean_arr[rollout_idx].tolist()
+                ),
+                "traffic_speed_neighbor_median_t": (
+                    None
+                    if traffic_speed_neighbor_median_arr is None
+                    else traffic_speed_neighbor_median_arr[rollout_idx].tolist()
+                ),
+                "traffic_speed_floor_threshold_t": (
+                    None
+                    if traffic_speed_floor_threshold_arr is None
+                    else traffic_speed_floor_threshold_arr[rollout_idx].tolist()
+                ),
+                "traffic_speed_cap_threshold_t": (
+                    None
+                    if traffic_speed_cap_threshold_arr is None
+                    else traffic_speed_cap_threshold_arr[rollout_idx].tolist()
+                ),
+                "traffic_speed_cap_penalty_t": (
+                    None
+                    if traffic_speed_cap_penalty_arr is None
+                    else traffic_speed_cap_penalty_arr[rollout_idx].tolist()
+                ),
+                "traffic_speed_sdc_t": (
+                    None if traffic_speed_sdc_arr is None else traffic_speed_sdc_arr[rollout_idx].tolist()
+                ),
+                "traffic_speed_neighbor_count_t": (
+                    None if traffic_speed_neighbor_count_arr is None else traffic_speed_neighbor_count_arr[rollout_idx].tolist()
+                ),
             }
         )
 
@@ -584,6 +652,36 @@ def write_rollout_tube_training_debug(
             "y_min": float(path_world_arr[:, 1].min()) if path_world_arr.size else 0.0,
             "y_max": float(path_world_arr[:, 1].max()) if path_world_arr.size else 0.0,
         },
+        "traffic_speed_penalty_mean": (
+            None
+            if traffic_speed_penalty_arr is None
+            else (float(np.mean(traffic_speed_penalty_arr[valid_mask_arr])) if valid_any else None)
+        ),
+        "traffic_speed_reference_mean": (
+            None
+            if traffic_speed_reference_arr is None
+            else (float(np.mean(traffic_speed_reference_arr[valid_mask_arr])) if valid_any else None)
+        ),
+        "traffic_speed_neighbor_median_mean": (
+            None
+            if traffic_speed_neighbor_median_arr is None
+            else (float(np.mean(traffic_speed_neighbor_median_arr[valid_mask_arr])) if valid_any else None)
+        ),
+        "traffic_speed_floor_threshold_mean": (
+            None
+            if traffic_speed_floor_threshold_arr is None
+            else (float(np.mean(traffic_speed_floor_threshold_arr[valid_mask_arr])) if valid_any else None)
+        ),
+        "traffic_speed_sdc_mean": (
+            None
+            if traffic_speed_sdc_arr is None
+            else (float(np.mean(traffic_speed_sdc_arr[valid_mask_arr])) if valid_any else None)
+        ),
+        "traffic_speed_neighbor_count_mean": (
+            None
+            if traffic_speed_neighbor_count_arr is None
+            else (float(np.mean(traffic_speed_neighbor_count_arr[valid_mask_arr])) if valid_any else None)
+        ),
         "rollouts": rollouts,
     }
     if extra_summary:

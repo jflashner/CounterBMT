@@ -3,8 +3,11 @@ import hydra
 import matplotlib.pyplot as plt
 import numpy as np
 import omegaconf
-import seaborn as sns
-from matplotlib.animation import FFMpegWriter
+try:
+    import seaborn as sns  # type: ignore
+except Exception:  # pragma: no cover - plotting-only optional dependency
+    sns = None
+from matplotlib.animation import FFMpegWriter, PillowWriter
 from matplotlib.patches import Polygon, Circle, Rectangle
 
 from bmt.dataset.dataset import InfgenDataset
@@ -20,6 +23,13 @@ NON_EGO_FONT_SIZE = 12
 
 
 
+def _color_palette(name, *, n_colors):
+    if sns is not None:
+        return sns.color_palette(name, n_colors=n_colors)
+    cmap = plt.get_cmap("tab20")
+    return [cmap(i % max(1, cmap.N)) for i in range(int(n_colors))]
+
+
 def get_limit(agent_pos, map_pos):
     assert agent_pos.shape[-1] == 2
     assert map_pos.shape[-1] == 2
@@ -33,6 +43,22 @@ def get_limit(agent_pos, map_pos):
     ymin = max(aymin, mymin) - BOUNDARY
     xmax = min(axmax, mxmax) + BOUNDARY
     ymax = min(aymax, mymax) + BOUNDARY
+    return {"xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax}
+
+
+def get_union_limit(agent_pos, map_pos, boundary=BOUNDARY):
+    assert agent_pos.shape[-1] == 2
+    assert map_pos.shape[-1] == 2
+    agent_pos = agent_pos.reshape(-1, 2)
+    map_pos = map_pos.reshape(-1, 2)
+    axmin, aymin = tuple(agent_pos.min(0))
+    axmax, aymax = tuple(agent_pos.max(0))
+    mxmin, mymin = tuple(map_pos.min(0))
+    mxmax, mymax = tuple(map_pos.max(0))
+    xmin = min(axmin, mxmin) - boundary
+    ymin = min(aymin, mymin) - boundary
+    xmax = max(axmax, mxmax) + boundary
+    ymax = max(aymax, mymax) + boundary
     return {"xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax}
 
 
@@ -278,7 +304,7 @@ def _plot_gt(data_dict, ax, draw_line=False, draw_text=True, ooi=None, draw_map=
 
         modeled_agents_indicies = np.concatenate([data_dict["decoder/object_of_interest_id"], np.atleast_1d(ego_agent_id)])
 
-        cmap = sns.color_palette("colorblind", n_colors=N)
+        cmap = _color_palette("colorblind", n_colors=N)
         plotted_count = 0
 
         draw_trajectory(
@@ -415,7 +441,7 @@ def plot_pred(data_dict, show=False, save_path=None, ooi=None):
     else:
         modeled_agents_indicies = []
 
-    cmap = sns.color_palette("colorblind", n_colors=N)
+    cmap = _color_palette("colorblind", n_colors=N)
     plotted_count = 0
     draw_trajectory(
         ax=ax,
@@ -494,7 +520,16 @@ def plot_pred(data_dict, show=False, save_path=None, ooi=None):
 
 
 def _animate(
-    save_path, agent_pos, agent_heading, agent_mask, agent_shape, data_dict, fps=10, dpi=300, draw_traffic=True
+    save_path,
+    agent_pos,
+    agent_heading,
+    agent_mask,
+    agent_shape,
+    data_dict,
+    fps=10,
+    dpi=300,
+    draw_traffic=True,
+    full_scene_view=False,
 ):
     # TODO: Agent mask is not considered.
 
@@ -515,14 +550,33 @@ def _animate(
     T = agent_pos.shape[0]  # Number of timesteps
     N = agent_pos.shape[1]  # Number of agents
 
-    cmap = sns.color_palette("colorblind", n_colors=N)  # Color for each agent
+    cmap = _color_palette("colorblind", n_colors=N)  # Color for each agent
 
-    all_agent_positions = agent_pos[:, :, ...].reshape(-1, 2)
-    xmin, ymin = all_agent_positions.min(axis=0)
-    xmax, ymax = all_agent_positions.max(axis=0)
-    xlim, ylim = (xmin - 10, xmax + 10), (ymin - 10, ymax + 10)  # Adjust `BOUNDARY` as needed
+    valid_agent_positions = agent_pos[agent_mask]
+    if valid_agent_positions.size == 0:
+        valid_agent_positions = agent_pos[:, :, ...].reshape(-1, 2)
 
-    writer = FFMpegWriter(fps=fps, codec='libx264', extra_args=['-preset', 'ultrafast', '-crf', '23', '-threads', '4'])
+    valid_map_positions = data_dict["vis/map_feature"][:, :, :2][data_dict["encoder/map_feature_valid_mask"]]
+    if valid_map_positions.size == 0:
+        valid_map_positions = valid_agent_positions
+
+    if bool(full_scene_view):
+        limit = get_union_limit(valid_agent_positions, valid_map_positions)
+    else:
+        xmin, ymin = valid_agent_positions.min(axis=0)
+        xmax, ymax = valid_agent_positions.max(axis=0)
+        limit = {"xmin": xmin - 10, "xmax": xmax + 10, "ymin": ymin - 10, "ymax": ymax + 10}
+    xlim, ylim = (limit["xmin"], limit["xmax"]), (limit["ymin"], limit["ymax"])
+
+    save_path_str = str(save_path)
+    if save_path_str.lower().endswith(".gif"):
+        writer = PillowWriter(fps=fps)
+    else:
+        writer = FFMpegWriter(
+            fps=fps,
+            codec='libx264',
+            extra_args=['-preset', 'ultrafast', '-crf', '23', '-threads', '4'],
+        )
     fig, ax = plt.subplots(figsize=(10, 10), dpi=dpi)
     ax.set_aspect(1)
     ax.set_xlim(xlim)
@@ -585,7 +639,14 @@ def _animate(
             writer.grab_frame()
 
 
-def create_animation_from_gt(data_dict, save_path='gt_animation.mp4', fps=10, dpi=300, draw_traffic=True):
+def create_animation_from_gt(
+    data_dict,
+    save_path='gt_animation.mp4',
+    fps=10,
+    dpi=300,
+    draw_traffic=True,
+    full_scene_view=False,
+):
     _animate(
         save_path=save_path,
         agent_pos=data_dict["decoder/agent_position"][:91, :, :2],
@@ -596,13 +657,21 @@ def create_animation_from_gt(data_dict, save_path='gt_animation.mp4', fps=10, dp
         dpi=dpi,
         draw_traffic=draw_traffic,
         fps=fps,
+        full_scene_view=full_scene_view,
     )
-    print(f"MP4 video saved at {save_path}")
+    print(f"Animation saved at {save_path}")
     plt.close()
     return save_path
 
 
-def create_animation_from_pred(data_dict, save_path='pred_animation.mp4', fps=10, dpi=300, draw_traffic=True):
+def create_animation_from_pred(
+    data_dict,
+    save_path='pred_animation.mp4',
+    fps=10,
+    dpi=300,
+    draw_traffic=True,
+    full_scene_view=False,
+):
     all_agent_shape = data_dict["decoder/current_agent_shape"]
     _animate(
         save_path=save_path,
@@ -614,8 +683,9 @@ def create_animation_from_pred(data_dict, save_path='pred_animation.mp4', fps=10
         dpi=dpi,
         draw_traffic=draw_traffic,
         fps=fps,
+        full_scene_view=full_scene_view,
     )
-    print(f"MP4 video saved at {save_path}")
+    print(f"Animation saved at {save_path}")
     plt.close()
     return save_path
 
@@ -729,4 +799,3 @@ def run_forward_prediction_with_teacher_forcing(model, config, forward_input_dic
         forward_output_dict, detokenizing_gt=False, backward_prediction=False, flip_wrong_heading=True
     )
     return forward_output_dict
-

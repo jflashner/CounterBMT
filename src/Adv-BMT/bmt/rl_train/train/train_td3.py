@@ -1,7 +1,9 @@
 import argparse
 import os
 import random
+import sys
 import time
+import types
 from collections import defaultdict
 from typing import List, Optional, Tuple, Union
 
@@ -13,6 +15,12 @@ from IPython.display import clear_output
 from metadrive.envs.scenario_env import ScenarioEnv
 from metadrive.policy.env_input_policy import EnvInputPolicy
 from metadrive.scenario.utils import get_number_of_scenarios
+
+# Force TensorBoard to use its no-TensorFlow stub. In this legacy env, importing
+# the real TensorFlow runtime through torch.utils.tensorboard can segfault before
+# TD3 even reaches our own code.
+sys.modules.setdefault("tensorboard.compat.notf", types.ModuleType("tensorboard.compat.notf"))
+
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.evaluation import evaluate_policy
@@ -432,7 +440,6 @@ def train(
     assert seed is not None
     assert num_eval_envs is not None
     set_seed(seed)
-    train_env = DummyVecEnv([lambda: create_env(config_train, True)])  # use only one training environment
     save_prefix = f"seed_{seed}"
     callbacks = []
     checkpoint_callback = CheckpointCallback(save_freq=50000, save_path=save_path, name_prefix=save_prefix)
@@ -454,7 +461,13 @@ def train(
         callbacks.append(wandb_callback)
         callbacks.append(wandb_loss_callback)
 
-    eval_env = SubprocVecEnv([lambda: create_eval_env(config_eval) for _ in range(num_eval_envs)])
+    # Keep eval in separate spawned processes so MetaDrive's global engine
+    # initialization does not collide with the training env in the parent process.
+    eval_env = SubprocVecEnv(
+        [lambda: create_eval_env(config_eval) for _ in range(num_eval_envs)],
+        start_method="spawn",
+    )
+    train_env = DummyVecEnv([lambda: create_env(config_train, True)])  # use only one training environment
 
     eval_callback = CustomizedFormalevalCallback(
         eval_env,
@@ -469,43 +482,49 @@ def train(
     callbacks.append(checkpoint_callback)
     callbacks.append(eval_callback)
 
-    if load_model_path:
-        model = CustomizedTD3.load(load_model_path, env=train_env)
-        print(f"Resuming training from model at {load_model_path}")
+    try:
+        if load_model_path:
+            model = CustomizedTD3.load(load_model_path, env=train_env)
+            print(f"Resuming training from model at {load_model_path}")
 
-        trained_steps = int(model.num_timesteps)
+            trained_steps = int(model.num_timesteps)
 
-        remaining_steps = training_steps - trained_steps
-        print(f"Resuming from {trained_steps} steps; training for {remaining_steps} more steps.")
+            remaining_steps = training_steps - trained_steps
+            print(f"Resuming from {trained_steps} steps; training for {remaining_steps} more steps.")
+
+            model.learn(
+                total_timesteps=remaining_steps,
+                reset_num_timesteps=False,  # Important: continue counting from previous steps
+                callback=callbacks,
+            )
+
+        else:
+            model = CustomizedTD3("MlpPolicy",
+                                  train_env,
+                                  action_noise=None,
+                                  learning_rate=lr,
+                                  learning_starts=200,
+                                  batch_size=1024,
+                                  tau=0.005,
+                                  gamma=0.99,
+                                  train_freq=1,
+                                  gradient_steps=1,
+                                  device="cuda",
+                                  seed=seed,
+                                  verbose=2,
+                                  tensorboard_log="TD3",
+                                  )
+            print("Starting new training...")
 
         model.learn(
-            total_timesteps=remaining_steps,
-            reset_num_timesteps=False,  # Important: continue counting from previous steps
+            total_timesteps=training_steps,
             callback=callbacks,
         )
-
-    else:
-        model = CustomizedTD3("MlpPolicy",
-                              train_env,
-                              action_noise=None,
-                              learning_rate=lr,
-                              learning_starts=200,
-                              batch_size=1024,
-                              tau=0.005,
-                              gamma=0.99,
-                              train_freq=1,
-                              gradient_steps=1,
-                              device="cuda",
-                              seed=seed,
-                              verbose=2,
-                              tensorboard_log="TD3",
-                              )
-        print("Starting new training...")
-
-    model.learn(
-        total_timesteps=training_steps,
-        callback=callbacks,
-    )
+    finally:
+        try:
+            eval_env.close()
+        finally:
+            train_env.close()
 
     clear_output()
 
@@ -519,8 +538,6 @@ def closed_loop_train(
     assert eval_ep is not None
     set_seed(seed)
 
-    train_env = create_env(config_train, need_monitor=True, closed_loop=True,
-                           closed_loop_generator=closed_loop_generator, model_name=model_name, no_adaptive=no_adaptive)
     save_prefix = f"seed_{seed}"
 
     checkpoint_callback = CheckpointCallback(save_freq=50000, save_path=save_path, name_prefix=save_prefix)
@@ -558,7 +575,12 @@ def closed_loop_train(
         callbacks.append(wandb_callback)
 
     # eval_env = None
-    eval_env = SubprocVecEnv([(lambda: create_eval_env(config_eval)) for _ in range(num_eval_envs)])
+    eval_env = SubprocVecEnv(
+        [(lambda: create_eval_env(config_eval)) for _ in range(num_eval_envs)],
+        start_method="spawn",
+    )
+    train_env = create_env(config_train, need_monitor=True, closed_loop=True,
+                           closed_loop_generator=closed_loop_generator, model_name=model_name, no_adaptive=no_adaptive)
 
     if eval_env is not None:
         eval_callback = CustomizedFormalevalCallback(
@@ -574,43 +596,49 @@ def closed_loop_train(
 
     callbacks.append(checkpoint_callback)
 
-    if load_model_path:
-        model = Closed_Loop_TD3.load(load_model_path, env=train_env)
-        print(f"Resuming training from model at {load_model_path}")
+    try:
+        if load_model_path:
+            model = Closed_Loop_TD3.load(load_model_path, env=train_env)
+            print(f"Resuming training from model at {load_model_path}")
 
-        trained_steps = int(model.num_timesteps)
-        remaining_steps = training_steps - trained_steps
-        print(f"Resuming from {trained_steps} steps; training for {remaining_steps} more steps.")
+            trained_steps = int(model.num_timesteps)
+            remaining_steps = training_steps - trained_steps
+            print(f"Resuming from {trained_steps} steps; training for {remaining_steps} more steps.")
 
-        model.learn(
-            total_timesteps=remaining_steps,
-            reset_num_timesteps=False,  # Important: continue counting from previous steps
-            callback=callbacks,
-        )
+            model.learn(
+                total_timesteps=remaining_steps,
+                reset_num_timesteps=False,  # Important: continue counting from previous steps
+                callback=callbacks,
+            )
 
-    else:
-        model = Closed_Loop_TD3("MlpPolicy",
-                                train_env,
-                                action_noise=None,
-                                learning_rate=lr,
-                                learning_starts=200,
-                                batch_size=1024,
-                                tau=0.005,
-                                gamma=0.99,
-                                train_freq=1,
-                                gradient_steps=1,
-                                device="cuda",
-                                seed=seed,
-                                verbose=2,
-                                tensorboard_log=str(save_path),
-                                training_dataset=source_data
-                                )
-        print("Starting new training...")
+        else:
+            model = Closed_Loop_TD3("MlpPolicy",
+                                    train_env,
+                                    action_noise=None,
+                                    learning_rate=lr,
+                                    learning_starts=200,
+                                    batch_size=1024,
+                                    tau=0.005,
+                                    gamma=0.99,
+                                    train_freq=1,
+                                    gradient_steps=1,
+                                    device="cuda",
+                                    seed=seed,
+                                    verbose=2,
+                                    tensorboard_log=str(save_path),
+                                    training_dataset=source_data
+                                    )
+            print("Starting new training...")
 
-        model.learn(
-            total_timesteps=training_steps,
-            callback=callbacks,
-        )
+            model.learn(
+                total_timesteps=training_steps,
+                callback=callbacks,
+            )
+    finally:
+        try:
+            eval_env.close()
+        finally:
+            train_env.close()
 
     clear_output()
 

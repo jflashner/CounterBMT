@@ -20,6 +20,40 @@ Examples assume:
 
 If your env differs, replace the Python executable path.
 
+## Counterfactual Utilities
+
+### `scripts/counterfactual/render_sdc_semantic_animation_examples.py`
+
+What it does:
+- renders multi-agent GIFs for SDC semantic-control validation rows
+- now also supports arbitrary-agent semantic probe cases through `--non-sdc-cases-json`
+
+Key modes:
+- SDC validation index mode:
+  - `--control-index`
+  - `--data-dir`
+  - `--num-scenes`
+- non-SDC arbitrary-agent mode:
+  - `--non-sdc-cases-json`
+  - each case supplies:
+    - `scenario_pkl`
+    - `agent_id`
+    - `semantic_label`
+    - optional `start_step`, `end_step`, `semantic_confidence`, `case_name`
+
+Non-SDC mode notes:
+- now uses the same evaluation-style `preprocess_GPTmodel(...)` + `GPT_AR(..., teacher_forcing=False)` stack as the SDC semantic GIF path
+- default control window is full horizon when `end_step` is omitted or negative
+
+Outputs:
+- SDC mode:
+  - one ground-truth GIF plus one predicted GIF per slot
+- non-SDC mode:
+  - one reference GIF
+  - one baseline-rollout GIF
+  - one controlled-rollout GIF
+  - per-case manifest entry
+
 ## 1) Supervised Training (Base v2)
 
 Command:
@@ -644,7 +678,334 @@ uvx --python 3.10 \
 
 See also: `docs/training_tensorboard.md`.
 
-## 11) Most Common End-to-End Workflows
+## 11) Legacy Counterfactual Probe Utilities
+
+These utilities are useful when we want to inspect or debug the legacy
+`src/Adv-BMT` counterfactual stack without launching a full training run.
+
+### 11.1 Arbitrary-Agent Semantic Rollout Probe
+
+Command:
+- `python scripts/counterfactual/probe_agent_semantic_rollout.py`
+
+What it does:
+- loads a single raw scenario pickle
+- preprocesses it into the legacy semantic-only model format
+- selects an arbitrary modeled agent via `--agent-id`
+- applies a semantic label to that agent with a controlled time window
+- runs both:
+  - a baseline rollout
+  - a controlled rollout
+- exports a small debug bundle:
+  - `summary.json`
+  - `trajectories.npz`
+  - `overlay.png`
+  - `victim_centric_overlay.png`
+- can also:
+  - default the victim to the scene SDC
+  - auto-select a likely victim agent when `--victim-agent-id auto`
+  - export a replayable victim-centric ground-truth/counterfactual scenario pair
+  - create a MetaDrive/ScenarioNet replay script for that pair
+  - dump a debug trace with:
+    - preprocessed `cf/*` control tensors
+    - runtime control-kind / control-available signals
+    - first-step top logits for the targeted agent
+    - optional SDC-vs-non-SDC comparison on the same scene
+
+This is the safest first tool for victim-centric work because it lets us test
+"can we intervene on a non-SDC actor with a semantic label?" before we build
+the full scenario exporter.
+
+Example:
+
+```bash
+PYTHONPATH=src/Adv-BMT .venv-mac/bin/python \
+  scripts/counterfactual/probe_agent_semantic_rollout.py \
+  --scenario-pkl outputs/pr10_1_sdc_semantic_top859_full/scenario_root/sd_waymo_v1.3.1_waymax_scene_00618.pkl \
+  --ckpt /data/home/grads/jflashner/CounterBMT_run/logs/pr10_1_top500_actualwall_progresssoft_4gpu_h200_run3/lightning_logs/infgen/pr10_1_top500_actualwall_progresssoft_4gpu_h200_2026-04-10/checkpoints/last.ckpt \
+  --config src/Adv-BMT/cfgs/motion_forward_sdc_semantic_only_progresssoft_topomcpo_dag_trafficcap.yaml \
+  --agent-id 2948 \
+  --semantic-label left \
+  --semantic-confidence 1.0 \
+  --start-step 0 \
+  --end-step 15 \
+  --rollout-sampling-method argmax \
+  --outdir outputs/debug_probe_agent_semantic_rollout_scene618_agent2948_left
+```
+
+Victim-centric export example:
+
+```bash
+PYTHONPATH=src/Adv-BMT .venv-mac/bin/python \
+  scripts/counterfactual/probe_agent_semantic_rollout.py \
+  --scenario-pkl outputs/pr10_1_sdc_semantic_top859_full/scenario_root/sd_waymo_v1.3.1_waymax_scene_00618.pkl \
+  --ckpt outputs/remote_checkpoints/pr10_1_semantic_only_sdc_top859_overnight_1gpu_run2/last.ckpt \
+  --config src/Adv-BMT/cfgs/motion_forward_sdc_semantic_only_progresssoft_topomcpo_dag_trafficcap.yaml \
+  --agent-id 1430 \
+  --victim-agent-id auto \
+  --semantic-label left \
+  --semantic-confidence 1.0 \
+  --start-step 0 \
+  --end-step 15 \
+  --rollout-sampling-method argmax \
+  --export-victim-centric \
+  --outdir outputs/debug_probe_agent_semantic_rollout_victim_export
+```
+
+Debug-trace example:
+
+```bash
+PYTHONPATH=src/Adv-BMT .venv-mac/bin/python \
+  scripts/counterfactual/probe_agent_semantic_rollout.py \
+  --scenario-pkl outputs/pr10_1_sdc_semantic_top859_full/scenario_root/sd_waymo_v1.3.1_waymax_scene_00057.pkl \
+  --ckpt /data/home/grads/jflashner/CounterBMT_run/logs/pr10_1_top500_actualwall_progresssoft_4gpu_h200_run3/lightning_logs/infgen/pr10_1_top500_actualwall_progresssoft_4gpu_h200_2026-04-10/checkpoints/last.ckpt \
+  --config src/Adv-BMT/cfgs/motion_forward_sdc_semantic_only_strict_local.yaml \
+  --agent-id 1205 \
+  --semantic-label left \
+  --compare-label stop \
+  --compare-label right \
+  --start-step 0 \
+  --end-step -1 \
+  --rollout-sampling-method argmax \
+  --debug-trace \
+  --debug-compare-sdc \
+  --outdir outputs/debug_probe_agent_semantic_rollout_trace_scene57
+```
+
+Useful outputs:
+- `summary.json`
+- `debug_trace.json`
+
+### `scripts/agent_eval/build_victim_centric_table4_dataset.py`
+
+What it does:
+- builds the first offline victim-centric train/val dataset for Table 4 style RL
+- uses the corrected arbitrary-agent semantic rollout path from
+  `probe_agent_semantic_rollout.py`
+- keeps the SDC as victim/ego by default
+- chooses one non-SDC adversary intervention per base scene
+- exports paired:
+  - natural scenarios
+  - adversarial victim-centric scenarios
+- creates MetaDrive-compatible dataset summaries and JSON manifests
+
+Core inputs:
+- `--control-index`
+- `--scenario-root`
+- `--ckpt`
+- `--config`
+- `--outdir`
+
+Important controls:
+- `--num-scenes`
+- `--scene-offset`
+- repeated `--semantic-label`
+- `--max-adversary-candidates`
+- `--min-moving-speed-mps`
+- `--max-distance-to-sdc-m`
+- `--min-final-position-delta-m`
+- `--min-changed-action-steps`
+
+Notes:
+- this is the right next step once non-SDC interventions are working
+- it is intended to produce the offline augmented scenario bank before TD3 training
+- the exporter functions themselves do not run rollout logic; they serialize the
+  adversary trajectory generated by the corrected probe/eval stack
+
+### `scripts/agent_eval/prepare_td3_table4_views.py`
+
+What it does:
+- builds TD3-ready ScenarioNet directory views from the offline natural and
+  adversarial victim-centric banks
+- matches scenarios by source `waymax_scene_*` id
+- creates:
+  - `train_waymo_only`
+  - `train_counterbmt_mixed`
+  - `eval_waymo_only`
+  - `eval_counterbmt_adversarial`
+- writes a manifest with the selected scene ids and the suggested TD3 dataset
+  paths
+
+Core inputs:
+- `--train-natural-dir`
+- `--train-adversarial-dir`
+- `--val-natural-dir`
+- `--val-adversarial-dir`
+- `--outdir`
+
+Important controls:
+- `--target-train-pairs`
+- `--target-val-pairs`
+- `--shuffle-scenes`
+- `--selection-seed`
+- `--link-mode`
+
+Notes:
+- this is the clean bridge from the offline victim-centric banks into
+  `train_td3.py`
+- when fewer paired exports are available than requested, it clips to the
+  available pair count deterministically
+
+### `scripts/agent_eval/migrate_victim_centric_bank.py`
+
+What it does:
+- migrates an already-exported victim-centric natural/adversarial bank into
+  MetaDrive-compatible ScenarioNet schema
+- repairs older banks that were written before the ScenarioNet schema fix
+- rewrites:
+  - top-level `version`
+  - map feature polygon/point fields
+  - fresh `dataset_summary.pkl`
+  - fresh `dataset_mapping.pkl`
+- writes a `migration_report.json` with before/after counts
+
+Core inputs:
+- `--source-root`
+- `--outdir`
+
+Useful optional controls:
+- `--max-scenarios-per-dir`
+- `--copy-scene-analysis`
+- `--overwrite`
+
+Notes:
+- this is the fastest repair path when intervention generation was already
+  correct and only the ScenarioNet serialization was wrong
+- use this before rebuilding TD3 views if the original bank predates the schema
+  normalization fix
+
+Example:
+
+```bash
+PYTHONPATH=src python scripts/agent_eval/migrate_victim_centric_bank.py \
+  --source-root /data/home/grads/jflashner/CounterBMT_run/eval_runs/victim_centric_table4_train500_fullindex_zh2_20260418 \
+  --outdir /data/home/grads/jflashner/CounterBMT_run/eval_runs/victim_centric_table4_train500_migrated_zh2_20260419 \
+  --overwrite
+```
+
+### `scripts/agent_eval/watch_remote_build_progress.py`
+
+What it does:
+- polls remote build directories or TD3 run directories over SSH and renders a
+  live in-place terminal view locally
+- shows:
+  - for build roots:
+    - completed scenes
+    - skip count
+    - natural/adversarial scenario counts
+    - `screen` liveness
+    - active builder process count
+  - for TD3 roots:
+    - latest `total_timesteps`
+    - `ep_rew_mean`
+    - `ep_len_mean`
+    - `fps`
+    - checkpoint count and latest checkpoint step
+    - `screen` liveness
+    - active TD3 process count
+
+Useful optional controls:
+- `--interval`
+- `--once`
+- repeated `--run`
+
+Run spec format:
+- `label|host|screen_name|remote_root|target_total`
+
+Notes:
+- if no `--run` is provided, it defaults to the current paper-faithful
+  Adv-BMT TD3 run on `zhoulab-1`
+- this is meant to be run locally from your terminal, not on the remote host
+
+Examples:
+
+```bash
+python scripts/agent_eval/watch_remote_build_progress.py
+```
+
+```bash
+python scripts/agent_eval/watch_remote_build_progress.py --once
+```
+
+```bash
+python scripts/agent_eval/watch_remote_build_progress.py \
+  --run 'advbmt-td3|zhoulab-1.cs.vt.edu|td3_advbmt_paperfaithful_seed0|/data/home/grads/jflashner/CounterBMT_run/logs/td3_table4_runs/td3_table4_advbmt_paperfaithful_train476_eval_natural_seed0|1000000'
+```
+
+```bash
+python scripts/agent_eval/watch_remote_build_progress.py \
+  --run 'train|zhoulab-1.cs.vt.edu|advbmt_train476_20260419|/data/home/grads/jflashner/CounterBMT_run/eval_runs/advbmt_paperfaithful_train476_zh1_20260419|476' \
+  --run 'val|zhoulab-1.cs.vt.edu|advbmt_val95_20260419|/data/home/grads/jflashner/CounterBMT_run/eval_runs/advbmt_paperfaithful_val95_zh1_20260419|95'
+```
+
+### `scripts/remote/run_td3_table4_openloop.sh`
+
+What it does:
+- launches the legacy open-loop TD3 trainer on a TD3-ready ScenarioNet dataset
+- uses `train_td3.py` without the closed-loop online generators
+
+Required environment variables:
+- `DATA_DIR`
+- `EVAL_DATA_DIR`
+
+Useful optional environment variables:
+- `REPO_ROOT`
+- `PYTHON_BIN`
+- `SAVE_ROOT`
+- `EXP_NAME`
+- `TRAINING_STEPS`
+- `EVAL_FREQ`
+- `EVAL_EP`
+- `WANDB_PROJECT`
+- `WANDB_TEAM`
+
+Example:
+
+```bash
+DATA_DIR=/path/to/train_counterbmt_mixed \
+EVAL_DATA_DIR=/path/to/eval_waymo_only \
+EXP_NAME=td3_counterbmt_victim \
+scripts/remote/run_td3_table4_openloop.sh 0
+```
+
+### `scripts/remote/run_td3_table4_train500_zh2.sh`
+
+What it does:
+- launches the concrete Table 4-style open-loop TD3 rows against the prepared
+  TD3 view bank on the shared remote tree
+- wraps `run_td3_table4_openloop.sh` so we only choose:
+  - `ROW=waymo` or `ROW=counterbmt`
+  - `EVAL_SPLIT=natural` or `EVAL_SPLIT=adversarial`
+
+Defaults:
+- `ROW=waymo`
+- `EVAL_SPLIT=natural`
+
+Examples:
+
+```bash
+ROW=waymo EVAL_SPLIT=natural scripts/remote/run_td3_table4_train500_zh2.sh 0
+ROW=counterbmt EVAL_SPLIT=natural scripts/remote/run_td3_table4_train500_zh2.sh 0
+ROW=counterbmt EVAL_SPLIT=adversarial scripts/remote/run_td3_table4_train500_zh2.sh 0
+```
+
+### `scripts/remote/run_pr10_progresssoft_topomcpo_dag_trafficcap_progresson_zh2.sh`
+
+What it does:
+- launches the progresssoft warm-start continuation on `zhoulab-2`
+- keeps the loose traffic-speed cap
+- keeps stall penalty disabled
+- restores the old positive tube progress reward under semantic-ext through
+  `LOCAL_CONTROL_SDC_SEMANTIC_EXT_ALLOW_PROGRESS_REWARD=true`
+
+Primary preset:
+- `src/Adv-BMT/cfgs/motion_forward_sdc_semantic_only_progresssoft_topomcpo_dag_trafficcap_progresson.yaml`
+
+Use this when:
+- the plain semantic-ext traffic-cap run starts collapsing to near-zero speed
+- you want the old progresssoft forward incentive back without removing the cap
+
+## 12) Most Common End-to-End Workflows
 
 ### A) Base model full training
 1. `train_nnx_bmt` with explicit train/val dirs.

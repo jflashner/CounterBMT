@@ -319,6 +319,7 @@ def preprocess_raw_scenario_for_forward_supervision(
     raw_scenario: Mapping[str, Any],
     *,
     config: Any,
+    in_evaluation: bool = False,
 ) -> Dict[str, Any]:
     _ensure_runtime_imports()
     from bmt.dataset.preprocessor import preprocess_scenario_description
@@ -356,7 +357,7 @@ def preprocess_raw_scenario_for_forward_supervision(
     return preprocess_scenario_description(
         scenario=scenario_copy,
         config=copy.deepcopy(config),
-        in_evaluation=False,
+        in_evaluation=bool(in_evaluation),
         keep_all_data=True,
         backward_prediction=False,
         tokenizer=tokenizer,

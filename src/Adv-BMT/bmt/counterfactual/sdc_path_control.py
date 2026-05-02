@@ -29,6 +29,7 @@ SDC_PATH_SEMANTIC_LABEL_ORDER = (
     "right_lane_change",
     "straight",
     "stop",
+    "no_intervention",
 )
 SDC_PATH_SEMANTIC_LABEL_TO_ID = {
     label: idx for idx, label in enumerate(SDC_PATH_SEMANTIC_LABEL_ORDER)
@@ -72,6 +73,8 @@ def sanitize_resampled_local_path(path: ResampledLocalPath) -> ResampledLocalPat
 
 def normalize_semantic_label(value: Any, *, default: str = "straight") -> str:
     text = str(value or "").strip().lower()
+    if text in {"none", "no_intervention", "no intervention", "noop", "no_op", "no-op"}:
+        return "no_intervention"
     if text in SDC_PATH_SEMANTIC_LABEL_TO_ID:
         return text
     return str(default)

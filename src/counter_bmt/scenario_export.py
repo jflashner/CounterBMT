@@ -30,6 +30,309 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+POLYGON_FEATURE_TYPES = {"CROSSWALK", "SPEED_BUMP", "DRIVEWAY"}
+
+
+def _normalize_track_name(value: Any) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+    if isinstance(value, np.generic):
+        value = value.item()
+    return "" if value is None else str(value)
+
+
+def _infer_track_length(scenario: Dict[str, Any]) -> int:
+    tracks = dict(scenario.get("tracks", {}))
+    if not tracks:
+        return 0
+    first_track = next(iter(tracks.values()))
+    position = np.asarray(first_track.get("state", {}).get("position", []))
+    if position.ndim == 0:
+        return 0
+    return int(position.shape[0])
+
+
+def _is_waymax_reconstructed_scenario(scenario: Dict[str, Any]) -> bool:
+    metadata = dict(scenario.get("metadata", {}))
+    if str(metadata.get("source_format", "")).strip() == "waymax_womd":
+        return True
+    scenario_id = str(scenario.get("id") or metadata.get("scenario_id") or "").strip()
+    return scenario_id.startswith("waymax_scene_")
+
+
+def _normalize_waymax_map_features(map_features: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    for feature_id, feature in dict(map_features).items():
+        if not isinstance(feature, dict):
+            normalized[str(feature_id)] = copy.deepcopy(feature)
+            continue
+        item = copy.deepcopy(feature)
+        item.pop("metadata", None)
+        feature_type = str(item.get("type") or "").strip()
+        polyline = item.get("polyline")
+        polyline_np = None
+        if polyline is not None:
+            polyline_np = np.asarray(polyline, dtype=np.float32)
+            item["polyline"] = polyline_np
+        if feature_type == "ROADGRAPH_TYPE_20":
+            item["type"] = "DRIVEWAY"
+            feature_type = "DRIVEWAY"
+        if feature_type in POLYGON_FEATURE_TYPES and polyline_np is not None and polyline_np.size > 0:
+            item["polygon"] = np.asarray(polyline_np, dtype=np.float32)
+            item.pop("polyline", None)
+        if feature_type == "STOP_SIGN" and polyline_np is not None and polyline_np.size > 0:
+            item["position"] = np.asarray(polyline_np[0], dtype=np.float32)
+            item.setdefault("lane", [])
+            item.pop("polyline", None)
+        normalized[str(feature_id)] = item
+    return normalized
+
+
+def _is_waymax_placeholder_track(track_id: Any, track: Any) -> bool:
+    if not isinstance(track, dict):
+        return False
+    track_name = _normalize_track_name(track_id)
+    metadata = dict(track.get("metadata", {}))
+    raw_object_type = metadata.get("raw_object_type_id", None)
+    state = dict(track.get("state", {}))
+    valid = np.asarray(state.get("valid", []), dtype=bool).reshape(-1)
+
+    try:
+        if int(track_name) < 0:
+            return True
+    except Exception:
+        pass
+    try:
+        if raw_object_type is not None and int(raw_object_type) < 0:
+            return True
+    except Exception:
+        pass
+    if valid.size == 0 or not bool(np.any(valid)):
+        return True
+    return False
+
+
+def _normalize_waymax_tracks(tracks: Dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    for track_id, track in dict(tracks).items():
+        if _is_waymax_placeholder_track(track_id, track):
+            continue
+        normalized[_normalize_track_name(track_id)] = copy.deepcopy(track)
+    return normalized
+
+
+def _normalize_waymax_source_scenario(
+    *,
+    scenario: Dict[str, Any],
+    original_file_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    scenario = copy.deepcopy(scenario)
+    track_length = _infer_track_length(scenario)
+    scenario_id = str(scenario.get("id") or scenario.get("metadata", {}).get("scenario_id") or "").strip()
+    scenario["id"] = scenario_id
+    scenario["version"] = str(scenario.get("version") or "v1.2")
+    scenario["length"] = int(scenario.get("length") or track_length)
+    scenario["tracks"] = _normalize_waymax_tracks(dict(scenario.get("tracks", {})))
+    scenario["map_features"] = _normalize_waymax_map_features(dict(scenario.get("map_features", {})))
+
+    metadata = scenario.setdefault("metadata", {})
+    metadata.setdefault("id", scenario_id)
+    metadata.setdefault("coordinate", "waymo")
+    metadata.setdefault("dataset", "waymo")
+    metadata.setdefault("scenario_id", scenario_id)
+    metadata.setdefault("track_length", track_length)
+    metadata.setdefault("metadrive_processed", False)
+    metadata.setdefault("objects_of_interest", [])
+    metadata.setdefault("tracks_to_predict", {})
+    if original_file_path is not None:
+        metadata.setdefault("source_file", str(Path(original_file_path).expanduser()))
+    else:
+        metadata.setdefault("source_file", "raw_reconstructed")
+    return scenario
+
+
+def normalize_scenario_for_metadrive(
+    scenario: Dict[str, Any],
+    *,
+    original_file_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """
+    Return a MetaDrive-compatible copy of a scenario when we recognize one of
+    our reconstructed Waymax-derived exports.
+
+    This is the safe public entrypoint for migration scripts and offline bank
+    repair utilities.
+    """
+    scenario_copy = copy.deepcopy(scenario)
+    if _is_waymax_reconstructed_scenario(scenario_copy):
+        return _normalize_waymax_source_scenario(
+            scenario=scenario_copy,
+            original_file_path=original_file_path,
+        )
+    return scenario_copy
+
+
+def _scenario_tracks_include(
+    scenario: Dict[str, Any],
+    *,
+    required_track_names: Optional[List[str]] = None,
+) -> bool:
+    if not required_track_names:
+        return True
+    tracks = dict(scenario.get("tracks", {}))
+    for track_name in required_track_names:
+        if _normalize_track_name(track_name) not in tracks:
+            return False
+    return True
+
+
+def _load_source_scenario(
+    *,
+    original_scenario: Dict[str, Any],
+    original_file_path: Optional[Union[str, Path]] = None,
+    required_track_names: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    if original_file_path is not None and Path(original_file_path).expanduser().exists():
+        with Path(original_file_path).expanduser().open("rb") as f:
+            loaded = copy.deepcopy(pickle.load(f))
+    else:
+        loaded = copy.deepcopy(original_scenario)
+    normalized_loaded = (
+        _normalize_waymax_source_scenario(
+            scenario=loaded,
+            original_file_path=original_file_path,
+        )
+        if _is_waymax_reconstructed_scenario(loaded)
+        else loaded
+    )
+    if _scenario_tracks_include(normalized_loaded, required_track_names=required_track_names):
+        return normalized_loaded
+
+    fallback = copy.deepcopy(original_scenario)
+    normalized_fallback = (
+        _normalize_waymax_source_scenario(
+            scenario=fallback,
+            original_file_path=original_file_path,
+        )
+        if _is_waymax_reconstructed_scenario(fallback)
+        else fallback
+    )
+    if _scenario_tracks_include(normalized_fallback, required_track_names=required_track_names):
+        logger.warning(
+            "Loaded source scenario from %s is missing required tracks %s; falling back to original_scenario.",
+            original_file_path,
+            required_track_names,
+        )
+        return normalized_fallback
+    return normalized_loaded
+
+
+def _track_index_from_scenario(scenario: Dict[str, Any], track_name: str) -> int:
+    track_names = list(dict(scenario.get("tracks", {})).keys())
+    try:
+        return int(track_names.index(str(track_name)))
+    except Exception:
+        return 0
+
+
+def _fit_trajectory_length(xy_world: np.ndarray, *, orig_len: int) -> np.ndarray:
+    xy_world = np.asarray(xy_world, dtype=np.float32).reshape(-1, 2)
+    if orig_len <= 0:
+        return xy_world[:0]
+    if xy_world.shape[0] == 0:
+        return np.zeros((orig_len, 2), dtype=np.float32)
+    if xy_world.shape[0] < orig_len:
+        pad_len = int(orig_len - xy_world.shape[0])
+        return np.vstack([xy_world, np.repeat(xy_world[-1:], pad_len, axis=0)]).astype(np.float32)
+    if xy_world.shape[0] > orig_len:
+        return np.asarray(xy_world[:orig_len], dtype=np.float32)
+    return np.asarray(xy_world, dtype=np.float32)
+
+
+def _overwrite_track_trajectory_world(
+    *,
+    track: Dict[str, Any],
+    trajectory_world_xy: np.ndarray,
+) -> Dict[str, Any]:
+    state = track.setdefault("state", {})
+    orig_pos = np.asarray(state.get("position", []), dtype=np.float32)
+    orig_heading = np.asarray(state.get("heading", []), dtype=np.float32).reshape(-1)
+    orig_valid = np.asarray(state.get("valid", []), dtype=bool).reshape(-1)
+    orig_len = int(orig_pos.shape[0])
+    if orig_len <= 0:
+        raise ValueError("Cannot overwrite trajectory for a track with no original positions.")
+
+    xy_world = _fit_trajectory_length(trajectory_world_xy, orig_len=orig_len)
+    if orig_pos.ndim == 2 and orig_pos.shape[1] >= 3:
+        z_coord = orig_pos[:orig_len, 2:3]
+        position_final = np.concatenate([xy_world, z_coord], axis=1).astype(np.float32)
+    else:
+        position_final = np.asarray(xy_world, dtype=np.float32)
+    state["position"] = position_final
+
+    dt = 0.1
+    if xy_world.shape[0] > 1:
+        velocity = np.diff(xy_world, axis=0) / dt
+        velocity = np.vstack([velocity, velocity[-1:]]).astype(np.float32)
+    else:
+        velocity = np.zeros((orig_len, 2), dtype=np.float32)
+    state["velocity"] = velocity.astype(np.float32)
+
+    if xy_world.shape[0] > 1:
+        heading_raw = np.arctan2(velocity[:, 1], velocity[:, 0])
+        heading_unwrapped = np.unwrap(heading_raw)
+        if orig_heading.size > 0 and np.isfinite(orig_heading[0]):
+            heading_offset = float(orig_heading[0]) - float(heading_unwrapped[0])
+            heading_continuous = heading_unwrapped + heading_offset
+        else:
+            heading_continuous = heading_unwrapped
+    else:
+        fallback_heading = float(orig_heading[0]) if orig_heading.size > 0 and np.isfinite(orig_heading[0]) else 0.0
+        heading_continuous = np.full((orig_len,), fallback_heading, dtype=np.float32)
+    state["heading"] = np.asarray(heading_continuous, dtype=np.float32)
+
+    if orig_valid.size > 0:
+        valid = np.asarray(orig_valid[:orig_len], dtype=bool)
+        if valid.shape[0] < orig_len:
+            valid = np.concatenate([valid, np.zeros((orig_len - valid.shape[0],), dtype=bool)], axis=0)
+    else:
+        valid = np.ones((orig_len,), dtype=bool)
+    state["valid"] = valid.astype(bool)
+
+    return {
+        "orig_len": int(orig_len),
+        "final_len": int(position_final.shape[0]),
+        "path_length_m": float(np.linalg.norm(xy_world[1:] - xy_world[:-1], axis=-1).sum()) if xy_world.shape[0] >= 2 else 0.0,
+        "net_displacement_m": float(np.linalg.norm(xy_world[-1] - xy_world[0])) if xy_world.shape[0] >= 2 else 0.0,
+        "final_xy_world": xy_world[-1].tolist() if xy_world.shape[0] > 0 else None,
+    }
+
+
+def _set_victim_centric_metadata(
+    *,
+    scenario: Dict[str, Any],
+    victim_track_id: str,
+    adversary_track_id: str,
+    intervention_name: str,
+    source_scenario_id: str,
+    counterfactual: bool,
+) -> None:
+    metadata = scenario.setdefault("metadata", {})
+    metadata["sdc_id"] = str(victim_track_id)
+    metadata["victim_track_id"] = str(victim_track_id)
+    metadata["adversary_track_id"] = str(adversary_track_id)
+    metadata["counterfactual"] = bool(counterfactual)
+    metadata["victim_centric"] = True
+    metadata["intervention"] = str(intervention_name)
+    metadata["source_scenario"] = str(source_scenario_id)
+    metadata["dataset"] = "waymo_victim_centric_counterfactual"
+    metadata["objects_of_interest"] = [str(victim_track_id), str(adversary_track_id)]
+    metadata["tracks_to_predict"] = {
+        str(victim_track_id): {
+            "track_index": int(_track_index_from_scenario(scenario, str(victim_track_id))),
+        }
+    }
+
 
 def export_counterfactual_scenario(
     original_scenario: Dict[str, Any],
@@ -240,6 +543,128 @@ def export_all_counterfactuals(
     
     logger.info(f"Exported {len(saved_paths)} counterfactual scenarios to {output_dir}")
     return saved_paths
+
+
+def export_victim_centric_scenario(
+    original_scenario: Dict[str, Any],
+    output_path: Union[str, Path],
+    *,
+    victim_track_id: Union[str, int],
+    adversary_track_id: Union[str, int],
+    adversary_trajectory_world_xy: np.ndarray,
+    intervention_name: str = "victim_centric_counterfactual",
+    original_file_path: Optional[Union[str, Path]] = None,
+) -> Path:
+    """
+    Export a victim-centric counterfactual scenario for downstream RL/eval.
+
+    This keeps the victim actor as the new ego (`metadata['sdc_id']`) and
+    overwrites the adversary actor with the generated counterfactual rollout.
+    Background agents remain unchanged.
+    """
+    output_path = Path(output_path)
+    victim_track_name = _normalize_track_name(victim_track_id)
+    adversary_track_name = _normalize_track_name(adversary_track_id)
+    if not victim_track_name:
+        raise ValueError("victim_track_id must be provided.")
+    if not adversary_track_name:
+        raise ValueError("adversary_track_id must be provided.")
+    if victim_track_name == adversary_track_name:
+        raise ValueError("victim_track_id and adversary_track_id must differ for victim-centric export.")
+
+    new_scenario = _load_source_scenario(
+        original_scenario=original_scenario,
+        original_file_path=original_file_path,
+        required_track_names=[victim_track_name, adversary_track_name],
+    )
+    tracks = dict(new_scenario.get("tracks", {}))
+    if victim_track_name not in tracks:
+        raise KeyError(f"Victim track '{victim_track_name}' not found in scenario tracks.")
+    if adversary_track_name not in tracks:
+        raise KeyError(f"Adversary track '{adversary_track_name}' not found in scenario tracks.")
+
+    trajectory_stats = _overwrite_track_trajectory_world(
+        track=tracks[adversary_track_name],
+        trajectory_world_xy=adversary_trajectory_world_xy,
+    )
+    source_scenario_id = str(original_scenario.get("id", new_scenario.get("id", "unknown")))
+    _set_victim_centric_metadata(
+        scenario=new_scenario,
+        victim_track_id=victim_track_name,
+        adversary_track_id=adversary_track_name,
+        intervention_name=intervention_name,
+        source_scenario_id=source_scenario_id,
+        counterfactual=True,
+    )
+    new_scenario["id"] = f"{source_scenario_id}_victim_{_sanitize_name(victim_track_name)}_adv_{_sanitize_name(adversary_track_name)}_cf_{_sanitize_name(intervention_name)}"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        pickle.dump(new_scenario, f)
+
+    logger.info(
+        "Exported victim-centric scenario to %s (victim=%s, adversary=%s, final_len=%s)",
+        output_path,
+        victim_track_name,
+        adversary_track_name,
+        trajectory_stats["final_len"],
+    )
+    return output_path
+
+
+def export_victim_centric_ground_truth_scenario(
+    original_scenario: Dict[str, Any],
+    output_path: Union[str, Path],
+    *,
+    victim_track_id: Union[str, int],
+    adversary_track_id: Optional[Union[str, int]] = None,
+    original_file_path: Optional[Union[str, Path]] = None,
+    intervention_name: str = "victim_centric_ground_truth",
+) -> Path:
+    """
+    Export the original scene with the victim recast as ego but without
+    overwriting any trajectories.
+    """
+    output_path = Path(output_path)
+    victim_track_name = _normalize_track_name(victim_track_id)
+    adversary_track_name = _normalize_track_name(adversary_track_id)
+    if not victim_track_name:
+        raise ValueError("victim_track_id must be provided.")
+
+    new_scenario = _load_source_scenario(
+        original_scenario=original_scenario,
+        original_file_path=original_file_path,
+        required_track_names=[victim_track_name],
+    )
+    tracks = dict(new_scenario.get("tracks", {}))
+    if victim_track_name not in tracks:
+        raise KeyError(f"Victim track '{victim_track_name}' not found in scenario tracks.")
+    if not adversary_track_name:
+        adversary_track_name = _normalize_track_name(new_scenario.get("metadata", {}).get("sdc_id"))
+
+    source_scenario_id = str(original_scenario.get("id", new_scenario.get("id", "unknown")))
+    _set_victim_centric_metadata(
+        scenario=new_scenario,
+        victim_track_id=victim_track_name,
+        adversary_track_id=adversary_track_name,
+        intervention_name=intervention_name,
+        source_scenario_id=source_scenario_id,
+        counterfactual=False,
+    )
+    new_scenario["metadata"]["is_ground_truth"] = True
+    new_scenario["id"] = f"{source_scenario_id}_victim_{_sanitize_name(victim_track_name)}_ground_truth"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        pickle.dump(new_scenario, f)
+
+    logger.info(
+        "Exported victim-centric ground truth scenario to %s (victim=%s, adversary=%s)",
+        output_path,
+        victim_track_name,
+        adversary_track_name,
+    )
+    return output_path
 
 
 def export_trajectory_only(

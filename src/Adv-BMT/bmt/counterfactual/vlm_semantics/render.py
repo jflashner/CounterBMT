@@ -28,7 +28,10 @@ PLOT_BG_COLOR = "#f8fafc"
 MAP_CROSSWALK_COLOR = "#cbd5e1"
 MAP_LANE_COLOR = "#64748b"
 MAP_ROAD_COLOR = "#94a3b8"
-NEARBY_AGENT_COLOR = "#cbd5e1"
+NEARBY_AGENT_PAST_COLOR = "#94a3b8"
+NEARBY_AGENT_BODY_FILL_COLOR = "#cbd5e1"
+NEARBY_AGENT_BODY_OUTLINE_COLOR = "#334155"
+NEARBY_AGENT_DIRECTION_COLOR = "#111827"
 
 
 def _track_pose_at_index(raw_scenario: Mapping[str, Any], *, track_id: str, time_index: int) -> Optional[Dict[str, float]]:
@@ -172,6 +175,9 @@ def _select_nearby_agents(
         state = dict(track.get("state", {}))
         valid = np.asarray(state.get("valid", []), dtype=bool)
         position = np.asarray(state.get("position", []), dtype=np.float64)
+        heading = np.asarray(state.get("heading", []), dtype=np.float64).reshape(-1)
+        length = np.asarray(state.get("length", []), dtype=np.float64).reshape(-1)
+        width = np.asarray(state.get("width", []), dtype=np.float64).reshape(-1)
         if valid.size == 0 or position.ndim != 2 or position.shape[0] == 0:
             continue
         idx = int(np.clip(int(current_time_idx), 0, valid.shape[0] - 1))
@@ -184,11 +190,24 @@ def _select_nearby_agents(
         start_idx = max(0, idx - int(past_steps))
         past_mask = valid[start_idx : idx + 1]
         past_xy = np.asarray(position[start_idx : idx + 1, :2], dtype=np.float64)[past_mask]
+        heading_value = 0.0
+        if heading.shape[0] > idx and np.isfinite(heading[idx]):
+            heading_value = float(heading[idx])
+        length_value = 4.5
+        if length.shape[0] > idx and np.isfinite(length[idx]):
+            length_value = float(length[idx])
+        width_value = 2.0
+        if width.shape[0] > idx and np.isfinite(width[idx]):
+            width_value = float(width[idx])
         rows.append(
             {
                 "track_id": str(track_id),
+                "track_type": str(track.get("type", "UNKNOWN")),
                 "current_xy_world": current_xy,
                 "past_xy_world": past_xy,
+                "current_heading_world": heading_value,
+                "current_length_m": length_value,
+                "current_width_m": width_value,
                 "distance_to_center_m": dist,
             }
         )
@@ -201,6 +220,48 @@ def _heading_arrow_xy(pose: Mapping[str, Any], *, length_m: float = 5.0) -> np.n
     y = float(pose.get("y", 0.0))
     heading = float(pose.get("heading", 0.0))
     return np.asarray([[x, y], [x + length_m * math.cos(heading), y + length_m * math.sin(heading)]], dtype=np.float64)
+
+
+def _nearby_agent_heading_arrow(agent: Mapping[str, Any], *, length_m: float = 4.8) -> np.ndarray:
+    current_xy = np.asarray(agent.get("current_xy_world", []), dtype=np.float64).reshape(-1)
+    past_xy = np.asarray(agent.get("past_xy_world", []), dtype=np.float64)
+    if current_xy.size < 2:
+        return np.zeros((0, 2), dtype=np.float64)
+    if past_xy.ndim == 2 and past_xy.shape[0] >= 2:
+        delta = np.asarray(past_xy[-1] - past_xy[-2], dtype=np.float64)
+        norm = float(np.linalg.norm(delta))
+        if norm >= 0.20:
+            delta = delta / max(norm, 1e-6)
+            tip = current_xy[:2] + float(length_m) * delta[:2]
+            return np.asarray([current_xy[:2], tip], dtype=np.float64)
+    heading = float(agent.get("current_heading_world", 0.0))
+    tip = current_xy[:2] + float(length_m) * np.asarray([math.cos(heading), math.sin(heading)], dtype=np.float64)
+    return np.asarray([current_xy[:2], tip], dtype=np.float64)
+
+
+def _nearby_agent_box_polygon(agent: Mapping[str, Any], *, scale: float = 1.0) -> np.ndarray:
+    current_xy = np.asarray(agent.get("current_xy_world", []), dtype=np.float64).reshape(-1)
+    if current_xy.size < 2:
+        return np.zeros((0, 2), dtype=np.float64)
+    heading = float(agent.get("current_heading_world", 0.0))
+    length_m = max(0.6, float(agent.get("current_length_m", 4.5))) * float(scale)
+    width_m = max(0.4, float(agent.get("current_width_m", 2.0))) * float(scale)
+    forward = np.asarray([math.cos(heading), math.sin(heading)], dtype=np.float64)
+    left = np.asarray([-forward[1], forward[0]], dtype=np.float64)
+    half_l = 0.5 * length_m
+    half_w = 0.5 * width_m
+    center = current_xy[:2]
+    corners = np.stack(
+        [
+            center + half_l * forward + half_w * left,
+            center + half_l * forward - half_w * left,
+            center - half_l * forward - half_w * left,
+            center - half_l * forward + half_w * left,
+            center + half_l * forward + half_w * left,
+        ],
+        axis=0,
+    )
+    return np.asarray(corners, dtype=np.float64)
 
 
 def _candidate_color(index: int) -> str:
@@ -345,32 +406,82 @@ def _build_world_plot(
     for agent in nearby_agents:
         past_xy = np.asarray(agent["past_xy_world"], dtype=np.float64)
         current_xy = np.asarray(agent["current_xy_world"], dtype=np.float64).reshape(1, 2)
+        body_polygon_xy = _nearby_agent_box_polygon(agent)
+        heading_arrow_xy = _nearby_agent_heading_arrow(agent)
+        heading_tip_xy = heading_arrow_xy[1:].reshape(1, 2) if heading_arrow_xy.shape[0] >= 2 else np.zeros((0, 2), dtype=np.float64)
         series_list.append(
             TaggedXYSeries(
                 name=f"nearby_past_{agent['track_id']}",
                 xy=past_xy,
                 frame=FRAME_WORLD,
                 draw_style="line",
-                color=NEARBY_AGENT_COLOR,
-                alpha=0.22,
-                linewidth=0.9,
+                color=NEARBY_AGENT_PAST_COLOR,
+                alpha=0.42,
+                linewidth=1.15,
                 zorder=3,
             )
         )
-        series_list.append(
-            TaggedXYSeries(
-                name=f"nearby_current_{agent['track_id']}",
-                xy=current_xy,
-                frame=FRAME_WORLD,
-                draw_style="scatter",
-                color=NEARBY_AGENT_COLOR,
-                alpha=0.28,
-                markersize=14.0,
-                marker="o",
-                zorder=4,
+        if body_polygon_xy.shape[0] >= 4:
+            series_list.append(
+                TaggedXYSeries(
+                    name=f"nearby_body_fill_{agent['track_id']}",
+                    xy=body_polygon_xy,
+                    frame=FRAME_WORLD,
+                    draw_style="polygon",
+                    color=NEARBY_AGENT_BODY_FILL_COLOR,
+                    alpha=0.92,
+                    fill_alpha=0.70,
+                    linewidth=1.0,
+                    zorder=6,
+                )
             )
-        )
+            series_list.append(
+                TaggedXYSeries(
+                    name=f"nearby_body_outline_{agent['track_id']}",
+                    xy=body_polygon_xy,
+                    frame=FRAME_WORLD,
+                    draw_style="line",
+                    color=NEARBY_AGENT_BODY_OUTLINE_COLOR,
+                    alpha=0.98,
+                    linewidth=1.7,
+                    zorder=7,
+                )
+            )
+        if heading_arrow_xy.shape[0] >= 2:
+            series_list.append(
+                TaggedXYSeries(
+                    name=f"nearby_heading_{agent['track_id']}",
+                    xy=heading_arrow_xy,
+                    frame=FRAME_WORLD,
+                    draw_style="line",
+                    color=NEARBY_AGENT_DIRECTION_COLOR,
+                    alpha=0.98,
+                    linewidth=1.9,
+                    zorder=8,
+                )
+            )
+            if heading_tip_xy.shape[0] > 0:
+                series_list.append(
+                    TaggedXYSeries(
+                        name=f"nearby_heading_tip_{agent['track_id']}",
+                        xy=heading_tip_xy,
+                        frame=FRAME_WORLD,
+                        draw_style="scatter",
+                        color=NEARBY_AGENT_DIRECTION_COLOR,
+                        alpha=0.98,
+                        markersize=20.0,
+                        marker="o",
+                        zorder=9,
+                    )
+                )
         world_series_for_sanity.append((f"nearby_past_{agent['track_id']}", past_xy))
+        if body_polygon_xy.shape[0] >= 4:
+            world_series_for_sanity.append((f"nearby_body_fill_{agent['track_id']}", body_polygon_xy))
+            world_series_for_sanity.append((f"nearby_body_outline_{agent['track_id']}", body_polygon_xy))
+        if heading_arrow_xy.shape[0] >= 2:
+            world_series_for_sanity.append((f"nearby_heading_{agent['track_id']}", heading_arrow_xy))
+        if heading_tip_xy.shape[0] > 0:
+            world_series_for_sanity.append((f"nearby_heading_tip_{agent['track_id']}", heading_tip_xy))
         world_series_for_sanity.append((f"nearby_current_{agent['track_id']}", current_xy))
 
     for idx, candidate in enumerate(branch_candidates):
