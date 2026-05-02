@@ -134,7 +134,11 @@ def _selection_row_to_bundle(
         path_id = str(path_row.get("path_id") or "")
         if not path_id:
             continue
-        trimmed_segments_world = _trim_and_split_world_path(path_row.get("polyline_xy", []), current_xy_world=current_xy)
+        trimmed_segments_world = _trim_and_split_world_path(
+            path_row.get("polyline_xy", []),
+            current_xy_world=current_xy,
+            current_heading_world=current_heading,
+        )
         alt_local_path, _, _ = _resampled_local_path_from_world_segments(
             trimmed_segments_world,
             center_xy_world=current_xy,
@@ -147,7 +151,11 @@ def _selection_row_to_bundle(
 
     for path_id in selected_alt_path_ids:
         path_row = dict(path_row_by_id[path_id])
-        trimmed_segments_world = _trim_and_split_world_path(path_row.get("polyline_xy", []), current_xy_world=current_xy)
+        trimmed_segments_world = _trim_and_split_world_path(
+            path_row.get("polyline_xy", []),
+            current_xy_world=current_xy,
+            current_heading_world=current_heading,
+        )
         alt_local_path, alt_local_segments, alt_world_resampled_segments = _resampled_local_path_from_world_segments(
             trimmed_segments_world,
             center_xy_world=current_xy,

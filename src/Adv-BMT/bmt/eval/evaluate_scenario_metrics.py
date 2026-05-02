@@ -24,10 +24,11 @@ from bmt.utils import REPO_ROOT
 import torch
 from bmt.utils.config import cfg_from_yaml_file, global_config
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from bmt.dataset.preprocessor import preprocess_scenario_description_for_motionlm
 from bmt.eval.scenario_evaluator import Evaluator
 from bmt.utils.utils import numpy_to_torch
+from bmt.utils.checkpoint_loading import load_model_from_checkpoint_forgiving
 from metadrive.scenario.utils import read_dataset_summary
 from bmt.dag_latent.config import get_dag_latent_block
 from bmt.dag_latent.dag_cache import DAGCacheBatchBuilder
@@ -104,6 +105,7 @@ def _checkpoint_uses_dag_latent(checkpoint_path: str) -> bool:
 
 def _load_eval_model(config, checkpoint_path: str):
     default_config = cfg_from_yaml_file(REPO_ROOT / "cfgs/motion_default.yaml", global_config)
+    ckpt_load_mode = str(config.get("CKPT_LOAD_MODE", "legacy_merge"))
 
     if _checkpoint_uses_dag_latent(checkpoint_path):
         from bmt.dag_latent.lightning import MotionLMDAGLatentLightning
@@ -120,15 +122,34 @@ def _load_eval_model(config, checkpoint_path: str):
     else:
         from bmt.models.motionlm_lightning import MotionLMLightning
 
-        model = utils.load_from_checkpoint(
-            checkpoint_path=checkpoint_path,
-            cls=MotionLMLightning,
-            config=config,
-            default_config=default_config,
-            strict=True,
-            checkpoint_surgery_func=utils.checkpoint_surgery_func,
-            map_location="cpu",
-        )
+        if ckpt_load_mode == "forgiving_state_dict":
+            model, load_report = load_model_from_checkpoint_forgiving(
+                config=config,
+                ckpt_path=checkpoint_path,
+                load_mode=ckpt_load_mode,
+                strict_state_dict=False,
+                map_location="cpu",
+                checkpoint_surgery_func=utils.checkpoint_surgery_func,
+            )
+            print(
+                "Eval forgiving load report:",
+                {
+                    "num_loaded_keys": load_report["num_loaded_keys"],
+                    "num_missing_keys": load_report["num_missing_keys"],
+                    "num_unexpected_keys": load_report["num_unexpected_keys"],
+                    "num_shape_mismatch_keys": load_report["num_shape_mismatch_keys"],
+                },
+            )
+        else:
+            model = utils.load_from_checkpoint(
+                checkpoint_path=checkpoint_path,
+                cls=MotionLMLightning,
+                config=config,
+                default_config=default_config,
+                strict=True,
+                checkpoint_surgery_func=utils.checkpoint_surgery_func,
+                map_location="cpu",
+            )
 
     model.eval()
     return model
@@ -499,6 +520,29 @@ class EvaluationLightningModule(pl.LightningModule):
 
         return input_data
 
+    def _extract_semantic_eval_metadata(self, batch):
+        debug_meta = batch.get("cf/debug_meta", {})
+        if not isinstance(debug_meta, Mapping):
+            debug_meta = {}
+
+        scenario_id = str(batch.get("metadata/scenario_id", batch.get("scenario_id", "")) or "").strip()
+        semantic_slot_id = str(
+            debug_meta.get("selected_slot_id", batch.get("selected_slot_id", batch.get("slot_id", ""))) or ""
+        ).strip()
+        semantic_source_kind = str(
+            debug_meta.get("source_kind", batch.get("source_kind", "")) or ""
+        ).strip()
+        requested_semantic_label = str(
+            debug_meta.get("requested_semantic_label", batch.get("requested_semantic_label", "")) or ""
+        ).strip()
+
+        return {
+            "scenario_id": scenario_id,
+            "semantic_slot_id": semantic_slot_id,
+            "semantic_source_kind": semantic_source_kind,
+            "requested_semantic_label": requested_semantic_label,
+        }
+
 
     def GPT_AR(self, input_data, backward_prediction=False, teacher_forcing=False):
         if not teacher_forcing:
@@ -818,6 +862,7 @@ class EvaluationLightningModule(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         print("sid:", batch["metadata/scenario_id"]) # print scenario ID for debugging
+        semantic_eval_meta = self._extract_semantic_eval_metadata(batch)
         
         if self.eval_mode == "CAT":
             if self.multi_mode:
@@ -975,7 +1020,12 @@ class EvaluationLightningModule(pl.LightningModule):
             device = self.model.device
             bv_list = all_agents_except_sdc_adv.to(device)
             self.evaluator.add(
-                original_data_dict_tensor, gathered_output, adv_list=torch.tensor([self.adv_id], device=device), bv_list=bv_list, device=self.device
+                original_data_dict_tensor,
+                gathered_output,
+                adv_list=torch.tensor([self.adv_id], device=device),
+                bv_list=bv_list,
+                device=self.device,
+                **semantic_eval_meta,
             )
 
         # Evaluate
@@ -1009,13 +1059,27 @@ class EvaluationLightningModule(pl.LightningModule):
                 for k, v in gathered_output.items()
             }
 
-            self.evaluator.add(input_data, gathered_output, adv_list=adv_list, bv_list=bv_list, device=self.device)
+            self.evaluator.add(
+                input_data,
+                gathered_output,
+                adv_list=adv_list,
+                bv_list=bv_list,
+                device=self.device,
+                **semantic_eval_meta,
+            )
 
         elif self.eval_mode == "GPTmodel" or self.eval_mode == "Backward" or self.eval_mode == "Backward_TF" or self.eval_mode == "Backward_Forward" :
             all_agents = batch["decoder/agent_id"]  # prepare parameters for differet CR metrics
             sdc_id = batch["decoder/sdc_index"]
             all_agents_except_sdc = all_agents[all_agents != sdc_id]
-            self.evaluator.add(original_data_dict_tensor, gathered_output, adv_list=None, bv_list=all_agents_except_sdc, device=self.device)
+            self.evaluator.add(
+                original_data_dict_tensor,
+                gathered_output,
+                adv_list=None,
+                bv_list=all_agents_except_sdc,
+                device=self.device,
+                **semantic_eval_meta,
+            )
 
 
         else:
@@ -1143,7 +1207,8 @@ def run_combined_evaluation(config):
     checkpoint_path = _resolve_checkpoint_path(config)
     model = _load_eval_model(config, checkpoint_path=checkpoint_path)
     config = model.config
-    model = model.to("cuda")
+    model_device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(model_device)
     eval_mode = config.eval_mode
     tokenizer = model.model.tokenizer
 
@@ -1152,7 +1217,9 @@ def run_combined_evaluation(config):
     if int(limit_test_batches) < 0:
         limit_test_batches = None
 
-    assert config.multi_mode is True, "Please set config.multi_mode to True for multi-mode evaluation."
+    baseline_eval_modes = {"CAT", "STRIVE", "SEAL", "GOOSE"}
+    if eval_mode not in baseline_eval_modes:
+        assert config.multi_mode is True, "Please set config.multi_mode to True for multi-mode evaluation."
 
     # ===== LOCAL DEBUG =====
     # config.DATA.TRAINING_DATA_DIR = "data/20scenarios"

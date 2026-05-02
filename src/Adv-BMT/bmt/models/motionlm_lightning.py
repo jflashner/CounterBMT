@@ -12,7 +12,11 @@ from omegaconf import OmegaConf
 from bmt.counterfactual.compile_control_code import (
     BRANCH_LABEL_ORDER,
     COMPLIANCE_LABEL_ORDER,
+    COMPLIANCE_TOKEN_DIM,
+    PATH_TOKEN_DIM,
+    SIGNAL_CATEGORY_ORDER,
     TERMINAL_ANCHOR_DIM,
+    TIMING_TOKEN_DIM,
     TIMING_LABEL_ORDER,
 )
 from bmt.counterfactual.sdc_path_control import (
@@ -35,6 +39,11 @@ from bmt.counterfactual.sdc_semantic_control import (
     project_points_to_segment_tube_torch,
 )
 from bmt.models.motionlm import MotionLM
+from bmt.models.semantic_ext_topomcpo import (
+    CausalDAGContextEncoder,
+    EMAGaussianNoveltyBank,
+    RolloutBehaviorEncoder,
+)
 from bmt.tokenization import get_tokenizer
 from bmt.utils import lr_schedule
 from bmt.utils import utils
@@ -125,6 +134,11 @@ class MotionLMLightning(pl.LightningModule):
         self._tokenizer = get_tokenizer(self.config)
         self.local_control_forward_enabled = bool(self.config.MODEL.get("LOCAL_CONTROL_FORWARD_ENABLED", False))
         self.counterfactual_mode = str(self.config.DATA.get("COUNTERFACTUAL_MODE", "default")).strip() or "default"
+        self.sdc_semantic_ext_enabled = bool(
+            self.counterfactual_mode == "sdc_semantic_only"
+            and self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_ENABLED", False)
+        )
+        self._init_semantic_ext_topomcpo_modules()
         if self.local_control_forward_enabled:
             d_model = int(self.config.MODEL.D_MODEL)
             self.path_head = torch.nn.Linear(d_model, len(BRANCH_LABEL_ORDER))
@@ -142,6 +156,42 @@ class MotionLMLightning(pl.LightningModule):
 
         self.exp_name = None
         self._last_rollout_train_debug_step = -1
+
+    def _init_semantic_ext_topomcpo_modules(self):
+        self.semantic_ext_behavior_encoder = None
+        self.semantic_ext_dag_encoder = None
+        self.semantic_ext_semantic_head = None
+        self.semantic_ext_branch_head = None
+        self.semantic_ext_compliance_head = None
+        self.semantic_ext_timing_head = None
+        self.semantic_ext_novelty_bank = None
+        if not self.sdc_semantic_ext_enabled:
+            return
+        if not bool(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_BEHAVIOR_MODEL_ENABLED", False)):
+            return
+        hidden_dim = int(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_BEHAVIOR_HIDDEN_DIM", 64))
+        embed_dim = int(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_BEHAVIOR_EMBED_DIM", 32))
+        input_dim = 8
+        self.semantic_ext_behavior_encoder = RolloutBehaviorEncoder(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            embed_dim=embed_dim,
+        )
+        self.semantic_ext_dag_encoder = CausalDAGContextEncoder(
+            path_dim=PATH_TOKEN_DIM,
+            compliance_dim=COMPLIANCE_TOKEN_DIM,
+            timing_dim=TIMING_TOKEN_DIM,
+            hidden_dim=hidden_dim,
+            embed_dim=embed_dim,
+        )
+        self.semantic_ext_semantic_head = torch.nn.Linear(embed_dim, len(SDC_PATH_SEMANTIC_LABEL_ORDER))
+        self.semantic_ext_branch_head = torch.nn.Linear(embed_dim, len(BRANCH_LABEL_ORDER))
+        self.semantic_ext_compliance_head = torch.nn.Linear(embed_dim, len(COMPLIANCE_LABEL_ORDER))
+        self.semantic_ext_timing_head = torch.nn.Linear(embed_dim, len(TIMING_LABEL_ORDER))
+        self.semantic_ext_novelty_bank = EMAGaussianNoveltyBank(
+            decay=float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_NOVELTY_EMA_DECAY", 0.995)),
+            min_var=float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_NOVELTY_MIN_VAR", 1e-3)),
+        )
 
     def _configure_local_control_finetune(self):
         if not self.local_control_forward_enabled:
@@ -405,6 +455,15 @@ class MotionLMLightning(pl.LightningModule):
         advantage_t,
         trajectories_world,
         action_token_t,
+        traffic_speed_penalty_t=None,
+        traffic_speed_reference_t=None,
+        traffic_speed_neighbor_mean_t=None,
+        traffic_speed_neighbor_median_t=None,
+        traffic_speed_floor_threshold_t=None,
+        traffic_speed_cap_threshold_t=None,
+        traffic_speed_cap_penalty_t=None,
+        traffic_speed_sdc_t=None,
+        traffic_speed_neighbor_count_t=None,
     ):
         if not self._should_dump_rollout_tube_training_debug():
             return
@@ -533,6 +592,51 @@ class MotionLMLightning(pl.LightningModule):
                     scenario_pkl=str(meta.get("scenario_pkl") or ""),
                     current_time_index=meta.get("current_time_index"),
                     sdc_id=str(meta.get("sdc_id") or ""),
+                    traffic_speed_penalty_t=(
+                        None
+                        if traffic_speed_penalty_t is None
+                        else traffic_speed_penalty_t[:, batch_idx].detach().cpu().numpy()
+                    ),
+                    traffic_speed_reference_t=(
+                        None
+                        if traffic_speed_reference_t is None
+                        else traffic_speed_reference_t[:, batch_idx].detach().cpu().numpy()
+                    ),
+                    traffic_speed_neighbor_mean_t=(
+                        None
+                        if traffic_speed_neighbor_mean_t is None
+                        else traffic_speed_neighbor_mean_t[:, batch_idx].detach().cpu().numpy()
+                    ),
+                    traffic_speed_neighbor_median_t=(
+                        None
+                        if traffic_speed_neighbor_median_t is None
+                        else traffic_speed_neighbor_median_t[:, batch_idx].detach().cpu().numpy()
+                    ),
+                    traffic_speed_floor_threshold_t=(
+                        None
+                        if traffic_speed_floor_threshold_t is None
+                        else traffic_speed_floor_threshold_t[:, batch_idx].detach().cpu().numpy()
+                    ),
+                    traffic_speed_cap_threshold_t=(
+                        None
+                        if traffic_speed_cap_threshold_t is None
+                        else traffic_speed_cap_threshold_t[:, batch_idx].detach().cpu().numpy()
+                    ),
+                    traffic_speed_cap_penalty_t=(
+                        None
+                        if traffic_speed_cap_penalty_t is None
+                        else traffic_speed_cap_penalty_t[:, batch_idx].detach().cpu().numpy()
+                    ),
+                    traffic_speed_sdc_t=(
+                        None
+                        if traffic_speed_sdc_t is None
+                        else traffic_speed_sdc_t[:, batch_idx].detach().cpu().numpy()
+                    ),
+                    traffic_speed_neighbor_count_t=(
+                        None
+                        if traffic_speed_neighbor_count_t is None
+                        else traffic_speed_neighbor_count_t[:, batch_idx].detach().cpu().numpy()
+                    ),
                     extra_summary={
                         "mean_total_return": float(total_return[:, batch_idx].mean().detach().cpu().item()),
                         "mean_scalar_group_advantage": float(total_return_adv[:, batch_idx].mean().detach().cpu().item()),
@@ -667,7 +771,13 @@ class MotionLMLightning(pl.LightningModule):
         }
 
     def _adapt_rollout_output_for_semantic_guidance(self, *, base_batch, rollout_output):
-        adapted = clone_nested_value(rollout_output)
+        # Start from the original batch so counterfactual control tensors survive
+        # the autoregressive rollout adaptation. The rollout output only carries
+        # model-produced decoder tensors, while the tube/semantic objectives still
+        # need the static `cf/...` metadata from the source batch.
+        adapted = clone_nested_value(base_batch)
+        for key, value in rollout_output.items():
+            adapted[key] = clone_nested_value(value)
         rollout_logits = rollout_output["decoder/output_logit"]
         device = rollout_logits.device
         dtype = rollout_logits.dtype
@@ -821,6 +931,970 @@ class MotionLMLightning(pl.LightningModule):
         ).sum(dim=1)
         return torch.linalg.norm(sdc_velocity.to(dtype=torch.float32), dim=-1)
 
+    @staticmethod
+    def _masked_mean_per_example(values, mask):
+        values = values.to(dtype=torch.float32)
+        mask_f = mask.to(dtype=values.dtype)
+        denom = mask_f.sum(dim=-1).clamp_min(1.0)
+        mean = (values * mask_f).sum(dim=-1) / denom
+        return torch.where(mask_f.sum(dim=-1) > 0.0, mean, torch.zeros_like(mean))
+
+    @staticmethod
+    def _wrap_angle(angle):
+        return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+    def _semantic_ext_center_curriculum_weight(self, device):
+        if not self.sdc_semantic_ext_enabled:
+            return torch.tensor(0.0, device=device)
+        max_weight = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_CENTER_WEIGHT_MAX", 0.03))
+        if max_weight <= 0.0:
+            return torch.tensor(0.0, device=device)
+        start_frac = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_CENTER_CURRICULUM_START_FRAC", 0.67)
+        )
+        trainer = getattr(self, "trainer", None)
+        total_steps = 0
+        if trainer is not None:
+            max_steps = int(getattr(trainer, "max_steps", -1) or -1)
+            if max_steps > 0:
+                total_steps = max_steps
+            else:
+                total_steps = int(getattr(trainer, "estimated_stepping_batches", 0) or 0)
+        if total_steps <= 0:
+            return torch.tensor(0.0, device=device)
+        start_step = int(max(0, min(total_steps, math.floor(float(start_frac) * float(total_steps)))))
+        current_step = int(getattr(self, "global_step", 0))
+        if current_step < start_step:
+            return torch.tensor(0.0, device=device)
+        ramp_denom = max(total_steps - start_step, 1)
+        ramp = min(max(float(current_step - start_step) / float(ramp_denom), 0.0), 1.0)
+        return torch.tensor(float(max_weight) * ramp, device=device, dtype=torch.float32)
+
+    def _compute_semantic_ext_traffic_speed_floor_bundle(
+        self,
+        *,
+        data_dict,
+        semantic_context,
+        sdc_next_pos_world,
+        valid_mask,
+        reference_batch=None,
+        frontier_arc_t=None,
+    ):
+        zero_t = torch.zeros_like(valid_mask, dtype=torch.float32)
+        zero = zero_t.new_tensor(0.0)
+        floor_enabled = bool(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_FLOOR_ENABLED", False)
+        )
+        cap_enabled = bool(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_CAP_ENABLED", False)
+        )
+
+        def _zero_bundle():
+            return {
+                "penalty_t": zero_t,
+                "floor_penalty_t": zero_t,
+                "cap_penalty_t": zero_t,
+                "reference_speed_t": zero_t,
+                "neighbor_mean_speed_t": zero_t,
+                "neighbor_median_speed_t": zero_t,
+                "floor_threshold_t": zero_t,
+                "cap_threshold_t": zero_t,
+                "sdc_speed_t": zero_t,
+                "neighbor_count_t": zero_t,
+                "penalty_mean": zero,
+                "floor_penalty_mean": zero,
+                "cap_penalty_mean": zero,
+                "reference_speed_mean": zero,
+                "neighbor_mean_speed_mean": zero,
+                "neighbor_median_speed_mean": zero,
+                "floor_threshold_mean": zero,
+                "cap_threshold_mean": zero,
+                "sdc_speed_mean": zero,
+                "neighbor_count_mean": zero,
+            }
+
+        if not self.sdc_semantic_ext_enabled:
+            return _zero_bundle()
+
+        if not (floor_enabled or cap_enabled):
+            return _zero_bundle()
+
+        if semantic_context is None or "decoder/rollout_next_position" not in data_dict:
+            return _zero_bundle()
+
+        device = sdc_next_pos_world.device
+        dtype = sdc_next_pos_world.dtype
+        horizon = int(valid_mask.shape[1])
+        floor_weight = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_FLOOR_WEIGHT", 0.05)
+        )
+        cap_weight = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_CAP_WEIGHT", 0.05)
+        )
+        cap_margin_mps = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_CAP_MARGIN_MPS", 2.0)
+        )
+        nearby_radius_m = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_NEARBY_RADIUS_M", 30.0)
+        )
+        expand_factor = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_EXPAND_FACTOR", 2.0)
+        )
+        expand_steps = max(
+            1,
+            int(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_MAX_EXPANSION_STEPS", 3)),
+        )
+        min_moving_speed_mps = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_MIN_MOVING_SPEED_MPS", 1.0)
+        )
+        reference_ratio = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_REFERENCE_RATIO", 0.60)
+        )
+        max_reference_speed_mps = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_MAX_REFERENCE_MPS", 12.0)
+        )
+        min_neighbors = max(
+            1,
+            int(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_MIN_NEIGHBORS", 1)),
+        )
+        use_progress_arc_speed = bool(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_SDC_USE_PROGRESS_ARC", False)
+        )
+        progress_window_steps = max(
+            1,
+            int(
+                self.config.MODEL.get(
+                    "LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_SDC_PROGRESS_WINDOW_STEPS",
+                    4,
+                )
+            ),
+        )
+        if (
+            (floor_enabled and floor_weight <= 0.0 and (not cap_enabled or cap_weight <= 0.0))
+            or (cap_enabled and cap_weight <= 0.0 and (not floor_enabled or floor_weight <= 0.0))
+            or nearby_radius_m <= 0.0
+            or (floor_enabled and reference_ratio <= 0.0)
+            or max_reference_speed_mps <= 0.0
+            or expand_factor < 1.0
+            or (cap_enabled and cap_margin_mps < 0.0)
+        ):
+            return _zero_bundle()
+
+        rollout_next_position = self._as_tensor(
+            data_dict["decoder/rollout_next_position"][:, :horizon, :, :2],
+            device=device,
+            dtype=dtype,
+        )
+        current_position = self._as_tensor(
+            data_dict.get("decoder/modeled_agent_position", torch.zeros_like(rollout_next_position))[:, :horizon, :, :2],
+            device=device,
+            dtype=dtype,
+        )
+        if "decoder/input_action_valid_mask" in data_dict:
+            agent_valid_mask = self._as_tensor(
+                data_dict["decoder/input_action_valid_mask"][:, :horizon],
+                device=device,
+                dtype=torch.bool,
+            )
+        else:
+            agent_valid_mask = torch.ones(
+                rollout_next_position.shape[:3],
+                device=device,
+                dtype=torch.bool,
+            )
+
+        decision_agent_mask = semantic_context["decision_agent_mask"][:, : rollout_next_position.shape[2]].to(dtype=torch.bool)
+        non_sdc_mask = (~decision_agent_mask)[:, None, :]
+        dt = max(self._get_rollout_step_dt_s(), 1e-3)
+        realized_delta_t = rollout_next_position.to(dtype=torch.float32) - current_position.to(dtype=torch.float32)
+        all_speed_t = torch.linalg.norm(realized_delta_t, dim=-1) / float(dt)
+        all_speed_t = torch.nan_to_num(all_speed_t, nan=0.0, posinf=0.0, neginf=0.0)
+        sdc_realized_speed_t = (
+            all_speed_t
+            * decision_agent_mask[:, None, :].to(dtype=torch.float32)
+        ).sum(dim=-1)
+        sdc_speed_t = sdc_realized_speed_t
+        if use_progress_arc_speed and frontier_arc_t is not None:
+            frontier_arc = self._as_tensor(
+                frontier_arc_t[:, :horizon],
+                device=device,
+                dtype=torch.float32,
+            )
+            shifted_frontier = torch.zeros_like(frontier_arc)
+            if progress_window_steps < int(frontier_arc.shape[1]):
+                shifted_frontier[:, progress_window_steps:] = frontier_arc[:, :-progress_window_steps]
+            step_idx = torch.arange(frontier_arc.shape[1], device=device, dtype=torch.float32).view(1, -1)
+            effective_window = torch.clamp(step_idx + 1.0, max=float(progress_window_steps))
+            sdc_speed_t = torch.relu(frontier_arc - shifted_frontier) / (
+                effective_window * float(dt)
+            ).clamp_min(1e-3)
+            sdc_speed_t = torch.nan_to_num(sdc_speed_t, nan=0.0, posinf=0.0, neginf=0.0)
+        distance_to_sdc = torch.linalg.norm(
+            rollout_next_position.to(dtype=torch.float32) - sdc_next_pos_world[:, :, None, :].to(dtype=torch.float32),
+            dim=-1,
+        )
+        moving_neighbor_mask = (
+            agent_valid_mask
+            & non_sdc_mask
+            & torch.isfinite(all_speed_t)
+            & torch.isfinite(distance_to_sdc)
+            & (all_speed_t >= float(min_moving_speed_mps))
+        )
+        reference_mask = torch.zeros_like(moving_neighbor_mask, dtype=torch.bool)
+        reference_found = torch.zeros_like(valid_mask, dtype=torch.bool)
+        current_radius = float(nearby_radius_m)
+        for _ in range(int(expand_steps)):
+            candidate_mask = moving_neighbor_mask & (distance_to_sdc <= float(current_radius))
+            candidate_found = candidate_mask.sum(dim=-1) >= int(min_neighbors)
+            new_found = (~reference_found) & candidate_found
+            reference_mask = reference_mask | (candidate_mask & new_found[:, :, None])
+            reference_found = reference_found | candidate_found
+            current_radius = float(current_radius) * float(expand_factor)
+
+        scenewide_found = (~reference_found) & moving_neighbor_mask.any(dim=-1)
+        reference_mask = reference_mask | (moving_neighbor_mask & scenewide_found[:, :, None])
+        reference_found = reference_found | scenewide_found
+
+        neighbor_count_t = reference_mask.sum(dim=-1).to(dtype=torch.float32)
+        masked_speed_t = torch.where(
+            reference_mask,
+            all_speed_t,
+            torch.full_like(all_speed_t, float("nan")),
+        )
+        neighbor_median_speed_t = torch.nanmedian(masked_speed_t, dim=-1).values
+        neighbor_median_speed_t = torch.nan_to_num(
+            neighbor_median_speed_t,
+            nan=0.0,
+            posinf=float(max_reference_speed_mps),
+            neginf=0.0,
+        ).clamp(min=0.0, max=float(max_reference_speed_mps))
+        neighbor_median_speed_t = torch.where(
+            reference_found,
+            neighbor_median_speed_t,
+            torch.zeros_like(neighbor_median_speed_t),
+        )
+        masked_speed_zero = torch.where(reference_mask, all_speed_t, torch.zeros_like(all_speed_t))
+        neighbor_mean_speed_t = masked_speed_zero.sum(dim=-1) / neighbor_count_t.clamp_min(1.0)
+        neighbor_mean_speed_t = torch.nan_to_num(
+            neighbor_mean_speed_t,
+            nan=0.0,
+            posinf=float(max_reference_speed_mps),
+            neginf=0.0,
+        ).clamp(min=0.0, max=float(max_reference_speed_mps))
+        neighbor_mean_speed_t = torch.where(
+            reference_found,
+            neighbor_mean_speed_t,
+            torch.zeros_like(neighbor_mean_speed_t),
+        )
+        floor_reference_speed_t = neighbor_median_speed_t
+        cap_reference_speed_t = neighbor_mean_speed_t
+        gt_reference_speed_t = torch.zeros_like(floor_reference_speed_t)
+        fallback_mask = (~reference_found) & valid_mask
+        if floor_enabled and bool(fallback_mask.any()):
+            source_batch = reference_batch if reference_batch is not None else data_dict
+            gt_speed_mean = torch.zeros((valid_mask.shape[0],), device=device, dtype=torch.float32)
+            if "decoder/agent_velocity" in source_batch and "decoder/agent_valid_mask" in source_batch:
+                gt_velocity = self._as_tensor(
+                    source_batch["decoder/agent_velocity"][:, :horizon, :, :2],
+                    device=device,
+                    dtype=dtype,
+                )
+                gt_valid_mask = self._as_tensor(
+                    source_batch["decoder/agent_valid_mask"][:, :horizon],
+                    device=device,
+                    dtype=torch.bool,
+                )
+                gt_speed_t = (
+                    torch.linalg.norm(gt_velocity.to(dtype=torch.float32), dim=-1)
+                    * decision_agent_mask[:, None, :].to(dtype=torch.float32)
+                ).sum(dim=-1)
+                gt_sdc_valid_t = (gt_valid_mask & decision_agent_mask[:, None, :]).any(dim=-1)
+                gt_speed_mean = self._masked_mean_per_example(gt_speed_t, gt_sdc_valid_t)
+            elif "decoder/agent_position" in source_batch and "decoder/agent_valid_mask" in source_batch:
+                gt_position = self._as_tensor(
+                    source_batch["decoder/agent_position"][:, :horizon, :, :2],
+                    device=device,
+                    dtype=dtype,
+                )
+                gt_valid_mask = self._as_tensor(
+                    source_batch["decoder/agent_valid_mask"][:, :horizon],
+                    device=device,
+                    dtype=torch.bool,
+                )
+                if int(gt_position.shape[1]) > 1:
+                    dt = max(self._get_rollout_step_dt_s(), 1e-3)
+                    gt_delta = gt_position[:, 1:] - gt_position[:, :-1]
+                    gt_speed_step = torch.linalg.norm(gt_delta.to(dtype=torch.float32), dim=-1) / float(dt)
+                    gt_speed_t = (
+                        gt_speed_step * decision_agent_mask[:, None, :].to(dtype=torch.float32)
+                    ).sum(dim=-1)
+                    gt_sdc_valid_t = (gt_valid_mask[:, 1:] & gt_valid_mask[:, :-1] & decision_agent_mask[:, None, :]).any(dim=-1)
+                    gt_speed_mean = self._masked_mean_per_example(gt_speed_t, gt_sdc_valid_t)
+            gt_reference_speed_t = gt_speed_mean[:, None].expand_as(floor_reference_speed_t).clamp(
+                min=0.0,
+                max=float(max_reference_speed_mps),
+            )
+            floor_reference_speed_t = torch.where(
+                fallback_mask,
+                gt_reference_speed_t,
+                floor_reference_speed_t,
+            )
+        floor_active = valid_mask & ((neighbor_count_t >= float(min_neighbors)) | fallback_mask) & bool(floor_enabled)
+        speed_floor_t = float(reference_ratio) * floor_reference_speed_t
+        floor_penalty_t = torch.where(
+            floor_active,
+            torch.relu(speed_floor_t - sdc_speed_t) * float(floor_weight),
+            torch.zeros_like(floor_reference_speed_t),
+        )
+        cap_active = valid_mask & reference_found & bool(cap_enabled)
+        speed_cap_t = (cap_reference_speed_t + float(cap_margin_mps)).clamp(
+            min=0.0,
+            max=float(max_reference_speed_mps),
+        )
+        cap_penalty_t = torch.where(
+            cap_active,
+            torch.relu(sdc_speed_t - speed_cap_t) * float(cap_weight),
+            torch.zeros_like(cap_reference_speed_t),
+        )
+        reference_speed_t = cap_reference_speed_t if cap_enabled else floor_reference_speed_t
+        penalty_t = floor_penalty_t + cap_penalty_t
+        return {
+            "penalty_t": penalty_t,
+            "reference_speed_t": reference_speed_t,
+            "neighbor_mean_speed_t": neighbor_mean_speed_t,
+            "neighbor_median_speed_t": neighbor_median_speed_t,
+            "floor_threshold_t": speed_floor_t,
+            "cap_threshold_t": speed_cap_t,
+            "floor_penalty_t": floor_penalty_t,
+            "cap_penalty_t": cap_penalty_t,
+            "sdc_speed_t": sdc_speed_t,
+            "neighbor_count_t": neighbor_count_t,
+            "penalty_mean": sanitize_scalar_loss(penalty_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "floor_penalty_mean": sanitize_scalar_loss(floor_penalty_t[floor_active].mean()) if bool(floor_active.any()) else zero,
+            "cap_penalty_mean": sanitize_scalar_loss(cap_penalty_t[cap_active].mean()) if bool(cap_active.any()) else zero,
+            "reference_speed_mean": sanitize_scalar_loss(reference_speed_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "neighbor_mean_speed_mean": sanitize_scalar_loss(neighbor_mean_speed_t[reference_found].mean()) if bool(reference_found.any()) else zero,
+            "neighbor_median_speed_mean": sanitize_scalar_loss(neighbor_median_speed_t[reference_found].mean()) if bool(reference_found.any()) else zero,
+            "floor_threshold_mean": sanitize_scalar_loss(speed_floor_t[floor_active].mean()) if bool(floor_active.any()) else zero,
+            "cap_threshold_mean": sanitize_scalar_loss(speed_cap_t[cap_active].mean()) if bool(cap_active.any()) else zero,
+            "sdc_speed_mean": sanitize_scalar_loss(sdc_speed_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "neighbor_count_mean": sanitize_scalar_loss(neighbor_count_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+        }
+
+    def _compute_sdc_semantic_ext_policy_kl(self, *, data_dict, semantic_context, teacher_logits):
+        output_logit = data_dict["decoder/output_logit"]
+        zero = output_logit.new_tensor(0.0)
+        if (
+            not self.sdc_semantic_ext_enabled
+            or semantic_context is None
+            or teacher_logits is None
+        ):
+            return {
+                "kl_gt": zero,
+                "kl_alt": zero,
+                "kl_total": zero,
+                "gt_token_fraction": zero,
+                "alt_token_fraction": zero,
+            }
+
+        decision_agent_mask = semantic_context["decision_agent_mask"][:, : output_logit.shape[2]]
+        decision_mask_f = decision_agent_mask[:, None, :, None].to(dtype=output_logit.dtype)
+        student_logits = sanitize_logits_for_loss(
+            (output_logit * decision_mask_f).sum(dim=2)
+        )
+        teacher_logits = teacher_logits[:, : output_logit.shape[1], : output_logit.shape[2]]
+        teacher_logits = teacher_logits.to(device=output_logit.device, dtype=output_logit.dtype)
+        teacher_logits = sanitize_logits_for_loss(
+            (teacher_logits * decision_mask_f).sum(dim=2)
+        )
+
+        kl_per_token = F.kl_div(
+            F.log_softmax(student_logits, dim=-1),
+            F.softmax(teacher_logits, dim=-1),
+            reduction="none",
+        ).sum(dim=-1).to(dtype=torch.float32)
+
+        sdc_valid_by_t = semantic_context["sdc_valid_by_t"]
+        factual_mask = semantic_context["factual_batch_mask"][:, None]
+        alt_mask = semantic_context["alternative_batch_mask"][:, None]
+        gt_valid = sdc_valid_by_t & factual_mask
+        alt_valid = sdc_valid_by_t & alt_mask
+
+        kl_gt = sanitize_scalar_loss(kl_per_token[gt_valid].mean()) if bool(gt_valid.any()) else zero
+        kl_alt = sanitize_scalar_loss(kl_per_token[alt_valid].mean()) if bool(alt_valid.any()) else zero
+        kl_weight_gt = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_KL_WEIGHT_GT", 0.10))
+        kl_weight_alt = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_KL_WEIGHT_ALT", 0.02))
+        kl_total = sanitize_scalar_loss(
+            float(kl_weight_gt) * kl_gt + float(kl_weight_alt) * kl_alt
+        )
+        return {
+            "kl_gt": kl_gt,
+            "kl_alt": kl_alt,
+            "kl_total": kl_total,
+            "gt_token_fraction": gt_valid.float().mean(),
+            "alt_token_fraction": alt_valid.float().mean(),
+        }
+
+    def on_save_checkpoint(self, checkpoint):
+        if self.semantic_ext_novelty_bank is not None:
+            checkpoint["semantic_ext_novelty_bank"] = self.semantic_ext_novelty_bank.state_dict()
+
+    def on_load_checkpoint(self, checkpoint):
+        if self.semantic_ext_novelty_bank is not None:
+            self.semantic_ext_novelty_bank.load_state_dict(checkpoint.get("semantic_ext_novelty_bank"))
+
+    @staticmethod
+    def _semantic_ext_round_ids(values, *, max_id):
+        values = torch.nan_to_num(values.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        return values.round().to(dtype=torch.long).clamp(min=0, max=int(max_id))
+
+    def _semantic_ext_bucket_keys(
+        self,
+        *,
+        semantic_label_id,
+        path_token,
+        compliance_token,
+        timing_token,
+    ):
+        branch_id = self._semantic_ext_round_ids(path_token[:, 0], max_id=len(BRANCH_LABEL_ORDER) - 1)
+        signal_id = self._semantic_ext_round_ids(compliance_token[:, 0], max_id=len(SIGNAL_CATEGORY_ORDER) - 1)
+        compliance_id = self._semantic_ext_round_ids(compliance_token[:, 1], max_id=len(COMPLIANCE_LABEL_ORDER) - 1)
+        timing_id = self._semantic_ext_round_ids(timing_token[:, 2], max_id=len(TIMING_LABEL_ORDER) - 1)
+        has_conflict = self._semantic_ext_round_ids(timing_token[:, 0], max_id=1)
+        keys = []
+        for idx in range(int(semantic_label_id.shape[0])):
+            keys.append(
+                (
+                    int(semantic_label_id[idx].item()),
+                    int(branch_id[idx].item()),
+                    int(signal_id[idx].item()),
+                    int(compliance_id[idx].item()),
+                    int(timing_id[idx].item()),
+                    int(has_conflict[idx].item()),
+                )
+            )
+        return keys
+
+    def _semantic_ext_target_entropy(
+        self,
+        *,
+        semantic_label_id,
+        path_token,
+        compliance_token,
+        timing_token,
+        num_active,
+    ):
+        max_entropy = math.log(float(max(num_active, 1)))
+        stop_label_id = int(SDC_PATH_SEMANTIC_LABEL_ORDER.index("stop"))
+        stop_target = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_TARGET_STOP", 0.10))
+        if int(semantic_label_id) == stop_label_id:
+            return max(0.0, min(float(stop_target), max_entropy))
+        base = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_TARGET_BASE", 0.40))
+        conflict_bonus = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_TARGET_CONFLICT_BONUS", 0.25))
+        after_conflict_bonus = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_TARGET_AFTER_CONFLICT_BONUS", 0.15)
+        )
+        turn_bonus = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_TARGET_TURN_BONUS", 0.05))
+        permissive_signal_bonus = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_TARGET_PERMISSIVE_SIGNAL_BONUS", 0.10)
+        )
+        violation_penalty = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_TARGET_VIOLATION_PENALTY", 0.10)
+        )
+        branch_id = int(self._semantic_ext_round_ids(path_token[:1, 0], max_id=len(BRANCH_LABEL_ORDER) - 1)[0].item())
+        signal_id = int(self._semantic_ext_round_ids(compliance_token[:1, 0], max_id=len(SIGNAL_CATEGORY_ORDER) - 1)[0].item())
+        compliance_id = int(self._semantic_ext_round_ids(compliance_token[:1, 1], max_id=len(COMPLIANCE_LABEL_ORDER) - 1)[0].item())
+        timing_id = int(self._semantic_ext_round_ids(timing_token[:1, 2], max_id=len(TIMING_LABEL_ORDER) - 1)[0].item())
+        has_conflict = bool(self._semantic_ext_round_ids(timing_token[:1, 0], max_id=1)[0].item() > 0)
+        target = float(base)
+        if branch_id in {
+            int(BRANCH_LABEL_ORDER.index("left")),
+            int(BRANCH_LABEL_ORDER.index("right")),
+            int(BRANCH_LABEL_ORDER.index("u_turn")),
+        }:
+            target += float(turn_bonus)
+        if has_conflict:
+            target += float(conflict_bonus)
+        if timing_id == int(TIMING_LABEL_ORDER.index("after_conflict")):
+            target += float(after_conflict_bonus)
+        if signal_id in {
+            int(SIGNAL_CATEGORY_ORDER.index("go")),
+            int(SIGNAL_CATEGORY_ORDER.index("caution")),
+            int(SIGNAL_CATEGORY_ORDER.index("unknown")),
+        }:
+            target += float(permissive_signal_bonus)
+        if compliance_id == int(COMPLIANCE_LABEL_ORDER.index("red_light_violation")):
+            target -= float(violation_penalty)
+        return max(0.0, min(float(target), max_entropy))
+
+    def _build_semantic_ext_rollout_features(
+        self,
+        *,
+        tube_distance,
+        frontier_arc_t,
+        trajectories_world,
+        current_heading_world,
+    ):
+        dt = max(self._get_rollout_step_dt_s(), 1e-3)
+        delta_pos = trajectories_world[:, :, 1:] - trajectories_world[:, :, :-1]
+        speed_t = torch.linalg.norm(delta_pos.to(dtype=torch.float32), dim=-1) / float(dt)
+        prev_speed = torch.cat([speed_t[:, :, :1], speed_t[:, :, :-1]], dim=-1)
+        accel_t = (speed_t - prev_speed) / float(dt)
+        prev_accel = torch.cat([accel_t[:, :, :1], accel_t[:, :, :-1]], dim=-1)
+        jerk_t = (accel_t - prev_accel) / float(dt)
+        move_heading = torch.atan2(delta_pos[..., 1], delta_pos[..., 0])
+        initial_heading = current_heading_world.to(dtype=torch.float32)[None, :, None]
+        prev_heading = torch.cat(
+            [initial_heading.expand(move_heading.shape[0], -1, 1), move_heading[:, :, :-1]],
+            dim=2,
+        )
+        yaw_rate_t = self._wrap_angle(move_heading - prev_heading).abs() / float(dt)
+        prev_arc = torch.cat(
+            [torch.zeros_like(frontier_arc_t[:, :, :1], dtype=torch.float32), frontier_arc_t[:, :, :-1].to(dtype=torch.float32)],
+            dim=-1,
+        )
+        arc_delta_t = torch.relu(frontier_arc_t.to(dtype=torch.float32) - prev_arc)
+        inside_t = (tube_distance <= float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_RADIUS_M", 3.0))).to(dtype=torch.float32)
+        feature_t = torch.stack(
+            [
+                frontier_arc_t.to(dtype=torch.float32) / 50.0,
+                arc_delta_t / 5.0,
+                tube_distance.to(dtype=torch.float32) / 3.0,
+                inside_t,
+                speed_t / 10.0,
+                accel_t / 4.0,
+                jerk_t / 8.0,
+                yaw_rate_t / 1.0,
+            ],
+            dim=-1,
+        )
+        return torch.nan_to_num(feature_t, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _compute_semantic_ext_behavior_aux_loss(
+        self,
+        *,
+        behavior_embedding,
+        dag_embedding,
+        semantic_label_id,
+        path_token,
+        compliance_token,
+        timing_token,
+        active_mask,
+    ):
+        zero = behavior_embedding.new_tensor(0.0)
+        if (
+            self.semantic_ext_behavior_encoder is None
+            or self.semantic_ext_semantic_head is None
+            or not bool(active_mask.any())
+        ):
+            return {
+                "loss": zero,
+                "semantic_ce": zero,
+                "branch_ce": zero,
+                "compliance_ce": zero,
+                "timing_ce": zero,
+                "dag_align": zero,
+            }
+        active_idx = torch.nonzero(active_mask, as_tuple=False).reshape(-1)
+        active_behavior = behavior_embedding[active_idx]
+        active_dag = dag_embedding[active_idx]
+        semantic_target = semantic_label_id[active_idx].to(dtype=torch.long)
+        branch_target = self._semantic_ext_round_ids(path_token[active_idx, 0], max_id=len(BRANCH_LABEL_ORDER) - 1)
+        compliance_target = self._semantic_ext_round_ids(compliance_token[active_idx, 1], max_id=len(COMPLIANCE_LABEL_ORDER) - 1)
+        timing_target = self._semantic_ext_round_ids(timing_token[active_idx, 2], max_id=len(TIMING_LABEL_ORDER) - 1)
+        semantic_ce = F.cross_entropy(self.semantic_ext_semantic_head(active_behavior), semantic_target)
+        branch_ce = F.cross_entropy(self.semantic_ext_branch_head(active_behavior), branch_target)
+        compliance_ce = F.cross_entropy(self.semantic_ext_compliance_head(active_behavior), compliance_target)
+        timing_ce = F.cross_entropy(self.semantic_ext_timing_head(active_behavior), timing_target)
+        dag_align = 1.0 - F.cosine_similarity(active_behavior, active_dag, dim=-1).mean()
+        loss = (
+            float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_BEHAVIOR_SEMANTIC_CE_WEIGHT", 0.05)) * semantic_ce
+            + float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_BEHAVIOR_BRANCH_CE_WEIGHT", 0.025)) * branch_ce
+            + float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_BEHAVIOR_COMPLIANCE_CE_WEIGHT", 0.025)) * compliance_ce
+            + float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_BEHAVIOR_TIMING_CE_WEIGHT", 0.025)) * timing_ce
+            + float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_BEHAVIOR_DAG_ALIGN_WEIGHT", 0.05)) * dag_align
+        )
+        return {
+            "loss": sanitize_scalar_loss(loss),
+            "semantic_ce": sanitize_scalar_loss(semantic_ce),
+            "branch_ce": sanitize_scalar_loss(branch_ce),
+            "compliance_ce": sanitize_scalar_loss(compliance_ce),
+            "timing_ce": sanitize_scalar_loss(timing_ce),
+            "dag_align": sanitize_scalar_loss(dag_align),
+        }
+
+    def _compute_rollout_topomcpo_regularization_bundle(
+        self,
+        *,
+        data_dict,
+        reward_t,
+        valid_mask,
+        tube_distance,
+        frontier_arc_t,
+        trajectories_world,
+        current_heading_world,
+    ):
+        zero_bonus = torch.zeros_like(reward_t, dtype=torch.float32)
+        zero = reward_t.new_tensor(0.0)
+        legacy = self._compute_rollout_terminal_consensus_bonus(
+            reward_t=reward_t,
+            valid_mask=valid_mask,
+            tube_distance=tube_distance,
+            frontier_arc_t=frontier_arc_t,
+            trajectories_world=trajectories_world,
+            current_heading_world=current_heading_world,
+        )
+        default_bundle = {
+            "bonus_t": legacy["bonus_t"],
+            "consensus_bonus_t": legacy["bonus_t"],
+            "novelty_bonus_t": zero_bonus,
+            "bonus_mean": legacy["bonus_mean"],
+            "consensus_bonus_mean": legacy["bonus_mean"],
+            "novelty_bonus_mean": zero,
+            "novelty_score_mean": zero,
+            "cluster_count_mean": legacy["cluster_count_mean"],
+            "cluster_entropy_mean": legacy["cluster_entropy_mean"],
+            "target_entropy_mean": zero,
+            "thermostat_alpha_mean": zero,
+            "thermostat_eta_mean": zero,
+            "behavior_aux_loss": zero,
+            "behavior_semantic_ce": zero,
+            "behavior_branch_ce": zero,
+            "behavior_compliance_ce": zero,
+            "behavior_timing_ce": zero,
+            "behavior_dag_align": zero,
+        }
+        if self.semantic_ext_behavior_encoder is None or self.semantic_ext_dag_encoder is None:
+            return default_bundle
+
+        path_token = self._as_tensor(
+            data_dict.get("cf/path_token", reward_t.new_zeros((reward_t.shape[1], PATH_TOKEN_DIM))),
+            device=reward_t.device,
+            dtype=torch.float32,
+        ).reshape(reward_t.shape[1], -1)
+        compliance_token = self._as_tensor(
+            data_dict.get("cf/compliance_token", reward_t.new_zeros((reward_t.shape[1], COMPLIANCE_TOKEN_DIM))),
+            device=reward_t.device,
+            dtype=torch.float32,
+        ).reshape(reward_t.shape[1], -1)
+        timing_token = self._as_tensor(
+            data_dict.get("cf/timing_token", reward_t.new_zeros((reward_t.shape[1], TIMING_TOKEN_DIM))),
+            device=reward_t.device,
+            dtype=torch.float32,
+        ).reshape(reward_t.shape[1], -1)
+        semantic_label_id = self._as_tensor(
+            data_dict.get("cf/sdc_semantic_label_id", reward_t.new_zeros((reward_t.shape[1],))),
+            device=reward_t.device,
+            dtype=torch.long,
+        ).reshape(reward_t.shape[1], -1)[:, 0]
+
+        feature_t = self._build_semantic_ext_rollout_features(
+            tube_distance=tube_distance,
+            frontier_arc_t=frontier_arc_t,
+            trajectories_world=trajectories_world,
+            current_heading_world=current_heading_world,
+        )
+        group_size, batch_size, horizon, feature_dim = feature_t.shape
+        flat_size = int(group_size * batch_size)
+        flat_feature = feature_t.reshape(flat_size, horizon, feature_dim)
+        flat_valid = valid_mask.reshape(flat_size, horizon)
+        flat_behavior = self.semantic_ext_behavior_encoder(flat_feature, flat_valid)
+        repeated_path = path_token[None, :, :].expand(group_size, -1, -1).reshape(flat_size, -1)
+        repeated_compliance = compliance_token[None, :, :].expand(group_size, -1, -1).reshape(flat_size, -1)
+        repeated_timing = timing_token[None, :, :].expand(group_size, -1, -1).reshape(flat_size, -1)
+        repeated_semantic = semantic_label_id[None, :].expand(group_size, -1).reshape(flat_size)
+        flat_dag = self.semantic_ext_dag_encoder(
+            path_token=repeated_path,
+            compliance_token=repeated_compliance,
+            timing_token=repeated_timing,
+        )
+        flat_valid_return = valid_mask.any(dim=-1).reshape(flat_size)
+        behavior_aux_bundle = self._compute_semantic_ext_behavior_aux_loss(
+            behavior_embedding=flat_behavior,
+            dag_embedding=flat_dag,
+            semantic_label_id=repeated_semantic,
+            path_token=repeated_path,
+            compliance_token=repeated_compliance,
+            timing_token=repeated_timing,
+            active_mask=flat_valid_return,
+        )
+        if not bool(flat_valid_return.any()):
+            default_bundle.update(
+                {
+                    "behavior_aux_loss": behavior_aux_bundle["loss"],
+                    "behavior_semantic_ce": behavior_aux_bundle["semantic_ce"],
+                    "behavior_branch_ce": behavior_aux_bundle["branch_ce"],
+                    "behavior_compliance_ce": behavior_aux_bundle["compliance_ce"],
+                    "behavior_timing_ce": behavior_aux_bundle["timing_ce"],
+                    "behavior_dag_align": behavior_aux_bundle["dag_align"],
+                }
+            )
+            return default_bundle
+
+        total_return = reward_t.sum(dim=-1)
+        valid_return = valid_mask.any(dim=-1)
+        normalized_return = self._group_normalize_advantages(total_return, valid_return).reshape(flat_size)
+        flat_batch_id = torch.arange(batch_size, device=reward_t.device)[None, :].expand(group_size, -1).reshape(flat_size)
+        novelty_scores_flat = reward_t.new_zeros((flat_size,), dtype=torch.float32)
+        active_idx = torch.nonzero(flat_valid_return, as_tuple=False).reshape(-1)
+        bucket_keys = self._semantic_ext_bucket_keys(
+            semantic_label_id=repeated_semantic[active_idx],
+            path_token=repeated_path[active_idx],
+            compliance_token=repeated_compliance[active_idx],
+            timing_token=repeated_timing[active_idx],
+        )
+        novelty_enabled = bool(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_NOVELTY_ENABLED", False))
+        if novelty_enabled and self.semantic_ext_novelty_bank is not None:
+            novelty_scores = self.semantic_ext_novelty_bank.score(
+                flat_behavior[active_idx].detach(),
+                bucket_keys,
+                warmup_count=int(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_NOVELTY_WARMUP_COUNT", 32)),
+            )
+            novelty_scores_flat[active_idx] = novelty_scores.to(device=reward_t.device, dtype=torch.float32)
+            if self.training:
+                self.semantic_ext_novelty_bank.update(flat_behavior[active_idx].detach(), bucket_keys)
+
+        cluster_radius = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_CONSENSUS_CLUSTER_RADIUS", 0.75))
+        consensus_base = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_CONSENSUS_WEIGHT", 0.10))
+        novelty_base = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_NOVELTY_BASE_WEIGHT", 0.05))
+        thermostat_enabled = bool(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_ENABLED", False))
+        thermostat_k_alpha = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_K_ALPHA", 0.10))
+        thermostat_k_eta = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_K_ETA", 0.10))
+        novelty_clamp = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_NOVELTY_STD_CLAMP", 2.0))
+
+        consensus_bonus_t = torch.zeros_like(reward_t, dtype=torch.float32)
+        novelty_bonus_t = torch.zeros_like(reward_t, dtype=torch.float32)
+        cluster_count_values = []
+        cluster_entropy_values = []
+        target_entropy_values = []
+        thermostat_alpha_values = []
+        thermostat_eta_values = []
+
+        for batch_idx in range(batch_size):
+            local_active = torch.nonzero(flat_valid_return & (flat_batch_id == batch_idx), as_tuple=False).reshape(-1)
+            if int(local_active.numel()) <= 0:
+                continue
+            embeddings = flat_behavior[local_active].detach()
+            norm_returns = normalized_return[local_active].to(dtype=torch.float32)
+            assignments = torch.full((int(local_active.numel()),), -1, device=reward_t.device, dtype=torch.long)
+            cluster_members = []
+            for idx in range(int(local_active.numel())):
+                if int(assignments[idx].item()) >= 0:
+                    continue
+                center = embeddings[idx]
+                distance = torch.linalg.norm(embeddings - center[None, :], dim=-1)
+                member_mask = (assignments < 0) & (distance <= float(cluster_radius))
+                assignments[member_mask] = len(cluster_members)
+                cluster_members.append(torch.nonzero(member_mask, as_tuple=False).reshape(-1))
+
+            probs = [float(members.numel()) / float(max(int(local_active.numel()), 1)) for members in cluster_members]
+            entropy = 0.0
+            if probs:
+                probs_t = torch.as_tensor(probs, device=reward_t.device, dtype=torch.float32)
+                entropy = float((-(probs_t * torch.log(probs_t.clamp_min(1e-6))).sum()).item())
+            target_entropy = self._semantic_ext_target_entropy(
+                semantic_label_id=int(semantic_label_id[batch_idx].item()),
+                path_token=path_token[batch_idx : batch_idx + 1],
+                compliance_token=compliance_token[batch_idx : batch_idx + 1],
+                timing_token=timing_token[batch_idx : batch_idx + 1],
+                num_active=int(local_active.numel()),
+            )
+            alpha = float(consensus_base)
+            eta = float(novelty_base if novelty_enabled else 0.0)
+            if thermostat_enabled:
+                alpha = max(0.0, alpha + float(thermostat_k_alpha) * float(entropy - target_entropy))
+                eta = max(0.0, eta + float(thermostat_k_eta) * float(target_entropy - entropy))
+
+            cluster_count_values.append(float(len(cluster_members)))
+            cluster_entropy_values.append(float(entropy))
+            target_entropy_values.append(float(target_entropy))
+            thermostat_alpha_values.append(float(alpha))
+            thermostat_eta_values.append(float(eta))
+
+            for members in cluster_members:
+                mass_fraction = float(members.numel()) / float(max(int(local_active.numel()), 1))
+                cluster_quality = torch.clamp(norm_returns[members].mean(), min=0.0, max=1.0)
+                bonus = float(alpha) * float(mass_fraction) * cluster_quality
+                for local_member in members.tolist():
+                    flat_idx = int(local_active[local_member].item())
+                    rollout_idx = flat_idx // batch_size
+                    valid_steps = torch.nonzero(valid_mask[rollout_idx, batch_idx], as_tuple=False).reshape(-1)
+                    if int(valid_steps.numel()) <= 0:
+                        continue
+                    consensus_bonus_t[rollout_idx, batch_idx, int(valid_steps[-1].item())] += bonus
+
+            if novelty_enabled and float(eta) > 0.0:
+                local_scores = novelty_scores_flat[local_active]
+                if int(local_scores.numel()) > 1:
+                    standardized = (local_scores - local_scores.mean()) / local_scores.std(unbiased=False).clamp_min(1e-6)
+                else:
+                    standardized = torch.zeros_like(local_scores)
+                novelty_signal = torch.relu(standardized).clamp(max=float(novelty_clamp))
+                for local_member, bonus_value in enumerate((float(eta) * novelty_signal).tolist()):
+                    if bonus_value <= 0.0:
+                        continue
+                    flat_idx = int(local_active[local_member].item())
+                    rollout_idx = flat_idx // batch_size
+                    valid_steps = torch.nonzero(valid_mask[rollout_idx, batch_idx], as_tuple=False).reshape(-1)
+                    if int(valid_steps.numel()) <= 0:
+                        continue
+                    novelty_bonus_t[rollout_idx, batch_idx, int(valid_steps[-1].item())] += float(bonus_value)
+
+        bonus_t = consensus_bonus_t + novelty_bonus_t
+        cluster_count_mean = zero if not cluster_count_values else reward_t.new_tensor(sum(cluster_count_values) / len(cluster_count_values))
+        cluster_entropy_mean = zero if not cluster_entropy_values else reward_t.new_tensor(sum(cluster_entropy_values) / len(cluster_entropy_values))
+        target_entropy_mean = zero if not target_entropy_values else reward_t.new_tensor(sum(target_entropy_values) / len(target_entropy_values))
+        thermostat_alpha_mean = zero if not thermostat_alpha_values else reward_t.new_tensor(sum(thermostat_alpha_values) / len(thermostat_alpha_values))
+        thermostat_eta_mean = zero if not thermostat_eta_values else reward_t.new_tensor(sum(thermostat_eta_values) / len(thermostat_eta_values))
+        bonus_mean = sanitize_scalar_loss(bonus_t[valid_mask].mean()) if bool(valid_mask.any()) else zero
+        consensus_bonus_mean = sanitize_scalar_loss(consensus_bonus_t[valid_mask].mean()) if bool(valid_mask.any()) else zero
+        novelty_bonus_mean = sanitize_scalar_loss(novelty_bonus_t[valid_mask].mean()) if bool(valid_mask.any()) else zero
+        novelty_score_mean = sanitize_scalar_loss(novelty_scores_flat[flat_valid_return].mean()) if bool(flat_valid_return.any()) else zero
+        return {
+            "bonus_t": bonus_t,
+            "consensus_bonus_t": consensus_bonus_t,
+            "novelty_bonus_t": novelty_bonus_t,
+            "bonus_mean": bonus_mean,
+            "consensus_bonus_mean": consensus_bonus_mean,
+            "novelty_bonus_mean": novelty_bonus_mean,
+            "novelty_score_mean": novelty_score_mean,
+            "cluster_count_mean": cluster_count_mean,
+            "cluster_entropy_mean": cluster_entropy_mean,
+            "target_entropy_mean": target_entropy_mean,
+            "thermostat_alpha_mean": thermostat_alpha_mean,
+            "thermostat_eta_mean": thermostat_eta_mean,
+            "behavior_aux_loss": behavior_aux_bundle["loss"],
+            "behavior_semantic_ce": behavior_aux_bundle["semantic_ce"],
+            "behavior_branch_ce": behavior_aux_bundle["branch_ce"],
+            "behavior_compliance_ce": behavior_aux_bundle["compliance_ce"],
+            "behavior_timing_ce": behavior_aux_bundle["timing_ce"],
+            "behavior_dag_align": behavior_aux_bundle["dag_align"],
+        }
+
+    def _compute_rollout_terminal_consensus_bonus(
+        self,
+        *,
+        reward_t,
+        valid_mask,
+        tube_distance,
+        frontier_arc_t,
+        trajectories_world,
+        current_heading_world,
+    ):
+        zero_bonus = torch.zeros_like(reward_t, dtype=torch.float32)
+        zero = reward_t.new_tensor(0.0)
+        if not self.sdc_semantic_ext_enabled:
+            return {
+                "bonus_t": zero_bonus,
+                "bonus_mean": zero,
+                "cluster_count_mean": zero,
+                "cluster_entropy_mean": zero,
+            }
+
+        consensus_weight = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_CONSENSUS_WEIGHT", 0.10)
+        )
+        cluster_radius = float(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_CONSENSUS_CLUSTER_RADIUS", 0.75)
+        )
+        if consensus_weight <= 0.0 or cluster_radius <= 0.0:
+            return {
+                "bonus_t": zero_bonus,
+                "bonus_mean": zero,
+                "cluster_count_mean": zero,
+                "cluster_entropy_mean": zero,
+            }
+
+        dt = max(self._get_rollout_step_dt_s(), 1e-3)
+        valid_float = valid_mask.to(dtype=torch.float32)
+        total_return = reward_t.sum(dim=-1)
+        valid_return = valid_mask.any(dim=-1)
+        normalized_return = self._group_normalize_advantages(total_return, valid_return)
+
+        frontier_final = torch.where(
+            valid_return,
+            frontier_arc_t.max(dim=-1).values.to(dtype=torch.float32),
+            torch.zeros_like(total_return, dtype=torch.float32),
+        )
+        inside_fraction = torch.where(
+            valid_return,
+            (valid_mask & (tube_distance <= float(self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_RADIUS_M", 3.0)))).float().sum(dim=-1)
+            / valid_float.sum(dim=-1).clamp_min(1.0),
+            torch.zeros_like(total_return, dtype=torch.float32),
+        )
+        mean_tube_distance = self._masked_mean_per_example(tube_distance, valid_mask)
+
+        delta_pos = trajectories_world[:, :, 1:] - trajectories_world[:, :, :-1]
+        speed_t = torch.linalg.norm(delta_pos.to(dtype=torch.float32), dim=-1) / float(dt)
+        mean_speed = self._masked_mean_per_example(speed_t, valid_mask)
+
+        move_heading = torch.atan2(delta_pos[..., 1], delta_pos[..., 0])
+        initial_heading = current_heading_world.to(dtype=torch.float32)[None, :, None]
+        prev_heading = torch.cat([initial_heading.expand(move_heading.shape[0], -1, 1), move_heading[:, :, :-1]], dim=2)
+        yaw_rate_t = self._wrap_angle(move_heading - prev_heading).abs() / float(dt)
+        mean_abs_yaw_rate = self._masked_mean_per_example(yaw_rate_t, valid_mask)
+
+        feature_stack = torch.stack(
+            [
+                frontier_final / 50.0,
+                inside_fraction,
+                mean_tube_distance / 3.0,
+                mean_speed / 10.0,
+                mean_abs_yaw_rate / 1.0,
+            ],
+            dim=-1,
+        )
+        feature_stack = torch.nan_to_num(feature_stack, nan=0.0, posinf=0.0, neginf=0.0)
+
+        bonus_t = torch.zeros_like(reward_t, dtype=torch.float32)
+        cluster_count_values = []
+        cluster_entropy_values = []
+        for batch_idx in range(int(feature_stack.shape[1])):
+            active = torch.nonzero(valid_return[:, batch_idx], as_tuple=False).reshape(-1)
+            if int(active.numel()) <= 0:
+                continue
+            embeddings = feature_stack[active, batch_idx]
+            norm_returns = normalized_return[active, batch_idx].to(dtype=torch.float32)
+            num_active = int(active.numel())
+            assignments = torch.full((num_active,), -1, device=embeddings.device, dtype=torch.long)
+            cluster_members = []
+            for idx in range(num_active):
+                if int(assignments[idx].item()) >= 0:
+                    continue
+                center = embeddings[idx]
+                distance = torch.linalg.norm(embeddings - center[None, :], dim=-1)
+                member_mask = (assignments < 0) & (distance <= float(cluster_radius))
+                cluster_id = len(cluster_members)
+                assignments[member_mask] = cluster_id
+                cluster_members.append(torch.nonzero(member_mask, as_tuple=False).reshape(-1))
+
+            cluster_count_values.append(float(len(cluster_members)))
+            probs = []
+            for members in cluster_members:
+                probs.append(float(members.numel()) / float(max(num_active, 1)))
+                mass_fraction = float(members.numel()) / float(max(num_active, 1))
+                cluster_quality = torch.clamp(norm_returns[members].mean(), min=0.0, max=1.0)
+                bonus = float(consensus_weight) * float(mass_fraction) * cluster_quality
+                for local_idx in members.tolist():
+                    rollout_idx = int(active[local_idx].item())
+                    valid_steps = torch.nonzero(valid_mask[rollout_idx, batch_idx], as_tuple=False).reshape(-1)
+                    if int(valid_steps.numel()) <= 0:
+                        continue
+                    bonus_t[rollout_idx, batch_idx, int(valid_steps[-1].item())] += bonus
+            if probs:
+                probs_t = torch.as_tensor(probs, device=feature_stack.device, dtype=torch.float32)
+                cluster_entropy_values.append(float((-(probs_t * torch.log(probs_t.clamp_min(1e-6))).sum()).item()))
+
+        cluster_count_mean = zero if not cluster_count_values else reward_t.new_tensor(sum(cluster_count_values) / len(cluster_count_values))
+        cluster_entropy_mean = zero if not cluster_entropy_values else reward_t.new_tensor(sum(cluster_entropy_values) / len(cluster_entropy_values))
+        bonus_mean = sanitize_scalar_loss(bonus_t[valid_mask].mean()) if bool(valid_mask.any()) else zero
+        return {
+            "bonus_t": bonus_t,
+            "bonus_mean": bonus_mean,
+            "cluster_count_mean": cluster_count_mean,
+            "cluster_entropy_mean": cluster_entropy_mean,
+        }
+
     def _compute_discounted_return_to_go(self, reward_t, valid_mask, *, discount):
         reward_t = reward_t.to(dtype=torch.float32)
         valid_mask = valid_mask.to(dtype=torch.bool)
@@ -953,11 +2027,12 @@ class MotionLMLightning(pl.LightningModule):
             )
         return out.to(dtype=torch.float32)
 
-    def _compute_sdc_rollout_tube_rewards(self, *, data_dict, semantic_context):
+    def _compute_sdc_rollout_tube_rewards(self, *, data_dict, semantic_context, reference_batch=None):
         output_logit = data_dict["decoder/output_logit"]
         device = output_logit.device
         dtype = output_logit.dtype
         zero = output_logit.new_tensor(0.0)
+        semantic_ext_enabled = bool(self.sdc_semantic_ext_enabled)
         required = (
             "decoder/rollout_next_position",
             "cf/sdc_semantic_label_id",
@@ -973,12 +2048,37 @@ class MotionLMLightning(pl.LightningModule):
                 "tube_distance": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
                 "progress_reward_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
                 "frontier_arc_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "stall_penalty_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "center_penalty_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "traffic_speed_penalty_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "traffic_speed_reference_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "traffic_speed_neighbor_mean_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "traffic_speed_neighbor_median_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "traffic_speed_floor_threshold_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "traffic_speed_cap_threshold_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "traffic_speed_cap_penalty_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "traffic_speed_sdc_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
+                "traffic_speed_neighbor_count_t": output_logit.new_zeros((output_logit.shape[0], output_logit.shape[1]), dtype=torch.float32),
                 "inside_fraction": zero,
                 "first_step_reward_mean": zero,
                 "progress_reward_mean": zero,
+                "stall_penalty_mean": zero,
+                "center_penalty_mean": zero,
+                "traffic_speed_penalty_mean": zero,
+                "traffic_speed_reference_mean": zero,
+                "traffic_speed_neighbor_mean_mean": zero,
+                "traffic_speed_neighbor_median_mean": zero,
+                "traffic_speed_floor_penalty_mean": zero,
+                "traffic_speed_cap_penalty_mean": zero,
+                "traffic_speed_cap_threshold_mean": zero,
+                "traffic_speed_sdc_mean": zero,
+                "traffic_speed_neighbor_count_mean": zero,
+                "center_curriculum_weight": zero,
                 "frontier_arc_final_mean": zero,
                 "progress_cap_arc_mean": zero,
                 "divergence_onset_mean": zero,
+                "inside_fraction_per_example": output_logit.new_zeros((output_logit.shape[0],), dtype=torch.float32),
+                "tube_distance_mean_per_example": output_logit.new_zeros((output_logit.shape[0],), dtype=torch.float32),
             }
 
         rollout_next_position = self._as_tensor(
@@ -1087,8 +2187,16 @@ class MotionLMLightning(pl.LightningModule):
             & (semantic_target != stop_label_id)[:, None]
             & route_available[:, None]
         )
-        progress_reward_scale = float(
+        progress_reward_scale_cfg = float(
             self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_REWARD_SCALE", 0.0)
+        )
+        semantic_ext_allow_progress_reward = bool(
+            self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_ALLOW_PROGRESS_REWARD", False)
+        )
+        progress_reward_scale = (
+            progress_reward_scale_cfg
+            if ((not semantic_ext_enabled) or semantic_ext_allow_progress_reward)
+            else 0.0
         )
         progress_exponent = float(
             self.config.MODEL.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_EXPONENT", 2.0)
@@ -1110,8 +2218,19 @@ class MotionLMLightning(pl.LightningModule):
         progress_reward_t = torch.zeros_like(reward_t)
         frontier_arc_t = torch.zeros_like(reward_t)
         progress_cap_arc_t = torch.zeros_like(reward_t)
+        stall_penalty_t = torch.zeros_like(reward_t)
+        center_penalty_t = torch.zeros_like(reward_t)
+        traffic_speed_penalty_t = torch.zeros_like(reward_t)
+        traffic_speed_reference_t = torch.zeros_like(reward_t)
+        traffic_speed_neighbor_mean_t = torch.zeros_like(reward_t)
+        traffic_speed_neighbor_median_t = torch.zeros_like(reward_t)
+        traffic_speed_floor_threshold_t = torch.zeros_like(reward_t)
+        traffic_speed_cap_threshold_t = torch.zeros_like(reward_t)
+        traffic_speed_cap_penalty_t = torch.zeros_like(reward_t)
+        traffic_speed_sdc_t = torch.zeros_like(reward_t)
+        traffic_speed_neighbor_count_t = torch.zeros_like(reward_t)
         divergence_onset_m = torch.zeros((reward_t.shape[0],), device=reward_t.device, dtype=torch.float32)
-        if progress_reward_scale > 0.0:
+        if progress_reward_scale_cfg > 0.0 or semantic_ext_enabled:
             progress_gate_radius = max(float(tube_radius_m) * float(progress_gate_mult), 0.0)
             onset_valid = torch.isfinite(family_divergence_onsets) & (family_divergence_onsets >= 0.0)
             onset_large = torch.full_like(family_divergence_onsets, 1e6)
@@ -1215,15 +2334,72 @@ class MotionLMLightning(pl.LightningModule):
                 dim=-1,
             ).values
             progress_cap_arc_t = cap_safe[:, None].expand_as(reward_t)
-            prev_frontier = torch.cat(
-                [torch.zeros_like(frontier_potential[:, :1]), frontier_potential[:, :-1]],
-                dim=-1,
-            )
-            progress_reward_t = torch.relu(frontier_potential - prev_frontier) * float(progress_reward_scale)
-            reward_t = reward_t + progress_reward_t
+            if progress_reward_scale > 0.0:
+                prev_frontier = torch.cat(
+                    [torch.zeros_like(frontier_potential[:, :1]), frontier_potential[:, :-1]],
+                    dim=-1,
+                )
+                progress_reward_t = torch.relu(frontier_potential - prev_frontier) * float(progress_reward_scale)
+                reward_t = reward_t + progress_reward_t
+            if semantic_ext_enabled:
+                grace_steps = max(0, int(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_STALL_GRACE_STEPS", 8)))
+                window_steps = max(1, int(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_STALL_WINDOW_STEPS", 8)))
+                stall_weight = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_STALL_WEIGHT", 0.10))
+                stall_min_advance_m = float(
+                    self.config.MODEL.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_STALL_MIN_ADVANCE_M", 0.5)
+                )
+                if stall_weight > 0.0:
+                    shifted_frontier = torch.zeros_like(frontier_arc_t)
+                    if window_steps < int(frontier_arc_t.shape[1]):
+                        shifted_frontier[:, window_steps:] = frontier_arc_t[:, :-window_steps]
+                    advance_over_window = frontier_arc_t - shifted_frontier
+                    step_idx = torch.arange(frontier_arc_t.shape[1], device=device).view(1, -1)
+                    stall_active = valid_mask & (step_idx >= int(grace_steps))
+                    stall_penalty_t = torch.where(
+                        stall_active,
+                        torch.relu(float(stall_min_advance_m) - advance_over_window) * float(stall_weight),
+                        torch.zeros_like(frontier_arc_t),
+                    )
+                    reward_t = reward_t - stall_penalty_t
+
+                traffic_speed_bundle = self._compute_semantic_ext_traffic_speed_floor_bundle(
+                    data_dict=data_dict,
+                    semantic_context=semantic_context,
+                    sdc_next_pos_world=sdc_next_pos_world.to(dtype=torch.float32),
+                    valid_mask=valid_mask,
+                    reference_batch=reference_batch,
+                    frontier_arc_t=frontier_arc_t,
+                )
+                traffic_speed_penalty_t = traffic_speed_bundle["penalty_t"]
+                traffic_speed_reference_t = traffic_speed_bundle["reference_speed_t"]
+                traffic_speed_neighbor_mean_t = traffic_speed_bundle["neighbor_mean_speed_t"]
+                traffic_speed_neighbor_median_t = traffic_speed_bundle["neighbor_median_speed_t"]
+                traffic_speed_floor_threshold_t = traffic_speed_bundle["floor_threshold_t"]
+                traffic_speed_cap_threshold_t = traffic_speed_bundle["cap_threshold_t"]
+                traffic_speed_cap_penalty_t = traffic_speed_bundle["cap_penalty_t"]
+                traffic_speed_sdc_t = traffic_speed_bundle["sdc_speed_t"]
+                traffic_speed_neighbor_count_t = traffic_speed_bundle["neighbor_count_t"]
+                reward_t = reward_t - traffic_speed_penalty_t
+
+        center_curriculum_weight = self._semantic_ext_center_curriculum_weight(device=device)
+        if semantic_ext_enabled and float(center_curriculum_weight.item()) > 0.0:
+            center_penalty_t = F.smooth_l1_loss(
+                tube_distance,
+                torch.zeros_like(tube_distance),
+                beta=1.0,
+                reduction="none",
+            ) * center_curriculum_weight.to(dtype=torch.float32)
+            center_penalty_t = torch.where(valid_mask, center_penalty_t, torch.zeros_like(center_penalty_t))
+            reward_t = reward_t - center_penalty_t
         reward_t = torch.where(valid_mask, reward_t, torch.zeros_like(reward_t))
         inside_mask = valid_mask & (tube_distance <= tube_radius_m)
         valid_frontier = valid_mask.any(dim=-1)
+        inside_fraction_per_example = torch.where(
+            valid_frontier,
+            inside_mask.float().sum(dim=-1) / valid_mask.float().sum(dim=-1).clamp_min(1.0),
+            torch.zeros_like(valid_frontier, dtype=torch.float32),
+        )
+        tube_distance_mean_per_example = self._masked_mean_per_example(tube_distance, valid_mask)
         return {
             "reward_t": reward_t,
             "valid_mask": valid_mask,
@@ -1231,13 +2407,38 @@ class MotionLMLightning(pl.LightningModule):
             "progress_reward_t": progress_reward_t,
             "frontier_arc_t": frontier_arc_t,
             "progress_cap_arc_t": progress_cap_arc_t,
+            "stall_penalty_t": stall_penalty_t,
+            "center_penalty_t": center_penalty_t,
+            "traffic_speed_penalty_t": traffic_speed_penalty_t,
+            "traffic_speed_reference_t": traffic_speed_reference_t,
+            "traffic_speed_neighbor_mean_t": traffic_speed_neighbor_mean_t,
+            "traffic_speed_neighbor_median_t": traffic_speed_neighbor_median_t,
+            "traffic_speed_floor_threshold_t": traffic_speed_floor_threshold_t,
+            "traffic_speed_cap_threshold_t": traffic_speed_cap_threshold_t,
+            "traffic_speed_cap_penalty_t": traffic_speed_cap_penalty_t,
+            "traffic_speed_sdc_t": traffic_speed_sdc_t,
+            "traffic_speed_neighbor_count_t": traffic_speed_neighbor_count_t,
             "divergence_onset_m": divergence_onset_m,
             "inside_fraction": sanitize_scalar_loss(inside_mask.float().mean()) if bool(valid_mask.any()) else zero,
             "first_step_reward_mean": sanitize_scalar_loss(reward_t[:, 0].mean()) if reward_t.shape[1] > 0 else zero,
             "progress_reward_mean": sanitize_scalar_loss(progress_reward_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "stall_penalty_mean": sanitize_scalar_loss(stall_penalty_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "center_penalty_mean": sanitize_scalar_loss(center_penalty_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "traffic_speed_penalty_mean": traffic_speed_bundle["penalty_mean"] if semantic_ext_enabled else zero,
+            "traffic_speed_reference_mean": traffic_speed_bundle["reference_speed_mean"] if semantic_ext_enabled else zero,
+            "traffic_speed_neighbor_mean_mean": traffic_speed_bundle["neighbor_mean_speed_mean"] if semantic_ext_enabled else zero,
+            "traffic_speed_neighbor_median_mean": traffic_speed_bundle["neighbor_median_speed_mean"] if semantic_ext_enabled else zero,
+            "traffic_speed_floor_penalty_mean": traffic_speed_bundle["floor_penalty_mean"] if semantic_ext_enabled else zero,
+            "traffic_speed_cap_penalty_mean": traffic_speed_bundle["cap_penalty_mean"] if semantic_ext_enabled else zero,
+            "traffic_speed_cap_threshold_mean": traffic_speed_bundle["cap_threshold_mean"] if semantic_ext_enabled else zero,
+            "traffic_speed_sdc_mean": traffic_speed_bundle["sdc_speed_mean"] if semantic_ext_enabled else zero,
+            "traffic_speed_neighbor_count_mean": traffic_speed_bundle["neighbor_count_mean"] if semantic_ext_enabled else zero,
+            "center_curriculum_weight": center_curriculum_weight,
             "frontier_arc_final_mean": sanitize_scalar_loss(frontier_arc_t[:, -1][valid_frontier].mean()) if bool(valid_frontier.any()) else zero,
             "progress_cap_arc_mean": sanitize_scalar_loss(progress_cap_arc_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
             "divergence_onset_mean": sanitize_scalar_loss(divergence_onset_m[valid_frontier].mean()) if bool(valid_frontier.any()) else zero,
+            "inside_fraction_per_example": inside_fraction_per_example,
+            "tube_distance_mean_per_example": tube_distance_mean_per_example,
         }
 
     def _build_sdc_semantic_rollout_tube_policy_objective(self, *, data_dict):
@@ -1257,6 +2458,32 @@ class MotionLMLightning(pl.LightningModule):
                 "advantage_abs_mean": zero,
                 "tube_distance_mean": zero,
                 "progress_reward_mean": zero,
+                "stall_penalty_mean": zero,
+                "center_penalty_mean": zero,
+                "traffic_speed_penalty_mean": zero,
+                "traffic_speed_reference_mean": zero,
+                "traffic_speed_neighbor_mean_mean": zero,
+                "traffic_speed_neighbor_median_mean": zero,
+                "traffic_speed_floor_penalty_mean": zero,
+                "traffic_speed_cap_penalty_mean": zero,
+                "traffic_speed_cap_threshold_mean": zero,
+                "traffic_speed_sdc_mean": zero,
+                "traffic_speed_neighbor_count_mean": zero,
+                "center_curriculum_weight": zero,
+                "consensus_bonus_mean": zero,
+                "novelty_bonus_mean": zero,
+                "novelty_score_mean": zero,
+                "consensus_cluster_count_mean": zero,
+                "consensus_cluster_entropy_mean": zero,
+                "thermostat_target_entropy_mean": zero,
+                "thermostat_alpha_mean": zero,
+                "thermostat_eta_mean": zero,
+                "behavior_aux_loss": zero,
+                "behavior_semantic_ce": zero,
+                "behavior_branch_ce": zero,
+                "behavior_compliance_ce": zero,
+                "behavior_timing_ce": zero,
+                "behavior_dag_align": zero,
                 "frontier_arc_final_mean": zero,
                 "progress_cap_arc_mean": zero,
                 "divergence_onset_mean": zero,
@@ -1275,12 +2502,33 @@ class MotionLMLightning(pl.LightningModule):
         log_prob_list = []
         distance_list = []
         progress_reward_list = []
+        stall_penalty_list = []
+        center_penalty_list = []
+        traffic_speed_penalty_list = []
+        traffic_speed_reference_list = []
+        traffic_speed_neighbor_mean_list = []
+        traffic_speed_neighbor_median_list = []
+        traffic_speed_floor_threshold_list = []
+        traffic_speed_cap_threshold_list = []
+        traffic_speed_cap_penalty_list = []
+        traffic_speed_sdc_list = []
+        traffic_speed_neighbor_count_list = []
         frontier_arc_list = []
         progress_cap_arc_list = []
         divergence_onset_list = []
         inside_fraction_list = []
-        trajectory_list = [] if debug_required else None
+        traffic_speed_penalty_mean_list = []
+        traffic_speed_reference_mean_list = []
+        traffic_speed_neighbor_mean_mean_list = []
+        traffic_speed_neighbor_median_mean_list = []
+        traffic_speed_floor_penalty_mean_list = []
+        traffic_speed_cap_penalty_mean_list = []
+        traffic_speed_cap_threshold_mean_list = []
+        traffic_speed_sdc_mean_list = []
+        traffic_speed_neighbor_count_mean_list = []
+        trajectory_list = []
         action_token_list = [] if debug_required else None
+        current_heading_list = []
 
         motion_decoder = getattr(self.model, "motion_decoder", None)
         previous_null_dropout_prob = getattr(motion_decoder, "cf_null_dropout_prob", None)
@@ -1313,6 +2561,7 @@ class MotionLMLightning(pl.LightningModule):
                     reward_bundle = self._compute_sdc_rollout_tube_rewards(
                         data_dict=rollout_eval_dict,
                         semantic_context=rollout_semantic_context,
+                        reference_batch=data_dict,
                     )
                 decision_agent_mask = rollout_semantic_context["decision_agent_mask"]
                 rollout_next_position = self._as_tensor(
@@ -1343,20 +2592,48 @@ class MotionLMLightning(pl.LightningModule):
                 valid_list.append(reward_bundle["valid_mask"])
                 distance_list.append(reward_bundle["tube_distance"])
                 progress_reward_list.append(reward_bundle["progress_reward_t"])
+                stall_penalty_list.append(reward_bundle["stall_penalty_t"])
+                center_penalty_list.append(reward_bundle["center_penalty_t"])
+                traffic_speed_penalty_list.append(reward_bundle["traffic_speed_penalty_t"])
+                traffic_speed_reference_list.append(reward_bundle["traffic_speed_reference_t"])
+                traffic_speed_neighbor_mean_list.append(reward_bundle["traffic_speed_neighbor_mean_t"])
+                traffic_speed_neighbor_median_list.append(reward_bundle["traffic_speed_neighbor_median_t"])
+                traffic_speed_floor_threshold_list.append(reward_bundle["traffic_speed_floor_threshold_t"])
+                traffic_speed_cap_threshold_list.append(reward_bundle["traffic_speed_cap_threshold_t"])
+                traffic_speed_cap_penalty_list.append(reward_bundle["traffic_speed_cap_penalty_t"])
+                traffic_speed_sdc_list.append(reward_bundle["traffic_speed_sdc_t"])
+                traffic_speed_neighbor_count_list.append(reward_bundle["traffic_speed_neighbor_count_t"])
                 frontier_arc_list.append(reward_bundle["frontier_arc_t"])
                 progress_cap_arc_list.append(reward_bundle["progress_cap_arc_t"])
                 divergence_onset_list.append(reward_bundle["divergence_onset_m"])
                 inside_fraction_list.append(reward_bundle["inside_fraction"])
-                if debug_required:
-                    trajectory_list.append(
-                        torch.cat(
-                            [
-                                rollout_semantic_context["sdc_current_pos_world"][:, :1].detach(),
-                                sdc_next_pos_world,
-                            ],
-                            dim=1,
-                        )
+                traffic_speed_penalty_mean_list.append(reward_bundle["traffic_speed_penalty_mean"])
+                traffic_speed_reference_mean_list.append(reward_bundle["traffic_speed_reference_mean"])
+                traffic_speed_neighbor_mean_mean_list.append(reward_bundle["traffic_speed_neighbor_mean_mean"])
+                traffic_speed_neighbor_median_mean_list.append(reward_bundle["traffic_speed_neighbor_median_mean"])
+                traffic_speed_floor_penalty_mean_list.append(reward_bundle["traffic_speed_floor_penalty_mean"])
+                traffic_speed_cap_penalty_mean_list.append(reward_bundle["traffic_speed_cap_penalty_mean"])
+                traffic_speed_cap_threshold_mean_list.append(reward_bundle["traffic_speed_cap_threshold_mean"])
+                traffic_speed_sdc_mean_list.append(reward_bundle["traffic_speed_sdc_mean"])
+                traffic_speed_neighbor_count_mean_list.append(reward_bundle["traffic_speed_neighbor_count_mean"])
+                trajectory_list.append(
+                    torch.cat(
+                        [
+                            rollout_semantic_context["sdc_current_pos_world"][:, :1].detach(),
+                            (
+                                sdc_next_pos_world
+                                if sdc_next_pos_world is not None
+                                else (
+                                    rollout_next_position
+                                    * decision_agent_mask[:, None, :, None].to(dtype=output_logit.dtype)
+                                ).sum(dim=2).detach()
+                            ),
+                        ],
+                        dim=1,
                     )
+                )
+                current_heading_list.append(rollout_semantic_context["sdc_current_heading_world"][:, 0].detach())
+                if debug_required:
                     action_token_list.append(sdc_action_tokens.detach())
                 if rollout_idx == 0:
                     self._trace_first_step(
@@ -1379,6 +2656,32 @@ class MotionLMLightning(pl.LightningModule):
                 "advantage_abs_mean": zero,
                 "tube_distance_mean": zero,
                 "progress_reward_mean": zero,
+                "stall_penalty_mean": zero,
+                "center_penalty_mean": zero,
+                "traffic_speed_penalty_mean": zero,
+                "traffic_speed_reference_mean": zero,
+                "traffic_speed_neighbor_mean_mean": zero,
+                "traffic_speed_neighbor_median_mean": zero,
+                "traffic_speed_floor_penalty_mean": zero,
+                "traffic_speed_cap_penalty_mean": zero,
+                "traffic_speed_cap_threshold_mean": zero,
+                "traffic_speed_sdc_mean": zero,
+                "traffic_speed_neighbor_count_mean": zero,
+                "center_curriculum_weight": zero,
+                "consensus_bonus_mean": zero,
+                "novelty_bonus_mean": zero,
+                "novelty_score_mean": zero,
+                "consensus_cluster_count_mean": zero,
+                "consensus_cluster_entropy_mean": zero,
+                "thermostat_target_entropy_mean": zero,
+                "thermostat_alpha_mean": zero,
+                "thermostat_eta_mean": zero,
+                "behavior_aux_loss": zero,
+                "behavior_semantic_ce": zero,
+                "behavior_branch_ce": zero,
+                "behavior_compliance_ce": zero,
+                "behavior_timing_ce": zero,
+                "behavior_dag_align": zero,
                 "frontier_arc_final_mean": zero,
                 "progress_cap_arc_mean": zero,
                 "divergence_onset_mean": zero,
@@ -1390,9 +2693,32 @@ class MotionLMLightning(pl.LightningModule):
         selected_log_probs = torch.stack(log_prob_list, dim=0)
         tube_distance = torch.stack(distance_list, dim=0)
         progress_reward_t = torch.stack(progress_reward_list, dim=0)
+        stall_penalty_t = torch.stack(stall_penalty_list, dim=0)
+        center_penalty_t = torch.stack(center_penalty_list, dim=0)
+        traffic_speed_penalty_t = torch.stack(traffic_speed_penalty_list, dim=0)
+        traffic_speed_reference_t = torch.stack(traffic_speed_reference_list, dim=0)
+        traffic_speed_neighbor_mean_t = torch.stack(traffic_speed_neighbor_mean_list, dim=0)
+        traffic_speed_neighbor_median_t = torch.stack(traffic_speed_neighbor_median_list, dim=0)
+        traffic_speed_floor_threshold_t = torch.stack(traffic_speed_floor_threshold_list, dim=0)
+        traffic_speed_cap_threshold_t = torch.stack(traffic_speed_cap_threshold_list, dim=0)
+        traffic_speed_cap_penalty_t = torch.stack(traffic_speed_cap_penalty_list, dim=0)
+        traffic_speed_sdc_t = torch.stack(traffic_speed_sdc_list, dim=0)
+        traffic_speed_neighbor_count_t = torch.stack(traffic_speed_neighbor_count_list, dim=0)
         frontier_arc_t = torch.stack(frontier_arc_list, dim=0)
         progress_cap_arc_t = torch.stack(progress_cap_arc_list, dim=0)
         divergence_onset_m = torch.stack(divergence_onset_list, dim=0)
+        trajectories_world = torch.stack(trajectory_list, dim=0)
+        current_heading_world = torch.stack(current_heading_list, dim=0).mean(dim=0)
+        consensus_bundle = self._compute_rollout_topomcpo_regularization_bundle(
+            data_dict=data_dict,
+            reward_t=reward_t,
+            valid_mask=valid_mask,
+            tube_distance=tube_distance,
+            frontier_arc_t=frontier_arc_t,
+            trajectories_world=trajectories_world,
+            current_heading_world=current_heading_world,
+        )
+        reward_t = reward_t + consensus_bundle["bonus_t"]
         rtg = self._compute_discounted_return_to_go(reward_t, valid_mask, discount=discount)
         advantage_t = self._group_normalize_advantages(rtg, valid_mask)
         policy_loss = sanitize_scalar_loss(
@@ -1410,7 +2736,6 @@ class MotionLMLightning(pl.LightningModule):
             torch.stack(inside_fraction_list).mean()
         ) if inside_fraction_list else zero
         if debug_required:
-            trajectories_world = torch.stack(trajectory_list, dim=0)
             action_token_t = torch.stack(action_token_list, dim=0)
             self._maybe_dump_rollout_tube_training_debug(
                 data_dict=data_dict,
@@ -1422,6 +2747,15 @@ class MotionLMLightning(pl.LightningModule):
                 advantage_t=advantage_t,
                 trajectories_world=trajectories_world,
                 action_token_t=action_token_t,
+                traffic_speed_penalty_t=traffic_speed_penalty_t,
+                traffic_speed_reference_t=traffic_speed_reference_t,
+                traffic_speed_neighbor_mean_t=traffic_speed_neighbor_mean_t,
+                traffic_speed_neighbor_median_t=traffic_speed_neighbor_median_t,
+                traffic_speed_floor_threshold_t=traffic_speed_floor_threshold_t,
+                traffic_speed_cap_threshold_t=traffic_speed_cap_threshold_t,
+                traffic_speed_cap_penalty_t=traffic_speed_cap_penalty_t,
+                traffic_speed_sdc_t=traffic_speed_sdc_t,
+                traffic_speed_neighbor_count_t=traffic_speed_neighbor_count_t,
             )
         self._trace_first_step(
             "tube_policy:end",
@@ -1438,6 +2772,34 @@ class MotionLMLightning(pl.LightningModule):
             "advantage_abs_mean": sanitize_scalar_loss(advantage_t[valid_mask].abs().mean()) if bool(valid_mask.any()) else zero,
             "tube_distance_mean": distance_mean,
             "progress_reward_mean": sanitize_scalar_loss(progress_reward_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "stall_penalty_mean": sanitize_scalar_loss(stall_penalty_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "center_penalty_mean": sanitize_scalar_loss(center_penalty_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
+            "traffic_speed_penalty_mean": sanitize_scalar_loss(torch.stack(traffic_speed_penalty_mean_list).mean()) if traffic_speed_penalty_mean_list else zero,
+            "traffic_speed_reference_mean": sanitize_scalar_loss(torch.stack(traffic_speed_reference_mean_list).mean()) if traffic_speed_reference_mean_list else zero,
+            "traffic_speed_neighbor_mean_mean": sanitize_scalar_loss(torch.stack(traffic_speed_neighbor_mean_mean_list).mean()) if traffic_speed_neighbor_mean_mean_list else zero,
+            "traffic_speed_neighbor_median_mean": sanitize_scalar_loss(torch.stack(traffic_speed_neighbor_median_mean_list).mean()) if traffic_speed_neighbor_median_mean_list else zero,
+            "traffic_speed_floor_penalty_mean": sanitize_scalar_loss(torch.stack(traffic_speed_floor_penalty_mean_list).mean()) if traffic_speed_floor_penalty_mean_list else zero,
+            "traffic_speed_cap_penalty_mean": sanitize_scalar_loss(torch.stack(traffic_speed_cap_penalty_mean_list).mean()) if traffic_speed_cap_penalty_mean_list else zero,
+            "traffic_speed_cap_threshold_mean": sanitize_scalar_loss(torch.stack(traffic_speed_cap_threshold_mean_list).mean()) if traffic_speed_cap_threshold_mean_list else zero,
+            "traffic_speed_sdc_mean": sanitize_scalar_loss(torch.stack(traffic_speed_sdc_mean_list).mean()) if traffic_speed_sdc_mean_list else zero,
+            "traffic_speed_neighbor_count_mean": sanitize_scalar_loss(torch.stack(traffic_speed_neighbor_count_mean_list).mean()) if traffic_speed_neighbor_count_mean_list else zero,
+            "center_curriculum_weight": reward_t.new_tensor(
+                float(self._semantic_ext_center_curriculum_weight(device=reward_t.device).item())
+            ),
+            "consensus_bonus_mean": consensus_bundle["consensus_bonus_mean"],
+            "novelty_bonus_mean": consensus_bundle["novelty_bonus_mean"],
+            "novelty_score_mean": consensus_bundle["novelty_score_mean"],
+            "consensus_cluster_count_mean": consensus_bundle["cluster_count_mean"],
+            "consensus_cluster_entropy_mean": consensus_bundle["cluster_entropy_mean"],
+            "thermostat_target_entropy_mean": consensus_bundle["target_entropy_mean"],
+            "thermostat_alpha_mean": consensus_bundle["thermostat_alpha_mean"],
+            "thermostat_eta_mean": consensus_bundle["thermostat_eta_mean"],
+            "behavior_aux_loss": consensus_bundle["behavior_aux_loss"],
+            "behavior_semantic_ce": consensus_bundle["behavior_semantic_ce"],
+            "behavior_branch_ce": consensus_bundle["behavior_branch_ce"],
+            "behavior_compliance_ce": consensus_bundle["behavior_compliance_ce"],
+            "behavior_timing_ce": consensus_bundle["behavior_timing_ce"],
+            "behavior_dag_align": consensus_bundle["behavior_dag_align"],
             "frontier_arc_final_mean": sanitize_scalar_loss(frontier_arc_t[:, :, -1][valid_return].mean()) if bool(valid_return.any()) else zero,
             "progress_cap_arc_mean": sanitize_scalar_loss(progress_cap_arc_t[valid_mask].mean()) if bool(valid_mask.any()) else zero,
             "divergence_onset_mean": sanitize_scalar_loss(divergence_onset_m[valid_return].mean()) if bool(valid_return.any()) else zero,
@@ -1670,6 +3032,7 @@ class MotionLMLightning(pl.LightningModule):
         is_factual = self._as_tensor(data_dict["cf/sdc_is_factual"], device=output_logit.device, dtype=torch.bool).reshape(B, -1)[:, 0]
         control_available = self._as_tensor(data_dict["cf/sdc_control_available"], device=output_logit.device, dtype=torch.bool).reshape(B, -1)[:, 0]
         alternative_batch_mask = control_available & (~is_factual)
+        factual_batch_mask = control_available & is_factual
         return {
             "decision_agent_mask": decision_agent_mask,
             "sdc_token_mask": sdc_token_mask,
@@ -1813,6 +3176,7 @@ class MotionLMLightning(pl.LightningModule):
             device=output_logit.device,
             dtype=torch.bool,
         ).reshape(B, -1)[:, 0]
+        factual_batch_mask = control_available & is_factual
         alternative_batch_mask = control_available & (~is_factual)
         return {
             "decision_agent_mask": decision_agent_mask,
@@ -1838,6 +3202,7 @@ class MotionLMLightning(pl.LightningModule):
             "expected_gate": expected_gate,
             "family_gate_mean": family_gate_mean,
             "is_factual": is_factual,
+            "factual_batch_mask": factual_batch_mask,
             "control_available": control_available,
             "alternative_batch_mask": alternative_batch_mask,
         }
@@ -2021,7 +3386,10 @@ class MotionLMLightning(pl.LightningModule):
             sdc_path_context = self._extract_sdc_path_context(data_dict)
             sdc_semantic_context = self._extract_sdc_semantic_context(data_dict)
             motion_token_weights = torch.ones_like(target_action, dtype=output_logit.dtype)
-            if sdc_semantic_context is not None:
+            if sdc_semantic_context is not None and self.sdc_semantic_ext_enabled:
+                factual_batch_mask = sdc_semantic_context["factual_batch_mask"]
+                motion_token_weights = factual_batch_mask[:, None, None].to(dtype=output_logit.dtype).expand_as(motion_token_weights)
+            elif sdc_semantic_context is not None:
                 stem_loss_weight = float(self.config.MODEL.get("LOCAL_CONTROL_SDC_STEM_LOSS_WEIGHT", 1.0))
                 stem_weight = (stem_loss_weight * (1.0 - sdc_semantic_context["family_gate_mean"].detach())).clamp(0.0, 1.0)
                 sdc_mask = sdc_semantic_context["sdc_token_mask"]
@@ -2111,6 +3479,9 @@ class MotionLMLightning(pl.LightningModule):
                         "cf/sdc_motion_gt_weight_mean": valid_motion_weights.mean(),
                     }
                 )
+                if sdc_semantic_context is not None and self.sdc_semantic_ext_enabled:
+                    loss_stat["cf/sdc_semantic_ext/gt_row_fraction"] = sdc_semantic_context["factual_batch_mask"].float().mean()
+                    loss_stat["cf/sdc_semantic_ext/alt_row_fraction"] = sdc_semantic_context["alternative_batch_mask"].float().mean()
                 if sdc_semantic_context is not None:
                     family_distance = sdc_semantic_context["expected_projection"]["nearest_distance"]
                     family_weights = sdc_semantic_context["family_weights"]
@@ -2202,6 +3573,18 @@ class MotionLMLightning(pl.LightningModule):
             if self.counterfactual_mode == "sdc_semantic_only" and self.sdc_semantic_head is not None and "cf/sdc_semantic_label_id" in data_dict:
                 semantic_target = _to_tensor("cf/sdc_semantic_label_id", dtype=torch.long).reshape(control_hidden.shape[0], -1)[:, 0]
                 semantic_supervision_mask = control_valid_mask & conditioning_eligible
+                factual_batch_mask = (
+                    sdc_semantic_context["factual_batch_mask"]
+                    if sdc_semantic_context is not None
+                    else torch.zeros_like(control_valid_mask, dtype=torch.bool)
+                )
+                alternative_batch_mask = (
+                    sdc_semantic_context["alternative_batch_mask"]
+                    if sdc_semantic_context is not None
+                    else torch.zeros_like(control_valid_mask, dtype=torch.bool)
+                )
+                if self.sdc_semantic_ext_enabled:
+                    semantic_supervision_mask = semantic_supervision_mask & alternative_batch_mask
                 semantic_loss_weight = float(
                     self.config.MODEL.get(
                         "LOCAL_CONTROL_SDC_SEMANTIC_AUX_LOSS_WEIGHT",
@@ -2281,10 +3664,43 @@ class MotionLMLightning(pl.LightningModule):
                     "advantage_abs_mean": control_hidden.new_tensor(0.0),
                     "tube_distance_mean": control_hidden.new_tensor(0.0),
                     "progress_reward_mean": control_hidden.new_tensor(0.0),
+                    "stall_penalty_mean": control_hidden.new_tensor(0.0),
+                    "center_penalty_mean": control_hidden.new_tensor(0.0),
+                    "traffic_speed_penalty_mean": control_hidden.new_tensor(0.0),
+                    "traffic_speed_reference_mean": control_hidden.new_tensor(0.0),
+                    "traffic_speed_neighbor_mean_mean": control_hidden.new_tensor(0.0),
+                    "traffic_speed_neighbor_median_mean": control_hidden.new_tensor(0.0),
+                    "traffic_speed_floor_penalty_mean": control_hidden.new_tensor(0.0),
+                    "traffic_speed_cap_penalty_mean": control_hidden.new_tensor(0.0),
+                    "traffic_speed_cap_threshold_mean": control_hidden.new_tensor(0.0),
+                    "traffic_speed_sdc_mean": control_hidden.new_tensor(0.0),
+                    "traffic_speed_neighbor_count_mean": control_hidden.new_tensor(0.0),
+                    "center_curriculum_weight": control_hidden.new_tensor(0.0),
+                    "consensus_bonus_mean": control_hidden.new_tensor(0.0),
+                    "novelty_bonus_mean": control_hidden.new_tensor(0.0),
+                    "novelty_score_mean": control_hidden.new_tensor(0.0),
+                    "consensus_cluster_count_mean": control_hidden.new_tensor(0.0),
+                    "consensus_cluster_entropy_mean": control_hidden.new_tensor(0.0),
+                    "thermostat_target_entropy_mean": control_hidden.new_tensor(0.0),
+                    "thermostat_alpha_mean": control_hidden.new_tensor(0.0),
+                    "thermostat_eta_mean": control_hidden.new_tensor(0.0),
+                    "behavior_aux_loss": control_hidden.new_tensor(0.0),
+                    "behavior_semantic_ce": control_hidden.new_tensor(0.0),
+                    "behavior_branch_ce": control_hidden.new_tensor(0.0),
+                    "behavior_compliance_ce": control_hidden.new_tensor(0.0),
+                    "behavior_timing_ce": control_hidden.new_tensor(0.0),
+                    "behavior_dag_align": control_hidden.new_tensor(0.0),
                     "frontier_arc_final_mean": control_hidden.new_tensor(0.0),
                     "progress_cap_arc_mean": control_hidden.new_tensor(0.0),
                     "divergence_onset_mean": control_hidden.new_tensor(0.0),
                     "group_size": 0,
+                }
+                semantic_ext_policy_kl_bundle = {
+                    "kl_gt": control_hidden.new_tensor(0.0),
+                    "kl_alt": control_hidden.new_tensor(0.0),
+                    "kl_total": control_hidden.new_tensor(0.0),
+                    "gt_token_fraction": control_hidden.new_tensor(0.0),
+                    "alt_token_fraction": control_hidden.new_tensor(0.0),
                 }
                 rollout_semantic_context = None
                 if (
@@ -2307,6 +3723,12 @@ class MotionLMLightning(pl.LightningModule):
                     rollout_tube_policy_bundle = self._build_sdc_semantic_rollout_tube_policy_objective(
                         data_dict=data_dict
                     )
+                if self.sdc_semantic_ext_enabled:
+                    semantic_ext_policy_kl_bundle = self._compute_sdc_semantic_ext_policy_kl(
+                        data_dict=data_dict,
+                        semantic_context=sdc_semantic_context,
+                        teacher_logits=teacher_logits,
+                    )
                 if guide_loss_weight > 0.0 and sdc_semantic_context is not None:
                     loss = loss + guide_loss_weight * sanitize_scalar_loss(guide_bundle["guide_loss"])
                 if rollout_guide_loss_weight > 0.0 and rollout_semantic_context is not None:
@@ -2315,12 +3737,18 @@ class MotionLMLightning(pl.LightningModule):
                     loss = loss + rollout_progress_loss_weight * sanitize_scalar_loss(rollout_progress_bundle["progress_loss"])
                 if rollout_tube_policy_loss_weight > 0.0:
                     loss = loss + rollout_tube_policy_loss_weight * sanitize_scalar_loss(rollout_tube_policy_bundle["policy_loss"])
+                if self.sdc_semantic_ext_enabled:
+                    loss = loss + sanitize_scalar_loss(rollout_tube_policy_bundle["behavior_aux_loss"])
+                if self.sdc_semantic_ext_enabled:
+                    loss = loss + sanitize_scalar_loss(semantic_ext_policy_kl_bundle["kl_total"])
                 total_control_objective = (
                     guide_loss_weight * sanitize_scalar_loss(guide_bundle["guide_loss"])
                     + rollout_guide_loss_weight * sanitize_scalar_loss(rollout_guide_bundle["guide_loss"])
                     + rollout_progress_loss_weight * sanitize_scalar_loss(rollout_progress_bundle["progress_loss"])
                     + rollout_tube_policy_loss_weight * sanitize_scalar_loss(rollout_tube_policy_bundle["policy_loss"])
+                    + sanitize_scalar_loss(rollout_tube_policy_bundle["behavior_aux_loss"])
                     + semantic_loss_weight * sanitize_scalar_loss(semantic_loss)
+                    + sanitize_scalar_loss(semantic_ext_policy_kl_bundle["kl_total"])
                 )
                 loss_stat.update(
                     {
@@ -2363,12 +3791,45 @@ class MotionLMLightning(pl.LightningModule):
                         "cf/sdc_rollout_tube_advantage_abs_mean": rollout_tube_policy_bundle["advantage_abs_mean"],
                         "cf/sdc_rollout_tube_distance_mean": rollout_tube_policy_bundle["tube_distance_mean"],
                         "cf/sdc_rollout_tube_progress_reward_mean": rollout_tube_policy_bundle["progress_reward_mean"],
+                        "cf/sdc_rollout_tube_stall_penalty_mean": rollout_tube_policy_bundle["stall_penalty_mean"],
+                        "cf/sdc_rollout_tube_center_penalty_mean": rollout_tube_policy_bundle["center_penalty_mean"],
+                        "cf/sdc_rollout_tube_traffic_speed_penalty_mean": rollout_tube_policy_bundle["traffic_speed_penalty_mean"],
+                        "cf/sdc_rollout_tube_traffic_speed_reference_mean": rollout_tube_policy_bundle["traffic_speed_reference_mean"],
+                        "cf/sdc_rollout_tube_traffic_speed_neighbor_mean_mean": rollout_tube_policy_bundle["traffic_speed_neighbor_mean_mean"],
+                        "cf/sdc_rollout_tube_traffic_speed_neighbor_median_mean": rollout_tube_policy_bundle["traffic_speed_neighbor_median_mean"],
+                        "cf/sdc_rollout_tube_traffic_speed_floor_penalty_mean": rollout_tube_policy_bundle["traffic_speed_floor_penalty_mean"],
+                        "cf/sdc_rollout_tube_traffic_speed_cap_penalty_mean": rollout_tube_policy_bundle["traffic_speed_cap_penalty_mean"],
+                        "cf/sdc_rollout_tube_traffic_speed_cap_threshold_mean": rollout_tube_policy_bundle["traffic_speed_cap_threshold_mean"],
+                        "cf/sdc_rollout_tube_traffic_speed_sdc_mean": rollout_tube_policy_bundle["traffic_speed_sdc_mean"],
+                        "cf/sdc_rollout_tube_traffic_speed_neighbor_count_mean": rollout_tube_policy_bundle["traffic_speed_neighbor_count_mean"],
+                        "cf/sdc_rollout_tube_center_curriculum_weight": rollout_tube_policy_bundle["center_curriculum_weight"],
+                        "cf/sdc_rollout_tube_consensus_bonus_mean": rollout_tube_policy_bundle["consensus_bonus_mean"],
+                        "cf/sdc_rollout_tube_novelty_bonus_mean": rollout_tube_policy_bundle["novelty_bonus_mean"],
+                        "cf/sdc_rollout_tube_novelty_score_mean": rollout_tube_policy_bundle["novelty_score_mean"],
+                        "cf/sdc_rollout_tube_consensus_cluster_count_mean": rollout_tube_policy_bundle["consensus_cluster_count_mean"],
+                        "cf/sdc_rollout_tube_consensus_cluster_entropy_mean": rollout_tube_policy_bundle["consensus_cluster_entropy_mean"],
+                        "cf/sdc_rollout_tube_thermostat_target_entropy_mean": rollout_tube_policy_bundle["thermostat_target_entropy_mean"],
+                        "cf/sdc_rollout_tube_thermostat_alpha_mean": rollout_tube_policy_bundle["thermostat_alpha_mean"],
+                        "cf/sdc_rollout_tube_thermostat_eta_mean": rollout_tube_policy_bundle["thermostat_eta_mean"],
                         "cf/sdc_rollout_tube_frontier_arc_final_mean": rollout_tube_policy_bundle["frontier_arc_final_mean"],
                         "cf/sdc_rollout_tube_progress_cap_arc_mean": rollout_tube_policy_bundle["progress_cap_arc_mean"],
                         "cf/sdc_rollout_tube_divergence_onset_mean": rollout_tube_policy_bundle["divergence_onset_mean"],
                         "cf/sdc_rollout_tube_group_size": control_hidden.new_tensor(
                             float(rollout_tube_policy_bundle["group_size"])
                         ),
+                        "cf/sdc_semantic_ext/kl_gt": semantic_ext_policy_kl_bundle["kl_gt"],
+                        "cf/sdc_semantic_ext/kl_alt": semantic_ext_policy_kl_bundle["kl_alt"],
+                        "cf/sdc_semantic_ext/kl_total": semantic_ext_policy_kl_bundle["kl_total"],
+                        "cf/sdc_semantic_ext/kl_gt_token_fraction": semantic_ext_policy_kl_bundle["gt_token_fraction"],
+                        "cf/sdc_semantic_ext/kl_alt_token_fraction": semantic_ext_policy_kl_bundle["alt_token_fraction"],
+                        "cf/sdc_semantic_ext/gt_row_fraction": factual_batch_mask.float().mean(),
+                        "cf/sdc_semantic_ext/alt_row_fraction": alternative_batch_mask.float().mean(),
+                        "cf/sdc_semantic_ext/behavior_aux_loss": rollout_tube_policy_bundle["behavior_aux_loss"],
+                        "cf/sdc_semantic_ext/behavior_semantic_ce": rollout_tube_policy_bundle["behavior_semantic_ce"],
+                        "cf/sdc_semantic_ext/behavior_branch_ce": rollout_tube_policy_bundle["behavior_branch_ce"],
+                        "cf/sdc_semantic_ext/behavior_compliance_ce": rollout_tube_policy_bundle["behavior_compliance_ce"],
+                        "cf/sdc_semantic_ext/behavior_timing_ce": rollout_tube_policy_bundle["behavior_timing_ce"],
+                        "cf/sdc_semantic_ext/behavior_dag_align": rollout_tube_policy_bundle["behavior_dag_align"],
                         "cf/sdc_control_objective": total_control_objective,
                         "cf/sdc_family_distance_mean": guide_bundle["projected_family_distance"][
                             sdc_semantic_context["sdc_valid_by_t"]
@@ -2635,6 +4096,164 @@ class MotionLMLightning(pl.LightningModule):
             pass
         return loss, loss_stat
 
+    def _filter_logged_loss_stat(self, loss_stat):
+        if not isinstance(loss_stat, dict):
+            return loss_stat
+
+        if self.counterfactual_mode != "sdc_semantic_only":
+            return loss_stat
+
+        model_cfg = self.config.MODEL
+        semantic_aux_weight = float(model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_AUX_LOSS_WEIGHT", 0.0))
+        family_guide_weight = float(model_cfg.get("LOCAL_CONTROL_SDC_FAMILY_GUIDE_LOSS_WEIGHT", 0.0))
+        rollout_guide_weight = float(model_cfg.get("LOCAL_CONTROL_SDC_ROLLOUT_GUIDE_LOSS_WEIGHT", 0.0))
+        rollout_progress_weight = float(model_cfg.get("LOCAL_CONTROL_SDC_ROLLOUT_PROGRESS_LOSS_WEIGHT", 0.0))
+        rollout_tube_weight = float(model_cfg.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_POLICY_LOSS_WEIGHT", 0.0))
+        progress_reward_scale = float(model_cfg.get("LOCAL_CONTROL_SDC_ROLLOUT_TUBE_PROGRESS_REWARD_SCALE", 0.0))
+        semantic_ext_enabled = bool(model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_ENABLED", False))
+        semantic_ext_allow_progress_reward = bool(
+            model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_ALLOW_PROGRESS_REWARD", False)
+        )
+        gt_kl_weight = float(model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_KL_WEIGHT_GT", 0.0))
+        alt_kl_weight = float(model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_KL_WEIGHT_ALT", 0.0))
+        stall_weight = float(model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_STALL_WEIGHT", 0.0))
+        center_weight_max = float(model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_CENTER_WEIGHT_MAX", 0.0))
+        speed_floor_enabled = bool(
+            model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_FLOOR_ENABLED", False)
+        )
+        speed_cap_enabled = bool(
+            model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_TRAFFIC_SPEED_CAP_ENABLED", False)
+        )
+        consensus_weight = float(model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_CONSENSUS_WEIGHT", 0.0))
+        novelty_enabled = bool(model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_NOVELTY_ENABLED", False))
+        novelty_base_weight = float(model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_NOVELTY_BASE_WEIGHT", 0.0))
+        thermostat_enabled = bool(model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_THERMOSTAT_ENABLED", False))
+        behavior_model_enabled = bool(
+            model_cfg.get("LOCAL_CONTROL_SDC_SEMANTIC_EXT_BEHAVIOR_MODEL_ENABLED", False)
+        )
+
+        filtered = {}
+        for key, value in loss_stat.items():
+            keep = True
+            if key.startswith("cf/path_") or key.startswith("cf/compliance_") or key.startswith("cf/timing_") or key.startswith("cf/anchor_"):
+                keep = False
+            elif key in ("cf/sdc_semantic_acc", "cf/sdc_semantic_aux_loss", "cf/sdc_semantic_aux_loss_weight"):
+                keep = semantic_aux_weight > 0.0
+            elif key.startswith("cf/sdc_family_guide_loss_by_label/") or key in (
+                "cf/sdc_family_guide_loss",
+                "cf/sdc_family_guide_loss_weight",
+                "cf/sdc_family_guide_valid_fraction",
+                "cf/sdc_family_student_entropy",
+                "cf/sdc_family_teacher_entropy",
+                "cf/sdc_family_expected_energy",
+                "cf/sdc_family_expected_pos_penalty",
+                "cf/sdc_family_expected_heading_penalty",
+                "cf/sdc_family_expected_backward_penalty",
+                "cf/sdc_family_gate_mean",
+                "cf/sdc_family_distance_mean",
+            ):
+                keep = family_guide_weight > 0.0
+            elif key.startswith("cf/sdc_rollout_family_guide_loss_by_label/") or key in (
+                "cf/sdc_rollout_family_guide_loss",
+                "cf/sdc_rollout_family_guide_loss_weight",
+                "cf/sdc_rollout_family_guide_valid_fraction",
+                "cf/sdc_rollout_family_student_entropy",
+                "cf/sdc_rollout_family_teacher_entropy",
+                "cf/sdc_rollout_family_expected_energy",
+                "cf/sdc_rollout_family_expected_pos_penalty",
+                "cf/sdc_rollout_family_expected_heading_penalty",
+                "cf/sdc_rollout_family_expected_backward_penalty",
+                "cf/sdc_rollout_family_gate_mean",
+                "cf/sdc_rollout_family_distance_mean",
+            ):
+                keep = rollout_guide_weight > 0.0
+            elif key in (
+                "cf/sdc_rollout_progress_loss",
+                "cf/sdc_rollout_progress_loss_weight",
+                "cf/sdc_rollout_progress_valid_fraction",
+                "cf/sdc_rollout_progress_mean",
+                "cf/sdc_rollout_stall_fraction",
+            ):
+                keep = rollout_progress_weight > 0.0
+            elif key.startswith("cf/sdc_rollout_tube_"):
+                if rollout_tube_weight <= 0.0:
+                    keep = False
+                elif key == "cf/sdc_rollout_tube_progress_reward_mean":
+                    keep = progress_reward_scale > 0.0 and (
+                        (not semantic_ext_enabled) or semantic_ext_allow_progress_reward
+                    )
+                elif key == "cf/sdc_rollout_tube_stall_penalty_mean":
+                    keep = semantic_ext_enabled and (stall_weight > 0.0)
+                elif key in (
+                    "cf/sdc_rollout_tube_center_penalty_mean",
+                    "cf/sdc_rollout_tube_center_curriculum_weight",
+                ):
+                    keep = semantic_ext_enabled and (center_weight_max > 0.0)
+                elif key in (
+                    "cf/sdc_rollout_tube_traffic_speed_penalty_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_neighbor_count_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_reference_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_sdc_mean",
+                ):
+                    keep = semantic_ext_enabled and (speed_floor_enabled or speed_cap_enabled)
+                elif key in (
+                    "cf/sdc_rollout_tube_traffic_speed_neighbor_mean_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_cap_penalty_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_cap_threshold_mean",
+                ):
+                    keep = semantic_ext_enabled and speed_cap_enabled
+                elif key in (
+                    "cf/sdc_rollout_tube_traffic_speed_neighbor_median_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_floor_penalty_mean",
+                ):
+                    keep = semantic_ext_enabled and speed_floor_enabled
+                elif key == "cf/sdc_rollout_tube_consensus_bonus_mean" or key.startswith(
+                    "cf/sdc_rollout_tube_consensus_cluster_"
+                ):
+                    keep = semantic_ext_enabled and (consensus_weight > 0.0)
+                elif key in (
+                    "cf/sdc_rollout_tube_novelty_bonus_mean",
+                    "cf/sdc_rollout_tube_novelty_score_mean",
+                ):
+                    keep = semantic_ext_enabled and novelty_enabled and (novelty_base_weight > 0.0)
+                elif key.startswith("cf/sdc_rollout_tube_thermostat_"):
+                    keep = semantic_ext_enabled and thermostat_enabled
+            elif key.startswith("cf/sdc_semantic_ext/"):
+                if not semantic_ext_enabled:
+                    keep = False
+                elif key in ("cf/sdc_semantic_ext/kl_gt", "cf/sdc_semantic_ext/kl_gt_token_fraction"):
+                    keep = gt_kl_weight > 0.0
+                elif key in ("cf/sdc_semantic_ext/kl_alt", "cf/sdc_semantic_ext/kl_alt_token_fraction"):
+                    keep = alt_kl_weight > 0.0
+                elif key == "cf/sdc_semantic_ext/kl_total":
+                    keep = (gt_kl_weight > 0.0) or (alt_kl_weight > 0.0)
+                elif key.startswith("cf/sdc_semantic_ext/behavior_"):
+                    keep = behavior_model_enabled
+
+            if keep:
+                filtered[key] = value
+
+        if (
+            "cf/sdc_rollout_tube_traffic_speed_reference_mean" in loss_stat
+            and semantic_ext_enabled
+            and (speed_floor_enabled or speed_cap_enabled)
+            and rollout_tube_weight > 0.0
+        ):
+            filtered["cf/sdc_rollout_tube_neighbor_speed_mean"] = loss_stat[
+                "cf/sdc_rollout_tube_traffic_speed_reference_mean"
+            ]
+        if (
+            "cf/sdc_rollout_tube_traffic_speed_sdc_mean" in loss_stat
+            and semantic_ext_enabled
+            and (speed_floor_enabled or speed_cap_enabled)
+            and rollout_tube_weight > 0.0
+        ):
+            filtered["cf/sdc_rollout_tube_sdc_speed_mean"] = loss_stat[
+                "cf/sdc_rollout_tube_traffic_speed_sdc_mean"
+            ]
+
+        return filtered
+
     def training_step(self, data_dict, batch_idx):
 
         # For profiling GPU usage.
@@ -2658,10 +4277,11 @@ class MotionLMLightning(pl.LightningModule):
 
         motion_stat = {k: v for k, v in loss_stat.items() if k.startswith("motion_stat")}
         loss_stat = {k: v for k, v in loss_stat.items() if not k.startswith("motion_stat")}
+        logged_loss_stat = self._filter_logged_loss_stat(loss_stat)
 
         self.log_dict(
             {f"{k}": float(v)
-             for k, v in loss_stat.items() if k in pbar_keys},
+             for k, v in logged_loss_stat.items() if k in pbar_keys},
             batch_size=data_dict["encoder/map_feature"].shape[0],
             prog_bar=True,
         )
@@ -2674,7 +4294,7 @@ class MotionLMLightning(pl.LightningModule):
             )
         self.log_dict(
             {f"train/{k}": float(v)
-             for k, v in loss_stat.items()},
+             for k, v in logged_loss_stat.items()},
             batch_size=data_dict["encoder/map_feature"].shape[0],
             # on_epoch=True,
             prog_bar=False,
@@ -2730,6 +4350,43 @@ class MotionLMLightning(pl.LightningModule):
             for label_name in SDC_PATH_SEMANTIC_LABEL_ORDER:
                 loss_stat.setdefault(f"cf/sdc_family_guide_loss_by_label/{label_name}", zero)
                 loss_stat.setdefault(f"cf/sdc_rollout_family_guide_loss_by_label/{label_name}", zero)
+            if self.sdc_semantic_ext_enabled:
+                for key in (
+                    "cf/sdc_semantic_ext/kl_gt",
+                    "cf/sdc_semantic_ext/kl_alt",
+                    "cf/sdc_semantic_ext/kl_total",
+                    "cf/sdc_semantic_ext/kl_gt_token_fraction",
+                    "cf/sdc_semantic_ext/kl_alt_token_fraction",
+                    "cf/sdc_semantic_ext/gt_row_fraction",
+                    "cf/sdc_semantic_ext/alt_row_fraction",
+                    "cf/sdc_semantic_ext/behavior_aux_loss",
+                    "cf/sdc_semantic_ext/behavior_semantic_ce",
+                    "cf/sdc_semantic_ext/behavior_branch_ce",
+                    "cf/sdc_semantic_ext/behavior_compliance_ce",
+                    "cf/sdc_semantic_ext/behavior_timing_ce",
+                    "cf/sdc_semantic_ext/behavior_dag_align",
+                    "cf/sdc_rollout_tube_stall_penalty_mean",
+                    "cf/sdc_rollout_tube_center_penalty_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_penalty_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_reference_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_neighbor_mean_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_neighbor_median_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_floor_penalty_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_cap_penalty_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_cap_threshold_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_sdc_mean",
+                    "cf/sdc_rollout_tube_traffic_speed_neighbor_count_mean",
+                    "cf/sdc_rollout_tube_center_curriculum_weight",
+                    "cf/sdc_rollout_tube_consensus_bonus_mean",
+                    "cf/sdc_rollout_tube_novelty_bonus_mean",
+                    "cf/sdc_rollout_tube_novelty_score_mean",
+                    "cf/sdc_rollout_tube_consensus_cluster_count_mean",
+                    "cf/sdc_rollout_tube_consensus_cluster_entropy_mean",
+                    "cf/sdc_rollout_tube_thermostat_target_entropy_mean",
+                    "cf/sdc_rollout_tube_thermostat_alpha_mean",
+                    "cf/sdc_rollout_tube_thermostat_eta_mean",
+                ):
+                    loss_stat.setdefault(key, zero)
 
         return loss_stat
 
@@ -2775,9 +4432,10 @@ class MotionLMLightning(pl.LightningModule):
         loss_stat = self._normalize_validation_loss_stat(loss_stat)
         motion_stat = {k: v for k, v in loss_stat.items() if k.startswith("motion_stat")}
         loss_stat = {k: v for k, v in loss_stat.items() if not k.startswith("motion_stat")}
+        logged_loss_stat = self._filter_logged_loss_stat(loss_stat)
 
         self.log_dict(
-            {f"val/{k}": float(v) for k, v in loss_stat.items()},
+            {f"val/{k}": float(v) for k, v in logged_loss_stat.items()},
             batch_size=data_dict["encoder/map_feature"].shape[0],
             prog_bar=False,
             sync_dist=True,

@@ -140,6 +140,8 @@ from .scenario_export import (
     export_counterfactual_scenario,
     export_all_counterfactuals,
     export_trajectory_only,
+    export_victim_centric_scenario,
+    export_victim_centric_ground_truth_scenario,
     create_replay_script,
 )
 
@@ -228,6 +230,8 @@ __all__ = [
     "export_counterfactual_scenario",
     "export_all_counterfactuals",
     "export_trajectory_only",
+    "export_victim_centric_scenario",
+    "export_victim_centric_ground_truth_scenario",
     "create_replay_script",
 ]
 

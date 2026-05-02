@@ -204,6 +204,37 @@ def _extract_current_time_index(state: Any) -> int:
     return int(arr[0])
 
 
+def _is_padding_object_slot(
+    *,
+    object_id: Any,
+    object_type: Any,
+    valid_mask: np.ndarray,
+) -> bool:
+    """
+    Waymax object tensors are padded to a fixed actor count. Padded slots use
+    sentinel values such as id=-1 / object_type=-1 and have no valid states.
+
+    Those placeholders are not real ScenarioNet actors and should never be
+    materialized into the exported track dictionary.
+    """
+    try:
+        if int(object_id) < 0:
+            return True
+    except Exception:
+        pass
+    try:
+        if int(object_type) < 0:
+            return True
+    except Exception:
+        pass
+    valid_arr = np.asarray(valid_mask, dtype=bool).reshape(-1)
+    if valid_arr.size == 0:
+        return True
+    if not bool(np.any(valid_arr)):
+        return True
+    return False
+
+
 def _extract_track_dict(state: Any, *, fallback_scenario_id: str) -> tuple[Dict[str, Any], str, np.ndarray]:
     trajectory = _get_any(state, ("log_trajectory", "trajectory"), default=None)
     metadata = _get_any(state, ("object_metadata", "metadata"), default=None)
@@ -241,8 +272,16 @@ def _extract_track_dict(state: Any, *, fallback_scenario_id: str) -> tuple[Dict[
         sdc_id = str(ids[int(np.flatnonzero(is_sdc)[0])])
 
     for index in range(int(ids.shape[0])):
+        track_valid = np.asarray(valid[index], dtype=bool)
+        raw_object_type = object_types[index] if index < object_types.shape[0] else 0
+        if _is_padding_object_slot(
+            object_id=ids[index],
+            object_type=raw_object_type,
+            valid_mask=track_valid,
+        ):
+            continue
         track_id = str(ids[index])
-        type_name = _object_type_name(object_types[index] if index < object_types.shape[0] else 0)
+        type_name = _object_type_name(raw_object_type)
         default_length, default_width, default_height = _default_extent_by_object_type(type_name)
         track_length = np.asarray(length[index], dtype=np.float32).reshape(-1)
         track_width = np.asarray(width[index], dtype=np.float32).reshape(-1)
@@ -259,13 +298,13 @@ def _extract_track_dict(state: Any, *, fallback_scenario_id: str) -> tuple[Dict[
                 "position": np.stack([x[index], y[index], z[index]], axis=-1).astype(np.float32).tolist(),
                 "heading": yaw[index].astype(np.float32).tolist(),
                 "velocity": np.stack([vel_x[index], vel_y[index]], axis=-1).astype(np.float32).tolist(),
-                "valid": valid[index].astype(bool).tolist(),
+                "valid": track_valid.astype(bool).tolist(),
                 "length": track_length.astype(np.float32).tolist(),
                 "width": track_width.astype(np.float32).tolist(),
                 "height": track_height.astype(np.float32).tolist(),
             },
             "metadata": {
-                "raw_object_type_id": int(object_types[index]) if index < object_types.shape[0] else 0,
+                "raw_object_type_id": int(raw_object_type),
                 "is_sdc": bool(is_sdc[index]) if index < is_sdc.shape[0] else False,
             },
         }

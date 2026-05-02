@@ -1,0 +1,73 @@
+\documentclass[tikz,border=3pt]{standalone}
+\usetikzlibrary{arrows.meta,positioning}
+
+\definecolor{ink}{HTML}{0F172A}
+\definecolor{muted}{HTML}{475569}
+\definecolor{line}{HTML}{CBD5E1}
+\definecolor{soft}{HTML}{F8FAFC}
+\definecolor{blue}{HTML}{2563EB}
+\definecolor{green}{HTML}{16A34A}
+\definecolor{orange}{HTML}{EA580C}
+\definecolor{violet}{HTML}{7C3AED}
+\definecolor{rose}{HTML}{E11D48}
+
+\tikzset{
+  block/.style={
+    rounded corners=2pt,
+    draw=line,
+    line width=0.5pt,
+    fill=white,
+    align=center,
+    inner sep=4pt,
+    font=\sffamily\scriptsize,
+    text=ink,
+    minimum height=0.62cm
+  },
+  backbone/.style={block, draw=blue!65, fill=blue!7, minimum width=2.25cm},
+  control/.style={block, draw=green!70, fill=green!8, minimum width=2.15cm},
+  train/.style={block, draw=orange!70, fill=orange!8, minimum width=2.30cm, font=\sffamily\tiny},
+  dag/.style={block, draw=violet!65, fill=violet!8, minimum width=2.10cm, font=\sffamily\tiny},
+  output/.style={block, draw=rose!65, fill=rose!7, minimum width=2.05cm},
+  arrow/.style={-Latex, draw=ink!70, line width=0.55pt},
+  controlarrow/.style={-Latex, draw=green!75!black, line width=0.60pt},
+  trainarrow/.style={-Latex, draw=orange!85!black, dashed, line width=0.45pt}
+}
+
+\begin{document}
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \fill[soft] (-0.35,-1.30) rectangle (13.85,3.35);
+
+  \node[anchor=west, font=\sffamily\bfseries\large, text=ink] at (-0.15,3.05)
+    {CounterDrive Architecture};
+  \node[anchor=west, font=\sffamily\scriptsize, text=muted] at (-0.15,2.72)
+    {Adv-BMT motion prior with semantic-only, mask-gated control};
+
+  % Main Adv-BMT backbone.
+  \node[backbone] (scene) at (1.20,0.10) {Logged scene\\$x$};
+  \node[backbone] (enc) at (4.05,0.10) {Scene encoder\\$c=f_{\rm enc}(x)$};
+  \node[backbone] (dec) at (6.95,0.10) {Autoregressive\\decoder};
+  \node[output] (rollout) at (9.75,0.10) {Trajectory\\rollout $\tau$};
+
+  \draw[arrow] (scene.east) -- (enc.west);
+  \draw[arrow] (enc.east) -- (dec.west);
+  \draw[arrow] (dec.east) -- (rollout.west);
+
+  % Semantic control path.
+  \node[control] (request) at (1.20,1.55) {Semantic request\\$u=(y,W,m)$};
+  \node[control] (sem) at (4.05,1.55) {Semantic embedding\\$z_y=E_{\rm sem}(y)$};
+  \node[control] (adapter) at (6.95,1.55) {Mask-gated adapter\\attention + bias\\on $\Omega=W{\times}m$};
+
+  \draw[controlarrow] (request.east) -- (sem.west);
+  \draw[controlarrow] (sem.east) -- (adapter.west);
+  \draw[controlarrow] (adapter.south) -- (dec.north);
+
+  % Training-only supervision.
+  \node[dag] (dag) at (2.05,-0.90) {DAG context\\branch, timing, risk};
+  \node[train] (cf) at (5.35,-0.90) {Counterfactual rows\\valid tube + Topo-MCPO};
+  \node[train] (ce) at (8.75,-0.90) {Factual / no-intervention\\teacher-forced CE};
+
+  \draw[trainarrow] (dag.east) -- (cf.west);
+  \draw[trainarrow] (cf.east) -- (ce.west);
+
+\end{tikzpicture}
+\end{document}

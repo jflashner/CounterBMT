@@ -1,0 +1,36 @@
+\documentclass[border=2pt]{standalone}
+\usepackage{graphicx}
+\usepackage[table]{xcolor}
+\usepackage{array}
+\usepackage{helvet}
+\renewcommand{\familydefault}{\sfdefault}
+
+\definecolor{textcolor}{HTML}{0F172A}
+\definecolor{muted}{HTML}{475569}
+
+\newcommand{\panelimage}[1]{%
+  \includegraphics[width=0.326\textwidth,trim=145 135 145 205,clip]{#1}%
+}
+\newcommand{\rowtitle}[1]{%
+  {\scriptsize\bfseries\color{muted}#1}%
+}
+
+\begin{document}
+\setlength{\tabcolsep}{1.5pt}
+\renewcommand{\arraystretch}{0.90}
+\begin{tabular}{@{}ccc@{}}
+  \rowtitle{Ground truth} &
+  \rowtitle{Ground truth} &
+  \rowtitle{Ground truth} \\
+  \panelimage{adversary_50scene_candidates_pad075_20260429_193720/waymax_scene_00018/waymax_scene_00018__tlast__ground_truth__paper_graph.png} &
+  \panelimage{adversary_50scene_candidates_pad075_20260429_193720/waymax_scene_00032/waymax_scene_00032__tlast__ground_truth__paper_graph.png} &
+  \panelimage{adversary_50scene_candidates_pad075_20260429_193720/waymax_scene_00055/waymax_scene_00055__tlast__ground_truth__paper_graph.png} \\
+  [-0.15em]
+  \rowtitle{left lane change} &
+  \rowtitle{left lane change} &
+  \rowtitle{right lane change} \\
+  \panelimage{adversary_50scene_candidates_pad075_20260429_193720/waymax_scene_00018/waymax_scene_00018__tlast__adversary_18_left_lane_change__paper_graph.png} &
+  \panelimage{adversary_50scene_candidates_pad075_20260429_193720/waymax_scene_00032/waymax_scene_00032__tlast__adversary_949_left_lane_change__paper_graph.png} &
+  \panelimage{adversary_50scene_candidates_pad075_20260429_193720/waymax_scene_00055/waymax_scene_00055__tlast__adversary_61_right_lane_change__paper_graph.png}
+\end{tabular}
+\end{document}

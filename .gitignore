@@ -15,3 +15,36 @@ wheels/
 src/exp_converted/
 src/exp_waymo/
 .env
+
+# Local OS/editor artifacts
+.DS_Store
+
+# Local datasets and generated experiment assets
+/waymo_validation/
+/logs/
+/tmp/
+/CAT_scenarios/
+/SEAL_scenarios/
+/STRIVE_scenarios/
+/selected_scenes/
+
+# Large model/data artifacts
+*.ckpt
+*.pkl
+*.npz
+*.npy
+*.tfrecord*
+
+# LaTeX build products
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+
+# Bulky intermediate paper render galleries. Keep selected/final figures instead.
+/CounterDrive_Latex/figures/adversary_10scene_candidates_*/
+/CounterDrive_Latex/figures/adversary_50scene_candidates_*/

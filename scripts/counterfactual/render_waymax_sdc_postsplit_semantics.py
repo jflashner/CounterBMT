@@ -172,11 +172,33 @@ def _trim_and_split_world_path(
     points_xy_world: Any,
     *,
     current_xy_world: np.ndarray,
+    current_heading_world: float,
     stitch_discontinuities: bool = False,
     stitch_radius_m: float = DEFAULT_DISCONTINUITY_STITCH_RADIUS_M,
     stitch_jump_threshold_m: float = DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
 ) -> List[np.ndarray]:
-    trimmed = trim_polyline_from_point(points_xy_world, current_xy_world, prepend_point=True)
+    points_xy = _finite_xy_rows(np.asarray(points_xy_world, dtype=np.float32))
+    if points_xy.shape[0] < 2:
+        return []
+
+    current_xy = np.asarray(current_xy_world, dtype=np.float32).reshape(1, 2)
+    nearest_idx = int(np.argmin(np.linalg.norm(points_xy - current_xy, axis=-1)))
+    if nearest_idx < int(points_xy.shape[0] - 1):
+        forward_delta = np.asarray(points_xy[nearest_idx + 1] - points_xy[nearest_idx], dtype=np.float32)
+    else:
+        forward_delta = np.asarray(points_xy[nearest_idx] - points_xy[nearest_idx - 1], dtype=np.float32)
+    if float(np.linalg.norm(forward_delta)) >= 1e-3:
+        forward_heading = float(np.arctan2(float(forward_delta[1]), float(forward_delta[0])))
+        heading_error = float(
+            np.arctan2(
+                np.sin(forward_heading - float(current_heading_world)),
+                np.cos(forward_heading - float(current_heading_world)),
+            )
+        )
+        if abs(heading_error) > (0.5 * np.pi):
+            points_xy = np.asarray(points_xy[::-1], dtype=np.float32)
+
+    trimmed = trim_polyline_from_point(points_xy, current_xy_world, prepend_point=True)
     if bool(stitch_discontinuities):
         trimmed = stitch_polyline_discontinuities(
             trimmed,
@@ -327,6 +349,7 @@ def _select_top_separable_alternates(
         trimmed_segments_world = _trim_and_split_world_path(
             path_row.get("polyline_xy", []),
             current_xy_world=current_xy,
+            current_heading_world=current_heading,
             stitch_discontinuities=bool(stitch_discontinuities),
             stitch_radius_m=float(stitch_radius_m),
             stitch_jump_threshold_m=float(stitch_jump_threshold_m),

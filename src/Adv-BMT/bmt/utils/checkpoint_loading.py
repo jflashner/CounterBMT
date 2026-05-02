@@ -29,6 +29,14 @@ EXPECTED_NEW_PATH_CONTROL_PREFIXES = (
     "model.motion_decoder.cf_sdc_local_residual_gate",
 )
 
+SEMANTIC_LABEL_EXPANSION_KEYS = {
+    "sdc_semantic_head.weight",
+    "sdc_semantic_head.bias",
+    "semantic_ext_semantic_head.weight",
+    "semantic_ext_semantic_head.bias",
+    "model.motion_decoder.cf_sdc_semantic_embed.weight",
+}
+
 
 def _resolve_checkpoint_path(ckpt_path: str | Path) -> Path:
     resolved = Path(ckpt_path).expanduser()
@@ -93,6 +101,30 @@ def _is_expected_new_path_control_key(key: str) -> bool:
 
 def _is_policy_teacher_key(key: str) -> bool:
     return str(key).startswith("policy_teacher.")
+
+
+def _maybe_load_expanded_semantic_label_tensor(
+    key: str,
+    checkpoint_value: torch.Tensor,
+    model_value: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if key not in SEMANTIC_LABEL_EXPANSION_KEYS:
+        return None
+    if not torch.is_tensor(checkpoint_value) or not torch.is_tensor(model_value):
+        return None
+    source_shape = tuple(checkpoint_value.shape)
+    target_shape = tuple(model_value.shape)
+    if len(source_shape) != len(target_shape):
+        return None
+    if len(source_shape) == 0:
+        return None
+    if source_shape[0] > target_shape[0]:
+        return None
+    if source_shape[1:] != target_shape[1:]:
+        return None
+    merged = model_value.detach().clone()
+    merged[: source_shape[0], ...].copy_(checkpoint_value.to(device=merged.device, dtype=merged.dtype))
+    return merged
 
 
 def _parameter_owner_from_key(key: str) -> str:
@@ -178,11 +210,17 @@ def load_model_from_checkpoint_forgiving(
     loaded_state: Dict[str, torch.Tensor] = {}
     unexpected_keys = []
     shape_mismatch_keys = []
+    partially_loaded_keys = []
     for key, value in checkpoint_state.items():
         if key not in model_state:
             unexpected_keys.append(str(key))
             continue
         if not hasattr(value, "shape") or tuple(value.shape) != tuple(model_state[key].shape):
+            expanded_value = _maybe_load_expanded_semantic_label_tensor(str(key), value, model_state[key])
+            if expanded_value is not None:
+                loaded_state[str(key)] = expanded_value
+                partially_loaded_keys.append(str(key))
+                continue
             shape_mismatch_keys.append(str(key))
             continue
         loaded_state[str(key)] = value
@@ -207,9 +245,11 @@ def load_model_from_checkpoint_forgiving(
                 "num_missing_keys": int(len(missing_keys)),
                 "num_unexpected_keys": int(len(unexpected_keys)),
                 "num_shape_mismatch_keys": int(len(shape_mismatch_keys)),
+                "num_partially_loaded_keys": int(len(partially_loaded_keys)),
                 "first_50_missing_keys": sorted(missing_keys)[:50],
                 "first_50_unexpected_keys": sorted(unexpected_keys)[:50],
                 "first_50_shape_mismatch_keys": sorted(shape_mismatch_keys)[:50],
+                "partially_loaded_keys": sorted(partially_loaded_keys),
                 "expected_new_path_control_keys_missing": expected_new_path_control_keys_missing,
                 "expected_policy_teacher_keys_missing": expected_policy_teacher_keys_missing,
                 "unexpected_missing_keys": unexpected_missing_keys,
@@ -244,9 +284,11 @@ def load_model_from_checkpoint_forgiving(
         "num_missing_keys": int(len(missing_keys)),
         "num_unexpected_keys": int(len(unexpected_keys)),
         "num_shape_mismatch_keys": int(len(shape_mismatch_keys)),
+        "num_partially_loaded_keys": int(len(partially_loaded_keys)),
         "first_50_missing_keys": sorted(missing_keys)[:50],
         "first_50_unexpected_keys": sorted(unexpected_keys)[:50],
         "first_50_shape_mismatch_keys": sorted(shape_mismatch_keys)[:50],
+        "partially_loaded_keys": sorted(partially_loaded_keys),
         "expected_new_path_control_keys_missing": expected_new_path_control_keys_missing,
         "expected_policy_teacher_keys_missing": expected_policy_teacher_keys_missing,
         "unexpected_missing_keys": unexpected_missing_keys,

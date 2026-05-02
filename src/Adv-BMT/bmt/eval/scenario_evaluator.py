@@ -227,6 +227,193 @@ def tf_to_torch(tf_tensor, device=None):
     )
 
 
+def _as_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _scalar_int(value, default: int = 0) -> int:
+    if value is None:
+        return int(default)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return int(default)
+        return int(value.detach().reshape(-1)[0].item())
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return int(default)
+        return int(value.reshape(-1)[0])
+    return int(value)
+
+
+def _max_pairwise_l2(points_xy: np.ndarray) -> float:
+    points_xy = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
+    if points_xy.shape[0] < 2:
+        return float("nan")
+    diffs = points_xy[:, None, :] - points_xy[None, :, :]
+    dists = np.linalg.norm(diffs, axis=-1)
+    return float(np.max(dists))
+
+
+def _to_numpy(value, *, dtype=None) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    else:
+        value = np.asarray(value)
+    if dtype is not None:
+        value = value.astype(dtype, copy=False)
+    return value
+
+
+def _cumulative_arc(points_xy: np.ndarray) -> np.ndarray:
+    points_xy = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
+    if points_xy.shape[0] <= 1:
+        return np.zeros((points_xy.shape[0],), dtype=np.float32)
+    segment_lengths = np.linalg.norm(points_xy[1:] - points_xy[:-1], axis=-1).astype(np.float32)
+    return np.concatenate([np.zeros((1,), dtype=np.float32), np.cumsum(segment_lengths, dtype=np.float32)], axis=0)
+
+
+def _interp_polyline_at_arc(points_xy: np.ndarray, cumulative_arc: np.ndarray, query_arc: float) -> np.ndarray:
+    points_xy = np.asarray(points_xy, dtype=np.float32).reshape(-1, 2)
+    cumulative_arc = np.asarray(cumulative_arc, dtype=np.float32).reshape(-1)
+    if points_xy.shape[0] == 0:
+        return np.full((2,), np.nan, dtype=np.float32)
+    if points_xy.shape[0] == 1 or cumulative_arc.shape[0] <= 1:
+        return np.asarray(points_xy[0], dtype=np.float32)
+
+    q = float(np.clip(float(query_arc), 0.0, float(cumulative_arc[-1])))
+    hi = int(np.searchsorted(cumulative_arc, q, side="right"))
+    if hi <= 0:
+        return np.asarray(points_xy[0], dtype=np.float32)
+    if hi >= cumulative_arc.shape[0]:
+        return np.asarray(points_xy[-1], dtype=np.float32)
+
+    lo = hi - 1
+    s0 = float(cumulative_arc[lo])
+    s1 = float(cumulative_arc[hi])
+    if s1 <= s0 + 1e-6:
+        return np.asarray(points_xy[hi], dtype=np.float32)
+
+    alpha = (q - s0) / (s1 - s0)
+    return ((1.0 - alpha) * points_xy[lo] + alpha * points_xy[hi]).astype(np.float32)
+
+
+def _compute_sdc_rollout_metric_arrays(*, gt_data_dict, pred_data_dict) -> dict[str, np.ndarray]:
+    gt_pos = _to_numpy(gt_data_dict.get("decoder/agent_position", []), dtype=np.float32)[..., :2]
+    gt_valid = _to_numpy(gt_data_dict.get("decoder/agent_valid_mask", []), dtype=bool)
+    pred_pos = _to_numpy(pred_data_dict.get("decoder/reconstructed_position", []), dtype=np.float32)[..., :2]
+    pred_valid = _to_numpy(pred_data_dict.get("decoder/reconstructed_valid_mask", []), dtype=bool)
+
+    if gt_pos.ndim != 3 or pred_pos.ndim != 4 or pred_valid.ndim != 3:
+        nan = np.full((1,), np.nan, dtype=np.float32)
+        return {
+            "sdc_ade": nan,
+            "sdc_fde": nan,
+            "sdc_gtarc_clip_ade": nan,
+            "sdc_gtarc_clip_fde": nan,
+        }
+
+    t_gt, n_gt = gt_pos.shape[:2]
+    k_modes, t_pred, n_pred = pred_pos.shape[:3]
+    sdc_index = _scalar_int(gt_data_dict.get("decoder/sdc_index"), default=0)
+    if sdc_index < 0 or sdc_index >= min(n_gt, n_pred):
+        sdc_index = 0
+
+    if gt_valid.shape == (n_gt, t_gt):
+        gt_valid = gt_valid.T
+    if gt_valid.shape != (t_gt, n_gt):
+        gt_valid = np.ones((t_gt, n_gt), dtype=bool)
+
+    time_ade = np.full((k_modes,), np.nan, dtype=np.float32)
+    time_fde = np.full((k_modes,), np.nan, dtype=np.float32)
+    arc_ade = np.full((k_modes,), np.nan, dtype=np.float32)
+    arc_fde = np.full((k_modes,), np.nan, dtype=np.float32)
+
+    gt_traj = np.asarray(gt_pos[:, sdc_index, :2], dtype=np.float32)
+    gt_valid_sdc = np.asarray(gt_valid[:, sdc_index], dtype=bool)
+    gt_valid_idx = np.flatnonzero(gt_valid_sdc)
+    gt_valid_points = gt_traj[gt_valid_idx] if gt_valid_idx.size > 0 else np.zeros((0, 2), dtype=np.float32)
+    gt_cum_arc = _cumulative_arc(gt_valid_points) if gt_valid_points.shape[0] > 0 else np.zeros((0,), dtype=np.float32)
+
+    t_eval = int(min(t_gt, t_pred))
+    last_valid_t = int(gt_valid_idx[-1]) if gt_valid_idx.size > 0 else -1
+
+    for mode_idx in range(k_modes):
+        pred_traj = np.asarray(pred_pos[mode_idx, :, sdc_index, :2], dtype=np.float32)
+        pred_valid_sdc = np.asarray(pred_valid[mode_idx, :, sdc_index], dtype=bool)
+
+        if t_eval > 0 and last_valid_t >= 0:
+            error = np.linalg.norm(gt_traj[:t_eval] - pred_traj[:t_eval], axis=-1).astype(np.float32)
+            valid_mask = gt_valid_sdc[:t_eval]
+            if np.any(valid_mask):
+                time_ade[mode_idx] = float(error[valid_mask].mean())
+                last_eval_t = min(last_valid_t, t_eval - 1)
+                time_fde[mode_idx] = float(error[last_eval_t])
+
+        pred_valid_idx = np.flatnonzero(pred_valid_sdc)
+        if gt_valid_points.shape[0] == 0 or pred_valid_idx.size == 0:
+            continue
+
+        pred_valid_points = pred_traj[pred_valid_idx]
+        pred_cum_arc = _cumulative_arc(pred_valid_points)
+        aligned_pred = np.stack(
+            [_interp_polyline_at_arc(pred_valid_points, pred_cum_arc, float(s)) for s in gt_cum_arc],
+            axis=0,
+        )
+        clip_error = np.linalg.norm(gt_valid_points - aligned_pred, axis=-1).astype(np.float32)
+        if clip_error.size > 0:
+            arc_ade[mode_idx] = float(np.mean(clip_error))
+            arc_fde[mode_idx] = float(clip_error[-1])
+
+    return {
+        "sdc_ade": time_ade,
+        "sdc_fde": time_fde,
+        "sdc_gtarc_clip_ade": arc_ade,
+        "sdc_gtarc_clip_fde": arc_fde,
+    }
+
+
+def _scene_diversity_from_trajs(*, trajs_mtn2: np.ndarray, valid_mt: np.ndarray) -> dict[str, float]:
+    trajs = np.asarray(trajs_mtn2, dtype=np.float32)
+    valid = np.asarray(valid_mt, dtype=bool)
+    if trajs.ndim != 3 or trajs.shape[-1] != 2:
+        return {}
+    if valid.ndim != 2 or valid.shape[:2] != trajs.shape[:2]:
+        return {}
+
+    valid_rollout_mask = valid.any(axis=1)
+    trajs = trajs[valid_rollout_mask]
+    valid = valid[valid_rollout_mask]
+    if trajs.shape[0] < 2:
+        return {}
+
+    first_valid = valid.argmax(axis=1)
+    last_valid = valid[:, ::-1].argmax(axis=1)
+    last_valid = valid.shape[1] - 1 - last_valid
+
+    final_pos = trajs[np.arange(trajs.shape[0]), last_valid]
+    start_pos = trajs[np.arange(trajs.shape[0]), first_valid]
+
+    add_terms = []
+    for t in range(trajs.shape[1]):
+        mask_t = valid[:, t]
+        if int(mask_t.sum()) < 2:
+            continue
+        add_terms.append(_max_pairwise_l2(trajs[mask_t, t, :]))
+
+    result = {
+        "semantic_scene_alt_rollout_count": float(trajs.shape[0]),
+        "semantic_scene_alt_fdd": _max_pairwise_l2(final_pos),
+        "semantic_scene_alt_sdd": _max_pairwise_l2(start_pos),
+    }
+    if add_terms:
+        result["semantic_scene_alt_add"] = float(np.mean(np.asarray(add_terms, dtype=np.float32)))
+    else:
+        result["semantic_scene_alt_add"] = float("nan")
+    return result
+
+
 def jsd(gt_hist, pred_hist, epsilon=1e-10):
     gt_prob = gt_hist / gt_hist.sum()
     pred_prob = pred_hist / pred_hist.sum()
@@ -277,6 +464,15 @@ class Metrics:
     skipped_sade_min: float = 0.0
     skipped_ssde_min: float = 0.0
     skipped_ssde_avg: float = 0.0
+
+    sdc_ade_avg: float = 0.0
+    sdc_ade_min: float = 0.0
+    sdc_fde_avg: float = 0.0
+    sdc_fde_min: float = 0.0
+    sdc_gtarc_clip_ade_avg: float = 0.0
+    sdc_gtarc_clip_ade_min: float = 0.0
+    sdc_gtarc_clip_fde_avg: float = 0.0
+    sdc_gtarc_clip_fde_min: float = 0.0
 
     sdd: float = 0.0  # (unsupervised) avg over scenarios: average over all agents: maximum L2 distance in first position of that agent between generated modes
     fdd: float = 0.0  # (unsupervised) avg over scenarios: average over all agents: maximum L2 distance in final position of that agent between generated modes
@@ -409,6 +605,7 @@ class Evaluator:
         self.metrics = Metrics()
         self.key_metrics_only = key_metrics_only
         self.start_metrics_only = start_metrics_only
+        self._semantic_scene_rollout_rows: dict[str, list[dict[str, object]]] = {}
 
 
 
@@ -429,7 +626,133 @@ class Evaluator:
         return mask
 
 
-    def add(self, gt_data_dict, pred_data_dict, adv_list, bv_list, device=None):
+    def _record_semantic_scene_rollouts(
+        self,
+        *,
+        gt_data_dict,
+        pred_data_dict,
+        scenario_id: str,
+        semantic_slot_id: str,
+        semantic_source_kind: str,
+        requested_semantic_label: str,
+    ) -> None:
+        scenario_id = _as_text(scenario_id)
+        slot_id = _as_text(semantic_slot_id)
+        source_kind = _as_text(semantic_source_kind)
+        semantic_label = _as_text(requested_semantic_label)
+        if not scenario_id:
+            return
+        if not slot_id:
+            return
+        if slot_id == "gt" or source_kind == "factual_gt":
+            return
+
+        pred_pos = pred_data_dict.get("decoder/reconstructed_position")
+        pred_valid = pred_data_dict.get("decoder/reconstructed_valid_mask")
+        if pred_pos is None or pred_valid is None:
+            return
+
+        if isinstance(pred_pos, torch.Tensor):
+            pred_pos = pred_pos.detach().cpu().numpy()
+        else:
+            pred_pos = np.asarray(pred_pos)
+        if isinstance(pred_valid, torch.Tensor):
+            pred_valid = pred_valid.detach().cpu().numpy()
+        else:
+            pred_valid = np.asarray(pred_valid)
+
+        if pred_pos.ndim != 4 or pred_valid.ndim != 3:
+            return
+
+        sdc_index = _scalar_int(gt_data_dict.get("decoder/sdc_index"), default=0)
+        if sdc_index < 0 or sdc_index >= pred_pos.shape[2] or sdc_index >= pred_valid.shape[2]:
+            return
+
+        sdc_trajs = np.asarray(pred_pos[:, :, sdc_index, :2], dtype=np.float32)
+        sdc_valid = np.asarray(pred_valid[:, :, sdc_index], dtype=bool)
+        if sdc_trajs.shape[0] == 0:
+            return
+
+        scene_rows = self._semantic_scene_rollout_rows.setdefault(scenario_id, [])
+        scene_rows.append(
+            {
+                "slot_id": slot_id,
+                "source_kind": source_kind,
+                "requested_semantic_label": semantic_label,
+                "trajs": sdc_trajs,
+                "valid": sdc_valid,
+            }
+        )
+
+    def _semantic_scene_diversity_details(self) -> list[dict[str, object]]:
+        details: list[dict[str, object]] = []
+        for scenario_id in sorted(self._semantic_scene_rollout_rows.keys()):
+            rows = list(self._semantic_scene_rollout_rows.get(scenario_id, []))
+            alt_rows = [
+                row
+                for row in rows
+                if _as_text(row.get("slot_id")) != "gt" and _as_text(row.get("source_kind")) != "factual_gt"
+            ]
+            if not alt_rows:
+                continue
+
+            trajs = np.concatenate([np.asarray(row["trajs"], dtype=np.float32) for row in alt_rows], axis=0)
+            valid = np.concatenate([np.asarray(row["valid"], dtype=bool) for row in alt_rows], axis=0)
+            metrics = _scene_diversity_from_trajs(trajs_mtn2=trajs, valid_mt=valid)
+            if not metrics:
+                continue
+            details.append(
+                {
+                    "scenario_id": scenario_id,
+                    "alt_row_count": int(len(alt_rows)),
+                    "alt_slot_ids": [_as_text(row.get("slot_id")) for row in alt_rows],
+                    "requested_semantic_labels": [
+                        _as_text(row.get("requested_semantic_label")) for row in alt_rows
+                    ],
+                    **metrics,
+                }
+            )
+        return details
+
+    def _aggregate_semantic_scene_diversity(self) -> dict[str, float]:
+        details = self._semantic_scene_diversity_details()
+        if not details:
+            return {}
+
+        def _mean_for(key: str) -> float:
+            values = [
+                float(item[key])
+                for item in details
+                if key in item and np.isfinite(float(item[key]))
+            ]
+            if not values:
+                return float("nan")
+            return float(np.mean(np.asarray(values, dtype=np.float32)))
+
+        alt_row_counts = [float(item["alt_row_count"]) for item in details]
+        rollout_counts = [float(item["semantic_scene_alt_rollout_count"]) for item in details]
+        return {
+            "semantic_scene_alt_scene_count": float(len(details)),
+            "semantic_scene_alt_row_count_mean": float(np.mean(np.asarray(alt_row_counts, dtype=np.float32))),
+            "semantic_scene_alt_rollout_count_mean": float(np.mean(np.asarray(rollout_counts, dtype=np.float32))),
+            "semantic_scene_alt_fdd": _mean_for("semantic_scene_alt_fdd"),
+            "semantic_scene_alt_add": _mean_for("semantic_scene_alt_add"),
+            "semantic_scene_alt_sdd": _mean_for("semantic_scene_alt_sdd"),
+        }
+
+    def add(
+        self,
+        gt_data_dict,
+        pred_data_dict,
+        adv_list,
+        bv_list,
+        device=None,
+        *,
+        scenario_id: str = "",
+        semantic_slot_id: str = "",
+        semantic_source_kind: str = "",
+        requested_semantic_label: str = "",
+    ):
 
         self.metrics.scenario_count += 1
 
@@ -468,6 +791,32 @@ class Evaluator:
 
         sdc_index = int(gt_data_dict["decoder/sdc_index"])
         sdc_index_in_ooi = list(gt_data_dict["decoder/agent_id"]).index(sdc_index)
+        self._record_semantic_scene_rollouts(
+            gt_data_dict=gt_data_dict,
+            pred_data_dict=pred_data_dict,
+            scenario_id=scenario_id,
+            semantic_slot_id=semantic_slot_id,
+            semantic_source_kind=semantic_source_kind,
+            requested_semantic_label=requested_semantic_label,
+        )
+
+        sdc_metric_arrays = _compute_sdc_rollout_metric_arrays(
+            gt_data_dict=gt_data_dict,
+            pred_data_dict=pred_data_dict,
+        )
+        for metric_name in (
+            "sdc_ade",
+            "sdc_fde",
+            "sdc_gtarc_clip_ade",
+            "sdc_gtarc_clip_fde",
+        ):
+            metric_values = np.asarray(sdc_metric_arrays[metric_name], dtype=np.float32).reshape(-1)
+            finite_mask = np.isfinite(metric_values)
+            if not np.any(finite_mask):
+                continue
+            finite_values = metric_values[finite_mask]
+            setattr(self.metrics, f"{metric_name}_avg", getattr(self.metrics, f"{metric_name}_avg") + float(np.mean(finite_values)))
+            setattr(self.metrics, f"{metric_name}_min", getattr(self.metrics, f"{metric_name}_min") + float(np.min(finite_values)))
 
         # minSFDE
         if not self.start_metrics_only:
@@ -1030,10 +1379,12 @@ class Evaluator:
             self.metrics.customized_all_agent_coll += all_agent_cr
 
     def aggregate(self):
-        return self.metrics.aggregate()
+        metrics = self.metrics.aggregate()
+        metrics.update(self._aggregate_semantic_scene_diversity())
+        return metrics
 
     def print(self):
-        metrics = self.metrics.aggregate()
+        metrics = self.aggregate()
         print("\n=====================================")
         print("Evaluation Metrics:")
         print(utils.pretty_print(metrics))
@@ -1044,7 +1395,7 @@ class Evaluator:
         if save_path is None:
             save_path = "evaluation_results"
 
-        metrics = self.metrics.aggregate()
+        metrics = self.aggregate()
         metrics["save_path"] = save_path
 
         # Save a json:
@@ -1053,6 +1404,13 @@ class Evaluator:
         with open(json_file, "w") as f:
             json.dump(metrics, f, indent=4)
         print(f"Saved metrics to {json_file}")
+
+        semantic_details = self._semantic_scene_diversity_details()
+        if semantic_details:
+            details_file = save_path + "_semantic_scene_diversity.json"
+            with open(details_file, "w") as f:
+                json.dump(semantic_details, f, indent=4)
+            print(f"Saved semantic scene diversity details to {details_file}")
 
         # Save a csv:
         import pandas as pd

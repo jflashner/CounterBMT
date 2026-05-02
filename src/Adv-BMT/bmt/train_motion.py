@@ -97,6 +97,13 @@ def _prepare_counterfactual_train_index(config) -> None:
     if counterfactual_mode != "sdc_semantic_only":
         return
 
+    semantic_ext_enabled = bool(
+        OmegaConf.select(config, "MODEL.LOCAL_CONTROL_SDC_SEMANTIC_EXT_ENABLED", default=False)
+    )
+    include_gt_rows = bool(
+        OmegaConf.select(config, "DATA.COUNTERFACTUAL_SEMANTIC_RL_INCLUDE_GT_ROWS", default=False)
+    )
+
     rollout_objective_enabled = any(
         float(OmegaConf.select(config, key, default=0.0) or 0.0) > 0.0
         for key in (
@@ -106,6 +113,16 @@ def _prepare_counterfactual_train_index(config) -> None:
         )
     )
     if not rollout_objective_enabled:
+        return
+
+    if semantic_ext_enabled and include_gt_rows:
+        print(
+            "[counterfactual-train-index] keeping factual GT rows for additive semantic RL extension",
+            {
+                "semantic_ext_enabled": bool(semantic_ext_enabled),
+                "include_gt_rows": bool(include_gt_rows),
+            },
+        )
         return
 
     requested_alt_only = bool(OmegaConf.select(config, "DATA.COUNTERFACTUAL_ALT_ONLY_TRAIN", default=False))
@@ -626,6 +643,197 @@ class SemanticRolloutAdvantageCallback(SemanticRolloutGifCallback):
             traceback.print_exc()
 
 
+class PaperRealismEvalCallback(Callback):
+    def __init__(self, *, config, artifact_root: pathlib.Path):
+        self.config = config
+        self.artifact_root = pathlib.Path(artifact_root)
+        self.enabled = bool(config.get("PAPER_REALISM_EVAL_ENABLED", False))
+        self.every_n_validations = max(1, int(config.get("PAPER_REALISM_EVAL_EVERY_N_VALIDATIONS", 1)))
+        self.limit_batches = int(config.get("PAPER_REALISM_EVAL_LIMIT_BATCHES", 25))
+        self.test_batch_size = max(1, int(config.get("PAPER_REALISM_EVAL_TEST_BATCH_SIZE", 1)))
+        self.val_num_workers = max(0, int(config.get("PAPER_REALISM_EVAL_NUM_WORKERS", 0)))
+        self.device = str(config.get("PAPER_REALISM_EVAL_DEVICE", "cpu")).strip().lower() or "cpu"
+        self.control_index_override = str(config.get("PAPER_REALISM_EVAL_CONTROL_INDEX", "")).strip()
+        self.data_dir_override = str(config.get("PAPER_REALISM_EVAL_DATA_DIR", "")).strip()
+        self.config_name = str(
+            config.get("PAPER_REALISM_EVAL_CONFIG_NAME", "motion_forward_sdc_semantic_only_strict_local.yaml")
+        ).strip() or "motion_forward_sdc_semantic_only_strict_local.yaml"
+        self._validation_events = 0
+        self.legacy_root = pathlib.Path(REPO_ROOT).resolve()
+        self.workspace_root = self.legacy_root.parent.parent
+        self.eval_script = self.legacy_root / "bmt" / "eval" / "evaluate_scenario_metrics.py"
+
+    def _resolve_path(self, value: str) -> pathlib.Path:
+        path = pathlib.Path(str(value).strip()).expanduser()
+        if not path.is_absolute():
+            path = (self.legacy_root / path).resolve()
+        return path
+
+    def _resolve_control_index(self) -> pathlib.Path:
+        for value in (
+            self.control_index_override,
+            str(self.config.get("PAPER_REALISM_EVAL_CONTROL_INDEX_VAL", "")).strip(),
+        ):
+            if value:
+                path = self._resolve_path(value)
+                if path.is_file():
+                    return path
+                raise FileNotFoundError(f"Paper realism control index does not exist: {path}")
+        raise FileNotFoundError(
+            "PAPER_REALISM_EVAL_CONTROL_INDEX must point to a GT/no_intervention validation JSONL."
+        )
+
+    def _resolve_data_dir(self) -> pathlib.Path:
+        for value in (
+            self.data_dir_override,
+            str(OmegaConf.select(self.config, "DATA.TEST_DATA_DIR", default="") or "").strip(),
+            str(OmegaConf.select(self.config, "DATA.TRAINING_DATA_DIR", default="") or "").strip(),
+        ):
+            if value:
+                path = self._resolve_path(value)
+                if path.exists():
+                    return path
+                raise FileNotFoundError(f"Paper realism data dir does not exist: {path}")
+        raise FileNotFoundError("No data dir configured for paper realism eval.")
+
+    @staticmethod
+    def _metric_subset(metrics):
+        names = (
+            "scenario_count",
+            "sade_avg",
+            "sade_min",
+            "sfde_avg",
+            "sfde_min",
+            "sdc_ade_avg",
+            "sdc_ade_min",
+            "sdc_fde_avg",
+            "sdc_fde_min",
+            "sdc_gtarc_clip_ade_avg",
+            "sdc_gtarc_clip_ade_min",
+            "sdc_gtarc_clip_fde_avg",
+            "sdc_gtarc_clip_fde_min",
+        )
+        output = {}
+        for name in names:
+            if name not in metrics:
+                continue
+            value = metrics[name]
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                output[name] = float(value)
+        return output
+
+    def _build_env(self):
+        env = dict(os.environ)
+        py_parts = [
+            str(self.workspace_root),
+            str(self.legacy_root),
+            str(self.workspace_root / "metadrive"),
+            str(self.workspace_root / "scenarionet"),
+        ]
+        existing = [part for part in env.get("PYTHONPATH", "").split(":") if part]
+        for part in existing:
+            if part not in py_parts:
+                py_parts.append(part)
+        env["PYTHONPATH"] = ":".join(py_parts)
+        if self.device == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+        elif self.device not in {"", "trainer", "current"}:
+            env["CUDA_VISIBLE_DEVICES"] = self.device
+        return env
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if not self.enabled or not trainer.is_global_zero or trainer.sanity_checking:
+            return
+        self._validation_events += 1
+        if (self._validation_events % self.every_n_validations) != 0:
+            return
+
+        eval_root = self.artifact_root / "paper_realism_eval" / f"step_{int(trainer.global_step):06d}"
+        eval_root.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "global_step": int(trainer.global_step),
+            "current_epoch": int(trainer.current_epoch),
+            "metrics": {},
+            "wandb_logged": False,
+        }
+        ckpt_path = eval_root / "_snapshot.ckpt"
+        try:
+            control_index = self._resolve_control_index()
+            data_dir = self._resolve_data_dir()
+            summary["control_index"] = str(control_index)
+            summary["data_dir"] = str(data_dir)
+            OmegaConf.save(config=self.config, f=str(eval_root / "resolved_train_config.yaml"))
+            trainer.save_checkpoint(str(ckpt_path))
+
+            save_tag = f"paper_realism_step_{int(trainer.global_step):06d}"
+            cmd = [
+                sys.executable,
+                str(self.eval_script),
+                "--config-name",
+                self.config_name,
+                "eval_mode=GPTmodel",
+                "multi_mode=true",
+                f"ckpt={ckpt_path}",
+                "CKPT_LOAD_MODE=forgiving_state_dict",
+                f"DATA.TRAINING_DATA_DIR={data_dir}",
+                f"DATA.TEST_DATA_DIR={data_dir}",
+                f"DATA.COUNTERFACTUAL_CONTROL_INDEX_VAL={control_index}",
+                f"DATA.COUNTERFACTUAL_CONTROL_INDEX={control_index}",
+                "DATA.COUNTERFACTUAL_MODE=sdc_semantic_only",
+                "DATA.COUNTERFACTUAL_WEIGHTED_SAMPLER=false",
+                f"++test_batch_size={self.test_batch_size}",
+                f"++limit_test_batches={self.limit_batches}",
+                f"++val_num_workers={self.val_num_workers}",
+                "++key_metrics_only=true",
+                "++start_metrics_only=false",
+                f"++save_tag={save_tag}",
+                "++wandb=false",
+                "hydra.run.dir=.",
+                "hydra.output_subdir=.hydra",
+                "++MODEL.LOCAL_CONTROL_SDC_SEMANTIC_EXT_ENABLED=true",
+                "++MODEL.LOCAL_CONTROL_SDC_SEMANTIC_EXT_BEHAVIOR_MODEL_ENABLED=false",
+            ]
+            result = subprocess.run(
+                cmd,
+                cwd=str(eval_root),
+                env=self._build_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            summary["returncode"] = int(result.returncode)
+            (eval_root / "paper_realism_eval.log").write_text(result.stdout, encoding="utf-8")
+            metric_files = sorted(eval_root.glob("*_open_loop_results.json"))
+            summary["metric_files"] = [str(path) for path in metric_files]
+            if result.returncode != 0 or not metric_files:
+                print(
+                    f"[paper-realism-eval] failed at step={trainer.global_step}; "
+                    f"returncode={result.returncode}. See {eval_root / 'paper_realism_eval.log'}"
+                )
+                return
+            metrics = json.loads(metric_files[-1].read_text(encoding="utf-8"))
+            metric_subset = self._metric_subset(metrics)
+            summary["metrics"] = metric_subset
+            if metric_subset and trainer.logger is not None:
+                trainer.logger.log_metrics(
+                    {f"paper_realism/{key}": value for key, value in metric_subset.items()},
+                    step=int(trainer.global_step),
+                )
+                summary["wandb_logged"] = True
+            print(f"[paper-realism-eval] step={trainer.global_step} metrics={metric_subset}")
+        except Exception as exc:
+            summary["error"] = str(exc)
+            print(f"[paper-realism-eval] callback failed: {exc}")
+            traceback.print_exc()
+        finally:
+            (eval_root / "callback_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+            try:
+                ckpt_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 @hydra.main(version_base=None, config_path=str(REPO_ROOT / "cfgs"), config_name="motion_default.yaml")
 def main(config):
     # Unfreeze the config to allow modification
@@ -688,15 +896,18 @@ def main(config):
     ckpt_save_dir = pathlib.Path(save_dir).absolute() / "infgen" / name
 
     # Set up trainer arguments
+    checkpoint_every_n_epochs = int(config.get("checkpoint_every_n_epochs", 1))
+    checkpoint_every_n_epochs = checkpoint_every_n_epochs if checkpoint_every_n_epochs > 0 else None
+    checkpoint_save_top_k = int(config.get("checkpoint_save_top_k", -1))
     callbacks = [
         ModelCheckpoint(
             filename=str(name) + "_{epoch}-{step}",
             monitor="monitoring_step",
-            every_n_epochs=1,
+            every_n_epochs=checkpoint_every_n_epochs,
             save_last=True,
             auto_insert_metric_name=True,
             mode="max",
-            save_top_k=-1,
+            save_top_k=checkpoint_save_top_k,
             save_on_train_epoch_end=True,
         ),
         ModelCheckpoint(
@@ -721,6 +932,12 @@ def main(config):
     )
     if rollout_advantage_callback.enabled:
         callbacks.append(rollout_advantage_callback)
+    paper_realism_callback = PaperRealismEvalCallback(
+        config=config,
+        artifact_root=ckpt_save_dir,
+    )
+    if paper_realism_callback.enabled:
+        callbacks.append(paper_realism_callback)
     device = "auto" if torch.cuda.is_available() else "cpu"
     trainer_kwargs = dict(
         num_sanity_val_steps=config.num_sanity_val_steps,

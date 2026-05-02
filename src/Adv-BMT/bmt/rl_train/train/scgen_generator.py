@@ -16,6 +16,8 @@ import os
 import copy
 from bmt.dataset.scenarionet_utils import overwrite_to_scenario_description
 from bmt.gradio_ui.plot import plot_pred, plot_gt
+from bmt.utils.config import cfg_from_yaml_file, global_config
+from bmt.utils.checkpoint_loading import load_model_from_checkpoint_forgiving, summarize_load_report_by_module
 
 def overwrite_to_scenario_description_new_agent(output_dict_mode, original_SD, adv_id, from_GT, ooi=None):
     """
@@ -468,24 +470,48 @@ def is_sdc_parking(scenario_description):
 
 class SCGEN_Generator:
     def __init__(self, model_name='0202_midgpt', TF_mode="all_TF_except_adv", ckpt_path="bmt/ckpt/last.ckpt"):
-
-        from hydra import initialize_config_dir, compose
-        from bmt.utils import REPO_ROOT
-
-        # if not model_name.endswith(".yaml"):
-        #     model_name += ".yaml"
-
-        # config_path = REPO_ROOT / "cfgs"
-        # with initialize_config_dir(config_dir=str(config_path), version_base=None):
-        #     config = compose(config_name=model_name)
+        if not model_name.endswith(".yaml"):
+            model_name = f"{model_name}.yaml"
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         assert torch.cuda.is_available(), "CUDA is not available, please check your environment."
 
-        pl_model = utils.get_model(checkpoint_path=ckpt_path).eval()
+        # Legacy SCGEN checkpoints do not embed the full runtime config. Loading them
+        # against today's motion_default.yaml introduces newer local-control decoder
+        # modules that the original checkpoint never trained. Recover the intended
+        # config from model_name and use the repo's forgiving loader so we only skip
+        # those newer compatibility weights.
+        config = cfg_from_yaml_file(REPO_ROOT / "cfgs" / model_name, global_config)
+        config.PREPROCESSING.keep_all_data = True
+        config.BACKWARD_PREDICTION = True
+        config.ADD_CONTOUR_RELATION = True
+        pl_model, load_report = load_model_from_checkpoint_forgiving(
+            config=config,
+            ckpt_path=ckpt_path,
+            load_mode="forgiving_state_dict",
+            strict_state_dict=False,
+            map_location=device,
+            checkpoint_surgery_func=utils.checkpoint_surgery_func,
+        )
+        print(
+            "SCGEN_Generator load report:",
+            {
+                "num_loaded_keys": load_report["num_loaded_keys"],
+                "num_missing_keys": load_report["num_missing_keys"],
+                "num_unexpected_keys": load_report["num_unexpected_keys"],
+                "num_shape_mismatch_keys": load_report["num_shape_mismatch_keys"],
+                "expected_new_path_control_prefix_counts": summarize_load_report_by_module(load_report).get(
+                    "expected_new_path_control_prefix_counts", {}
+                ),
+                "unexpected_missing_keys": load_report["unexpected_missing_keys"][:10],
+            },
+        )
+        pl_model = pl_model.eval()
 
         config = pl_model.config
         config.PREPROCESSING.keep_all_data = True
+        config.BACKWARD_PREDICTION = True
+        config.ADD_CONTOUR_RELATION = True
         # Set the maximum number of agents, so we can avoid making prediction for those static agents, thus saving GPU.
         config.PREPROCESSING.MAX_AGENTS = 64
 
@@ -841,9 +867,6 @@ if __name__ == "__main__":
 
 
         
-
-
-
 
 
 

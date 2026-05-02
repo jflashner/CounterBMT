@@ -6,7 +6,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 if __package__ is None or __package__ == "":
     repo_root = Path(__file__).resolve().parents[2]
@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-max-requests", type=int, default=DEFAULT_BATCH_MAX_REQUESTS)
     parser.add_argument("--batch-shard-indices", type=str, default="")
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--progress-every", type=int, default=10)
     return parser.parse_args()
 
 
@@ -453,13 +454,14 @@ def _run_sync_label_request(
     max_completion_tokens: int,
     max_retries: int,
     retry_sleep_s: float,
-) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+) -> Tuple[str, Optional[Dict[str, Any]], Optional[str], int, float]:
     model_name, image_detail, prompt, image_paths, json_schema = _resolved_request_settings(
         spec,
         model_override=model_override,
         image_detail_override=image_detail_override,
     )
     last_error: Optional[Exception] = None
+    start_t = time.time()
     for attempt in range(1, max(1, int(max_retries)) + 1):
         try:
             payload = client.label_contract(
@@ -470,13 +472,13 @@ def _run_sync_label_request(
                 max_completion_tokens=int(max_completion_tokens),
                 json_schema=json_schema,
             )
-            return str(spec["custom_id"]), dict(payload), None
+            return str(spec["custom_id"]), dict(payload), None, int(attempt), float(time.time() - start_t)
         except Exception as exc:
             last_error = exc
             if attempt >= max(1, int(max_retries)):
                 break
             time.sleep(float(retry_sleep_s))
-    return str(spec["custom_id"]), None, ("" if last_error is None else str(last_error))
+    return str(spec["custom_id"]), None, ("" if last_error is None else str(last_error)), max(1, int(max_retries)), float(time.time() - start_t)
 
 
 def _run_sync_labeling(
@@ -489,15 +491,99 @@ def _run_sync_labeling(
     max_retries: int,
     retry_sleep_s: float,
     num_workers: int,
+    progress_every: int,
+    on_slot_success: Optional[Callable[[Mapping[str, Any], Mapping[str, Any]], None]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     if not client.available:
         raise RuntimeError("OpenAI API key is not available")
     resolved: Dict[str, Dict[str, Any]] = {}
     failures: List[Dict[str, Any]] = []
     max_workers = max(1, int(num_workers))
+    progress_every = max(1, int(progress_every))
+    total = int(len(specs))
+    completed = 0
+    num_success = 0
+    num_failed = 0
+    first_success_logged = False
+    first_failure_logged = False
+
+    print(
+        json.dumps(
+            {
+                "event": "sync_label_start",
+                "total_slots": total,
+                "num_workers": max_workers,
+                "api_key_available": bool(client.available),
+                "model_override": str(model_override),
+                "image_detail_override": str(image_detail_override),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+    def _log_progress(*, custom_id: str, status: str, attempts: int, elapsed_s: float, error: Optional[str] = None) -> None:
+        nonlocal completed, num_success, num_failed, first_success_logged, first_failure_logged
+        completed += 1
+        if status == "ok":
+            num_success += 1
+            if not first_success_logged:
+                print(
+                    json.dumps(
+                        {
+                            "event": "api_first_success",
+                            "custom_id": str(custom_id),
+                            "completed": int(completed),
+                            "total_slots": total,
+                            "attempts": int(attempts),
+                            "elapsed_s": round(float(elapsed_s), 3),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                first_success_logged = True
+        else:
+            num_failed += 1
+            if not first_failure_logged:
+                print(
+                    json.dumps(
+                        {
+                            "event": "api_first_failure",
+                            "custom_id": str(custom_id),
+                            "completed": int(completed),
+                            "total_slots": total,
+                            "attempts": int(attempts),
+                            "elapsed_s": round(float(elapsed_s), 3),
+                            "error": str(error or ""),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                first_failure_logged = True
+        if completed == total or (completed % progress_every) == 0:
+            print(
+                json.dumps(
+                    {
+                        "event": "sync_label_progress",
+                        "completed": int(completed),
+                        "total_slots": total,
+                        "succeeded": int(num_success),
+                        "failed": int(num_failed),
+                        "last_custom_id": str(custom_id),
+                        "last_status": str(status),
+                        "last_attempts": int(attempts),
+                        "last_elapsed_s": round(float(elapsed_s), 3),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
     if max_workers <= 1 or len(specs) <= 1:
         for spec in specs:
-            custom_id, raw_contract, error = _run_sync_label_request(
+            custom_id, raw_contract, error, attempts, elapsed_s = _run_sync_label_request(
                 spec=spec,
                 client=client,
                 model_override=model_override,
@@ -508,6 +594,9 @@ def _run_sync_labeling(
             )
             if raw_contract is not None:
                 resolved[custom_id] = raw_contract
+                if on_slot_success is not None:
+                    on_slot_success(spec, raw_contract)
+                _log_progress(custom_id=custom_id, status="ok", attempts=attempts, elapsed_s=elapsed_s)
             else:
                 failures.append(
                     {
@@ -517,6 +606,7 @@ def _run_sync_labeling(
                         "error": str(error or ""),
                     }
                 )
+                _log_progress(custom_id=custom_id, status="error", attempts=attempts, elapsed_s=elapsed_s, error=error)
         return resolved, failures
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -535,9 +625,12 @@ def _run_sync_labeling(
         }
         for future in as_completed(future_map):
             spec = future_map[future]
-            custom_id, raw_contract, error = future.result()
+            custom_id, raw_contract, error, attempts, elapsed_s = future.result()
             if raw_contract is not None:
                 resolved[custom_id] = raw_contract
+                if on_slot_success is not None:
+                    on_slot_success(spec, raw_contract)
+                _log_progress(custom_id=custom_id, status="ok", attempts=attempts, elapsed_s=elapsed_s)
             else:
                 failures.append(
                     {
@@ -547,6 +640,7 @@ def _run_sync_labeling(
                         "error": str(error or ""),
                     }
                 )
+                _log_progress(custom_id=custom_id, status="error", attempts=attempts, elapsed_s=elapsed_s, error=error)
     return resolved, failures
 
 
@@ -711,6 +805,35 @@ def main() -> int:
     spec_by_custom_id = {str(spec["custom_id"]): dict(spec) for spec in slot_specs}
     raw_contracts_written: Dict[str, Dict[str, Any]] = {}
     failed_slots: List[Dict[str, Any]] = []
+    all_examples_map = {str(example_id): list(slot_requests) for example_id, slot_requests in all_examples}
+
+    def _handle_slot_success(spec: Mapping[str, Any], raw_contract: Mapping[str, Any]) -> None:
+        custom_id = str(spec["custom_id"])
+        _write_slot_contract_files(
+            spec=spec,
+            raw_contract=raw_contract,
+            example_contexts=example_contexts,
+            model_override=str(args.model),
+            image_detail_override=str(args.image_detail),
+        )
+        raw_contracts_written[custom_id] = dict(raw_contract)
+        finalized = _finalize_example_contract(
+            example_id=str(spec["example_id"]),
+            slot_requests=all_examples_map[str(spec["example_id"])],
+            example_contexts=example_contexts,
+        )
+        if finalized is not None:
+            print(
+                json.dumps(
+                    {
+                        "event": "example_contract_finalized",
+                        "example_id": str(spec["example_id"]),
+                        "custom_id": custom_id,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     batch_root = bundle_root / "postsplit_batch"
     batch_jobs_path = batch_root / "batch_jobs.json"
@@ -826,16 +949,12 @@ def main() -> int:
                 max_retries=int(args.max_retries),
                 retry_sleep_s=float(args.retry_sleep_s),
                 num_workers=int(args.num_workers),
+                progress_every=int(args.progress_every),
+                on_slot_success=_handle_slot_success,
             )
             for custom_id, raw_contract in sync_rows.items():
-                _write_slot_contract_files(
-                    spec=spec_by_custom_id[custom_id],
-                    raw_contract=raw_contract,
-                    example_contexts=example_contexts,
-                    model_override=str(args.model),
-                    image_detail_override=str(args.image_detail),
-                )
-                raw_contracts_written[custom_id] = raw_contract
+                if custom_id not in raw_contracts_written:
+                    _handle_slot_success(spec_by_custom_id[custom_id], raw_contract)
             failed_slots.extend(sync_failures)
             failed_slots = [
                 dict(row)
@@ -853,16 +972,12 @@ def main() -> int:
                 max_retries=int(args.max_retries),
                 retry_sleep_s=float(args.retry_sleep_s),
                 num_workers=int(args.num_workers),
+                progress_every=int(args.progress_every),
+                on_slot_success=_handle_slot_success,
             )
             for custom_id, raw_contract in sync_rows.items():
-                _write_slot_contract_files(
-                    spec=spec_by_custom_id[custom_id],
-                    raw_contract=raw_contract,
-                    example_contexts=example_contexts,
-                    model_override=str(args.model),
-                    image_detail_override=str(args.image_detail),
-                )
-                raw_contracts_written[custom_id] = raw_contract
+                if custom_id not in raw_contracts_written:
+                    _handle_slot_success(spec_by_custom_id[custom_id], raw_contract)
             failed_slots.extend(sync_failures)
 
     raw_contract_rows_this_run: List[Dict[str, Any]] = []

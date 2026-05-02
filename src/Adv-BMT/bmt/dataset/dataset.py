@@ -357,6 +357,12 @@ class InfgenDataset(Dataset):
         map_feature_valid_mask:     [B, T, #mapfeat, #points]
         map_feature_position:       [B, T, #mapfeat, 3]
         """
+        if bool(self.config.DATA.get("DROP_ORIGINAL_SD_IN_BATCH", False)):
+            raw_object_keys = {"raw_scenario_description", "original_SD"}
+            batch_list = [
+                {k: v for k, v in sample.items() if k not in raw_object_keys}
+                for sample in batch_list
+            ]
         data_dict_sample = batch_list[0]
 
         num_map_feat, num_points, _ = data_dict_sample["encoder/map_feature"].shape
@@ -867,7 +873,16 @@ class InfgenDataset(Dataset):
         counts = Counter(
             label
             for label in labels
-            if label in {"left", "straight", "right", "left_lane_change", "right_lane_change", "stop", "u_turn"}
+            if label in {
+                "left",
+                "straight",
+                "right",
+                "left_lane_change",
+                "right_lane_change",
+                "stop",
+                "u_turn",
+                "no_intervention",
+            }
         )
         if len(counts) == 0:
             return None

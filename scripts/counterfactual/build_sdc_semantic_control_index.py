@@ -25,7 +25,8 @@ if __package__ is None or __package__ == "":
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
 
-from bmt.counterfactual.normalize import load_raw_scenario
+from bmt.counterfactual.dag_risk import score_semantic_slot_dag_risks
+from bmt.counterfactual.normalize import load_raw_scenario, normalize_scenario
 from bmt.counterfactual.sdc_path_control import split_polyline_on_discontinuities
 from bmt.counterfactual.sdc_semantic_control import (
     DEFAULT_DISCONTINUITY_STITCH_JUMP_THRESHOLD_M,
@@ -49,6 +50,7 @@ from bmt.counterfactual.waymax_adapter import raw_scenario_from_waymax_state, re
 from waymax.dataloader import womd_dataloader
 
 DEFAULT_WOD_131_TRAIN_PATH = "gs://waymo_open_dataset_motion_v_1_3_1/uncompressed/tf_example/training/training_tfexample.tfrecord-00000-of-01000"
+_VLM_RISK_LEVEL_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-max-rows", type=int, default=4)
     parser.add_argument("--include-stop", action="store_true")
     parser.add_argument("--stage-vlm-artifacts", action="store_true")
+    parser.add_argument("--min-vlm-risk-level", type=str, choices=("low", "medium", "high"), default="low")
     return parser.parse_args()
 
 
@@ -546,11 +549,14 @@ def _build_row(
     divergence_min_run: int,
     debug_root: Optional[Path],
     staged_vlm_artifacts: Optional[Mapping[str, Any]],
+    dag_risk_by_slot: Optional[Mapping[str, Mapping[str, Any]]],
 ) -> Dict[str, Any]:
     scenario_id = str(contract.get("scenario_id") or example_row.get("scenario_id") or "")
     sdc_id = str(contract.get("sdc_id") or example_row.get("sdc_id") or "")
     current_time_index = int(contract.get("current_time_index") or example_row.get("current_time_index") or 0)
     requested_label = str(slot.get("semantic_label") or "straight")
+    requested_vlm_risk_level = str(slot.get("risk_level") or "medium").strip().lower() or "medium"
+    requested_vlm_risk_rationale_short = str(slot.get("risk_rationale_short") or "")
     requested_confidence = float(slot.get("confidence") or 0.0)
     slots = iter_highlighted_slots(contract, include_stop=True)
     family_slots = [entry for entry in slots if str(entry.get("semantic_label")) == requested_label and bool(entry.get("is_valid_target", True))]
@@ -634,6 +640,8 @@ def _build_row(
         "sdc_id": sdc_id,
         "current_time_index": int(current_time_index),
         "requested_semantic_label": requested_label,
+        "requested_vlm_risk_level": requested_vlm_risk_level,
+        "requested_vlm_risk_rationale_short": requested_vlm_risk_rationale_short,
         "requested_semantic_confidence": float(requested_confidence),
         "use_for_training": bool(contract.get("use_for_training", True)) and bool(slot.get("use_for_training", True)),
         "source_kind": str(slot.get("row_source_kind") or "alternative_sdc_path"),
@@ -648,6 +656,11 @@ def _build_row(
         "candidate_family_divergence_onsets_m": [float(value) for value in divergence_onsets],
         "metadata": metadata,
     }
+    slot_id = str(slot.get("slot_id") or "")
+    if dag_risk_by_slot is not None and slot_id:
+        dag_risk_payload = dict(dag_risk_by_slot.get(slot_id, {}) or {})
+        if dag_risk_payload:
+            row["dag_risk"] = dag_risk_payload
     map_center, map_heading = extract_model_frame(raw_scenario)
     row["candidate_family_frame"] = "model_map_centered"
     row["candidate_family_map_center"] = np.asarray(map_center, dtype=np.float32).tolist()
@@ -759,6 +772,7 @@ def main() -> int:
             if scenario_pkl is None:
                 raise
         raw_scenario = load_raw_scenario(scenario_pkl)
+        canonical = normalize_scenario(raw_scenario)
         sdc_id = str(contract.get("sdc_id") or example_row.get("sdc_id") or "")
         current_time_index = int(contract.get("current_time_index") or example_row.get("current_time_index") or 0)
         world_paths = build_world_paths_for_contract(
@@ -772,12 +786,24 @@ def main() -> int:
             stitch_radius_m=float(args.stitch_radius_m),
             stitch_jump_threshold_m=float(args.stitch_jump_threshold_m),
         )
+        dag_risk_by_slot = score_semantic_slot_dag_risks(
+            canonical=canonical,
+            contract=contract,
+            world_paths=world_paths,
+            sdc_id=str(sdc_id or canonical.sdc_id),
+            current_time_index=int(current_time_index),
+        )
         staged_vlm_artifacts = None
         if bool(args.stage_vlm_artifacts):
             staged_vlm_artifacts = _stage_vlm_artifacts(example_row, example_dir=example_dir, outdir=outdir)
             staged_manifests.append(dict(staged_vlm_artifacts))
 
+        min_vlm_risk_rank = _VLM_RISK_LEVEL_ORDER.get(str(args.min_vlm_risk_level or "low"), 0)
         for slot in iter_highlighted_slots(contract, include_stop=True):
+            slot_vlm_risk_level = str(slot.get("risk_level") or "medium").strip().lower() or "medium"
+            slot_vlm_risk_rank = _VLM_RISK_LEVEL_ORDER.get(slot_vlm_risk_level, _VLM_RISK_LEVEL_ORDER["medium"])
+            if slot_vlm_risk_rank < min_vlm_risk_rank:
+                continue
             debug_root = None
             if len(debug_records) < int(args.debug_max_rows):
                 debug_root = outdir / "debug" / str(example_row.get("example_id") or example_dir.name) / str(slot.get("slot_id") or "")
@@ -794,17 +820,24 @@ def main() -> int:
                 divergence_min_run=int(args.divergence_min_run),
                 debug_root=debug_root,
                 staged_vlm_artifacts=staged_vlm_artifacts,
+                dag_risk_by_slot=dag_risk_by_slot,
             )
             built_rows.append(row)
+            dag_risk = dict(row.get("dag_risk") or {})
             family_group_audit.append(
                 {
                     "example_id": str(example_row.get("example_id") or example_dir.name),
                     "scenario_id": scenario_id,
                     "slot_id": str(slot.get("slot_id") or ""),
                     "requested_semantic_label": str(row["requested_semantic_label"]),
+                    "requested_vlm_risk_level": str(row.get("requested_vlm_risk_level") or "medium"),
+                    "requested_vlm_risk_rationale_short": str(row.get("requested_vlm_risk_rationale_short") or ""),
                     "family_size": int(len(list(row.get("candidate_family_path_ids", []) or []))),
                     "source_kind": str(row["source_kind"]),
                     "use_for_training": bool(row["use_for_training"]),
+                    "dag_risk_score_total": dag_risk.get("risk_score_total"),
+                    "dag_risk_uplift_vs_gt": dag_risk.get("risk_uplift_vs_gt"),
+                    "dag_risk_tier": dag_risk.get("risk_tier"),
                 }
             )
             if debug_root is not None and "debug_artifacts" in row:
@@ -830,11 +863,30 @@ def main() -> int:
         "num_factual_rows": int(sum(1 for row in built_rows if str(row.get("source_kind")) == "factual_gt")),
         "num_alternative_rows": int(sum(1 for row in built_rows if str(row.get("source_kind")) == "alternative_sdc_path")),
         "num_use_for_training_rows": int(sum(1 for row in built_rows if bool(row.get("use_for_training", True)))),
+        "min_vlm_risk_level": str(args.min_vlm_risk_level),
+        "num_rows_with_dag_risk": int(sum(1 for row in built_rows if bool(row.get("dag_risk")))),
         "output_jsonl": str(output_path),
         "scenario_root": str(scenario_root),
         "debug_manifest": str(outdir / "debug_manifest.json"),
         "family_group_audit": str(outdir / "family_group_audit.json"),
     }
+    risk_scores = [
+        float(dict(row.get("dag_risk") or {}).get("risk_score_total"))
+        for row in built_rows
+        if dict(row.get("dag_risk") or {}).get("risk_score_total") is not None
+    ]
+    if risk_scores:
+        summary["dag_risk_score_stats"] = {
+            "min": float(np.min(np.asarray(risk_scores, dtype=np.float32))),
+            "median": float(np.median(np.asarray(risk_scores, dtype=np.float32))),
+            "max": float(np.max(np.asarray(risk_scores, dtype=np.float32))),
+        }
+    vlm_risk_level_histogram: Dict[str, int] = {}
+    for row in built_rows:
+        level = str(row.get("requested_vlm_risk_level") or "medium")
+        vlm_risk_level_histogram[level] = int(vlm_risk_level_histogram.get(level, 0) + 1)
+    if vlm_risk_level_histogram:
+        summary["vlm_risk_level_histogram"] = vlm_risk_level_histogram
     if staged_manifests:
         summary["vlm_artifact_manifest"] = str(outdir / "vlm_artifact_manifest.json")
     _write_json(outdir / "build_summary.json", summary)
